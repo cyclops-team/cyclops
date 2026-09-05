@@ -41,7 +41,7 @@ When you receive a notification in your composer:
    2. Song Two
    EOF
    ```
-*Note*: `--summary` is optional (auto-derived from `--body` if omitted). You can reply directly to the `m-att_...` attempt token, canonical ID, or use `--last` / `-`.
+*Note*: `--summary` is optional; when you omit it the daemon derives the one-line preview from the subject. You can reply directly to the `m-att_...` attempt token, the canonical id, or use `--last` to answer the most recently claimed message.
 
 ## Before you do anything
 
@@ -54,9 +54,9 @@ $ cyclops status
 If you get `cyclops isn't running. Start it with: cyclops start`, someone
 needs to run `cyclops start` in that tmux session before any of this
 works. That is an operator action, not something you should route around
-(see Safety rules below). The only exception is a human operator's explicit
-emergency authorization after confirming Cyclops is unavailable or broken.
-That exception is narrow, unrecorded, and never agent-authorized.
+(see Safety rules below). Never type into another agent's pane by hand; the
+only bypass is `cyclops send --raw`, which is recorded, and it needs a
+running daemon too.
 
 Find your own name with `cyclops list --json`: the entry whose `pane_id`
 matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
@@ -142,9 +142,9 @@ not an agent, or a CLI cyclops has not been taught; see
 ## 2. Send a durable message
 
 ```
-cyclops send <agent> --subject "One line" \
-  --summary "What this message asks. What the recipient should do next." \
-  --body "Details" [--reply-to <id>] [--fyi]
+cyclops send <agent>[,<agent>...] --subject <s> [--summary <one line>] \
+  [--body <b> | --body-file <path|->] [--raw] [--fyi] [--reply-to <id>] \
+  [--client-key <k>]
 ```
 
 `send` records one immutable message in each recipient's mailbox and returns
@@ -172,13 +172,15 @@ If the connection drops before the response arrives, inspect current state
 first. The request may already be durable. Repeat a send or reply only with the
 same explicit `--client-key`; an unkeyed retry can create a second message.
 
-`--summary` is mandatory for both `send` and `reply`. It must be exactly two
-sentences, on one line, and at most 240 characters. Write a useful human
-preview: what the message is about, then what should happen next. Do not copy
-the body or write two versions of the same sentence.
+`--summary` is optional for both `send` and `reply`. When you give one it
+must be one non-empty line of at most 240 characters; when you omit it the
+daemon derives the preview from the subject, never from the body. Write a
+useful human preview: what the message is about and what should happen next.
 
 Cyclops writes the summary beside one exact claim instruction after proving
-the foreground program is the intended, supported recipient agent:
+the pane is present and alive, a manifest binds it, and the foreground
+program is the intended recipient agent or a tool it handed the terminal to
+while the screen still reads as that agent:
 
 ```text
 [cyclops from codey-cyclops] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>
@@ -192,40 +194,46 @@ Every `send` and `reply` has two independent results:
    command into the recipient's pane, then submits it with Enter. This is the
    wake-up signal, not the complete message.
 
-The operating rule is simple: a known, supported recipient agent gets its
-notification whether it is idle, working, focused, unfocused, or has a
-composer Cyclops cannot read. Cyclops does **not** wait for a clean composer
-in those cases. It holds only when it positively sees human-authored input,
-because overwriting a human draft is worse than waiting, or when it cannot
-prove that the foreground program is the intended supported agent at all.
+The operating rule is simple. Ordinary doorbell delivery writes one line and
+presses Enter for a bound, live agent process unless a human draft is
+positively observed or a named block is present: a modal, a permission
+prompt, a quota screen, a dead pane, copy-mode, or a doorbell the recipient
+has not consumed yet. A composer Cyclops cannot read does **not** hold it;
+the journal marks such a line `submitted_unverified` when it could not be
+read back. A raw send bypasses the composer check entirely and is recorded
+as an unverified write. Uncertainty is recorded, never retried
+automatically.
 
 The visible line can soft-wrap in a narrow pane. That changes only its layout;
 Cyclops still sends the same summary and exact claim command. Run the exact
 `cyclops inbox claim m-att_...` command, read the complete claimed envelope,
 and work from that body before responding.
 
-Every `cyclops send` therefore supplies `--subject`, `--summary`, and either a
-`--body` or `--body-file` when technical detail is needed. Every `cyclops
-reply` supplies `--summary` and its reply body. Never act from the preview
+Every `cyclops send` therefore supplies `--subject`, and a `--body` or
+`--body-file` when technical detail is needed. Never act from the preview
 alone, and never treat seeing the preview as proof that the body was claimed.
 
-The reserved `m-att_` locator works with positional-claim clients while the
-daemon atomically resolves the exact current attempt. The returned envelope
-names the message id used for reply. Older summaryless wire clients retain
-their versioned Format 3 notification and direct-payload compatibility paths;
-new `cyclops send` and `cyclops reply` commands always create the
-summary-bearing exact claim above.
+The reserved `m-att_` locator is what you claim with; the daemon resolves the
+exact current attempt and the returned envelope names the message id used
+for reply.
 
-Both transports are one-shot. Cyclops protects a positively observed human
-draft, but a known idle or working agent with an inconclusive composer still
-receives the one direct notification and submit. Never resend or requeue
-blindly. The full workflow and attention
-commands are in
+The doorbell is one-shot. Cyclops protects a positively observed human
+draft, but an idle or working agent with an inconclusive composer still
+receives the one line and the one Enter. Never resend or requeue blindly.
+The full workflow and recovery commands are in
 [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md).
 
-Older full-payload session records may use `delivered_verified` and
-`delivered_unverified`. Current mailbox fallback uses `delivered_direct`; none
-of those states means an authenticated claim occurred.
+### `--raw`: the recorded bypass
+
+`cyclops send --raw` and `cyclops reply --raw` paste the whole message,
+header, body, reply hint, and end marker, into the recipient pane and press
+Enter with no composer check. Use it only when Cyclops itself is broken for
+that pane (its composer reading is wrong) or when the recipient is one of
+the unverified vendors, whose manifests carry no composer rule and can never
+protect a draft anyway. Two things to know before you reach for it: the
+body lands in the pane, so keep it short and free of anything you would not
+want submitted as a prompt, and the journal records the attempt as an
+unverified raw write, so it never passes for a gated delivery.
 
 ## 3. List, claim, and reply
 
@@ -357,19 +365,17 @@ cyclops status
 
 `messages` shows each message's mailbox state and each recipient's separate
 wake state. `alarm preview` lists unresolved notification attempts and their
-exact ids. `status` counts pane attention, legacy-delivery alarms, open
-mailbox attention attempts, and held queue heads, plus the admin unread
-count; its `waiting on you` rows name the next action for each. If a wake attempt needs
-attention, inspect its exact id before taking an action:
+exact ids. `status` counts pane attention, open mailbox attention attempts,
+and held queue heads, plus the admin unread count; its `waiting on you` rows
+name the next action for each. If a wake attempt needs attention, inspect its
+exact id before taking an action.
 
-```bash
-cyclops attention show <attempt-id> --diff
-```
-
-`show` is read-only. `complete` submits the exact staged notification and
-`discard` clears it without submitting, but both are allowed only when all
-five safety checks pass again immediately before the key. An uncertain action
-must not be repeated.
+An attempt reaches `needs attention` only for a physical write failure
+(a paste or submit command that failed, a pane whose occupant changed after
+the paste) or a daemon restart. Look at the pane before doing anything. If
+the line is not there and the recipient has not claimed, an operator can run
+`cyclops requeue <message-id>` for a fresh attempt. There is no operator
+action that submits or clears a staged line for you.
 
 Clear known alarms by explicit id. For an age-selected operator cleanup,
 `cyclops alarm clear --older-than <age>` prints and freezes the previewed ids,
@@ -402,29 +408,29 @@ it already did something specific and bad
 ([docs/development/INVARIANTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/INVARIANTS.md) has the full list
 and the proof).
 
-- **Never bypass the notification gate.** Do not `tmux send-keys` (or paste,
-  or otherwise type) directly into another agent's pane to "save time" or
-  route around a hold. The selected doorbell or direct payload is admitted
-  only after Cyclops proves the current supported occupant. Positive
-  human-authored composer input remains a hard boundary. Every message goes
-  through `cyclops send`, even when a direct write looks faster.
-- **Raw tmux requires explicit human emergency authorization.** A slow
-  delivery, safety hold, ambiguous outcome, or inconvenient recipient state is
-  not coordinator failure. Only after a human confirms Cyclops is unavailable
-  or broken may that human authorize one exact target-pane write. Label it
-  unrecorded, do not claim any Cyclops acceptance, receipt, ordering, replay,
-  claim, reply, or completion fact, and return to Cyclops when it is available.
-  An agent never grants itself this authority.
+- **Never type into another agent's pane by hand.** Do not `tmux send-keys`
+  (or paste, or otherwise type) directly into another agent's pane to "save
+  time" or route around a hold. The doorbell is written only after Cyclops
+  proves the pane is alive and bound to the intended agent, and a positively
+  observed human draft is a hard boundary. Every message goes through
+  `cyclops send`, even when a direct write looks faster.
+- **`--raw` is the only bypass, and it is recorded.** A slow delivery, a
+  hold, or an ambiguous outcome is not a reason to use it. Use it when
+  Cyclops's composer reading is wrong for a pane or the recipient is an
+  unverified vendor, know that it pastes the body into the pane, and say so
+  in the message. It never pretends to be a gated delivery.
 - **Never write the pane title.** It is a sensor cyclops (and the agent
   itself) reads to tell working from idle, not a place for your own
   decoration. If you want to announce a name or status, that is
   `cyclops name`, which paints the pane **border** and leaves the title
   alone.
-- **Notification ambiguity never auto-retries.** The immutable body remains
-  in the mailbox, and a direct payload may also be staged in the composer.
-  Inspect the exact attempt. An operator may use `cyclops
-  requeue <message-id>` only after resolving the cause and confirming the
-  attempt is eligible.
+- **Uncertainty is recorded, never retried automatically.** A line that
+  could not be read back is `submitted_unverified`; a missing receipt is
+  `notified` with no verifier; a physical write failure is
+  `attention_required`. The immutable body stays in the mailbox. Inspect the
+  pane and the exact attempt; an operator may use `cyclops requeue
+  <message-id>` only for an `attention_required` attempt whose cause is
+  understood.
 - **The ledger appends; it never retracts.** Do not expect a corrected or
   resolved fact to replace an old line. It lands as a **new** line
   (e.g., an alarm followed later by a clearance). If you are parsing the
@@ -444,5 +450,5 @@ and the proof).
 
 Doc links point at the repository on GitHub, so this file works from
 wherever it is installed. `cyclops start --setup-only --wire-hooks` seeds it
-for installed Claude Code, Codex, Cursor, Kimi, and Antigravity CLI consumers
-without overwriting operator-edited copies.
+for every installed consumer Cyclops ships a manifest for, without
+overwriting operator-edited copies.

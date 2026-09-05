@@ -40,7 +40,7 @@ impl Style {
     /// that file's warnings (an explicitly chosen theme that is missing,
     /// unknown tokens) to stderr. So only a command that is about to
     /// render calls it: `cyclops hook` must stay byte-silent, and
-    /// `cyclops ui` loads its own theme, so a Style built for either one
+    /// `cyclops watch` loads its own theme, so a Style built for either one
     /// broke a contract rather than helping.
     pub fn detect(plain: bool) -> Self {
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
@@ -118,7 +118,7 @@ impl Style {
     }
 
     /// The eye: eye.calm when nothing needs the human, eye.alert
-    /// otherwise. These are the tokens `cyclops ui` paints its own eye
+    /// otherwise. These are the tokens `cyclops watch` paints its own eye
     /// with, so the mark reads the same on both surfaces.
     ///
     /// Not surface.accent, which is what the status header used to paint.

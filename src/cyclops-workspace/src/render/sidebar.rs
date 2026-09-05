@@ -24,7 +24,7 @@ use cyclops_ui::Record;
 use crate::copy;
 use crate::decoration::DecorationSnapshot;
 use crate::drag::{DragState, DragTarget};
-use crate::input::mouse::{HitMap, HitTarget};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget};
 use crate::model::WorkspaceRow;
 use crate::persist::SidebarTab;
 use crate::theme::{self, Paint};
@@ -135,8 +135,9 @@ pub fn paint_daemon_status(
 }
 
 /// Render the workspace sidebar: the tab header, the selected tab's body,
-/// the shared footer, and the collapse chevron on its outer edge.
-#[allow(dead_code)]
+/// the shared footer, and the collapse chevron on its outer edge. The app
+/// calls `paint_sidebar_filtered` directly; this is the tests' entry.
+#[cfg(test)]
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,
@@ -233,7 +234,7 @@ pub fn paint_sidebar_filtered(
         SIDEBAR_GRAB_WIDTH.min(area.width),
         area.height,
     );
-    hits.push(grab, HitTarget::SidebarDivider);
+    hits.push(grab, HitLayer::Seam, HitTarget::SidebarDivider);
 
     // Two cells of breathing room keep workspace and agent names away from
     // the outer edge and the resize border.
@@ -340,7 +341,8 @@ pub fn paint_sidebar_filtered(
     // left it when the panel goes; the column moves because the panel it
     // was attached to did. It takes a band of the resize divider and no
     // more: the handle still answers on every row outside the band, and
-    // this hit is pushed last so the band wins its own rows.
+    // the control's layer sits above the handle's so the band wins its
+    // own rows.
     paint_toggle(
         buf,
         toggle_reach(edge),
@@ -421,7 +423,7 @@ fn paint_split(
     let glyph = if pointed || moving { "┅" } else { "─" };
     let rule: String = glyph.repeat(usize::from(seam.width));
     buf.set_stringn(seam.x, seam.y, &rule, usize::from(seam.width), style);
-    hits.push(seam, HitTarget::SidebarSplit);
+    hits.push(seam, HitLayer::Seam, HitTarget::SidebarSplit);
 }
 
 /// Recolor the pane canvas's own left border to show it doubles as the
@@ -596,7 +598,11 @@ pub fn paint_messages(
                 cyclops_ui::Scope::Inbox => "[Inbox ▾]",
                 cyclops_ui::Scope::Outbound => "[Outbox ▾]",
             };
-            let chip_w = scope_chip.len() as u16;
+            // Display columns, not bytes: the chevron is three bytes and
+            // one column, and a byte count made the hit rect two cells
+            // wider than the chip it was for.
+            let chip_w = u16::try_from(unicode_width::UnicodeWidthStr::width(scope_chip))
+                .unwrap_or(u16::MAX);
             let chip_x = area.x + 2 + title.len() as u16;
             if chip_x + chip_w + 2 < area.x + area.width {
                 super::overlay_text(
@@ -609,6 +615,7 @@ pub fn paint_messages(
                 );
                 hits.push(
                     Rect::new(chip_x, area.y, chip_w, 1),
+                    HitLayer::SidebarChrome,
                     HitTarget::MessagesAction(cyclops_ui::ChatAction::Scope),
                 );
             }
@@ -618,7 +625,7 @@ pub fn paint_messages(
     // The left edge of the Messages pane is the divider/toggle.
     let edge = Rect::new(area.x, area.y, 1, area.height);
     let grab = Rect::new(edge.x, edge.y, 1, edge.height);
-    hits.push(grab, HitTarget::MessagesDivider);
+    hits.push(grab, HitLayer::Seam, HitTarget::MessagesDivider);
     let hit = toggle_reach(edge);
     paint_toggle(
         buf,
@@ -690,7 +697,11 @@ pub fn paint_messages(
             let style = match &span.ink {
                 cyclops_ui::ChatInk::Button(action) => {
                     if row.kind == cyclops_ui::ChatLineKind::Strip && cell.width > 0 {
-                        hits.push(cell, HitTarget::MessagesAction(*action));
+                        hits.push(
+                            cell,
+                            HitLayer::SidebarChrome,
+                            HitTarget::MessagesAction(*action),
+                        );
                     }
                     if pointed(cell) {
                         theme::add_button_hover(paint)
@@ -880,7 +891,7 @@ fn paint_toggle(
         cell.set_symbol(glyph);
         cell.set_style(style);
     }
-    hits.push(hit, target);
+    hits.push(hit, HitLayer::SidebarChrome, target);
 }
 
 /// The Cyclops mark, right-aligned on the header row.
@@ -974,6 +985,7 @@ fn paint_tab_header(
             let chip_rect = Rect::new(fx, row.y, filter_w, 1);
             hits.push(
                 chip_rect,
+                HitLayer::SidebarChrome,
                 HitTarget::SidebarFilter {
                     filter: next_filter,
                 },
@@ -1020,6 +1032,7 @@ fn paint_tab_header(
             if x < right {
                 hits.push(
                     Rect::new(x, row.y, w.min(right - x), 1),
+                    HitLayer::SidebarChrome,
                     HitTarget::SidebarTab { tab: chip },
                 );
             }
@@ -1054,7 +1067,11 @@ fn paint_tab_header(
         };
         let chip_rect = Rect::new(x, row.y, share, 1);
         buf.set_style(chip_rect, style);
-        hits.push(chip_rect, HitTarget::SidebarTab { tab: chip });
+        hits.push(
+            chip_rect,
+            HitLayer::SidebarChrome,
+            HitTarget::SidebarTab { tab: chip },
+        );
         // Both cells of padding when the share can hold them; the leading
         // one goes first when it can't, because the label starting flush
         // with the chip's own edge is the smaller loss of the two.
@@ -1170,6 +1187,7 @@ fn paint_session_tree(
         );
         hits.push(
             row,
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: ws.session_id.clone(),
                 session: ws.name.clone(),
@@ -1177,6 +1195,7 @@ fn paint_session_tree(
         );
         hits.push(
             Rect::new(content.x, y, 1.min(content.width), 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarDisclosure {
                 session_id: ws.session_id.clone(),
             },
@@ -1218,6 +1237,7 @@ fn paint_session_tree(
             let order_key = DecorationSnapshot::agent_order_key(agent);
             hits.push(
                 row,
+                HitLayer::SidebarChrome,
                 HitTarget::SidebarAgent {
                     workspace_id: ws.session_id.clone(),
                     pane_id: agent.pane_id.clone(),
@@ -1349,6 +1369,7 @@ fn paint_footer(
     );
     hits.push(
         Rect::new(content.x, footer_y, menu_width, 1),
+        HitLayer::SidebarChrome,
         HitTarget::AppMenu,
     );
     // The composer's button, immediately left of the create button.
@@ -1444,6 +1465,7 @@ fn paint_footer(
     );
     hits.push(
         Rect::new(plus_x, footer_y, plus_width, 1),
+        HitLayer::SidebarChrome,
         HitTarget::NewWorkspaceButton,
     );
     if show_chat {
@@ -1461,6 +1483,7 @@ fn paint_footer(
         );
         hits.push(
             Rect::new(chat_x, footer_y, chat_width, 1),
+            HitLayer::SidebarChrome,
             HitTarget::ComposeButton,
         );
     }
@@ -3804,6 +3827,50 @@ mod tests {
             }
         }
         assert_eq!(found_actions, cyclops_ui::chat_actions(false));
+    }
+
+    /// The scope chip's hit rect is as wide as the chip reads, not as
+    /// wide as its bytes: `▾` is three bytes and one column, and a byte
+    /// count gave the chip two cells of the border after it.
+    #[test]
+    fn the_scope_chip_hit_is_its_display_width() {
+        let area = Rect::new(0, 0, 60, 24);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        let paint = Paint::for_test();
+        let queue = cyclops_ui::HumanQueue::new();
+        let registry = cyclops_ui::AvatarRegistry::default();
+        paint_messages(
+            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
+            &paint, &mut hits, None,
+        );
+
+        let chip = hits
+            .regions()
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.target,
+                    HitTarget::MessagesAction(cyclops_ui::ChatAction::Scope)
+                )
+            })
+            .map(|r| r.rect)
+            .expect("the header paints a scope chip at this width");
+        // The rect ends on the chip's closing bracket, and the cell after
+        // it is the border the chip sits in.
+        let symbol = |x: u16| buf[(x, chip.y)].symbol().to_string();
+        assert_eq!(symbol(chip.x), "[", "{chip:?}");
+        assert_eq!(symbol(chip.x + chip.width - 1), "]", "{chip:?}");
+        assert_ne!(symbol(chip.x + chip.width), "]", "{chip:?}");
+        let after = chip.x + chip.width;
+        assert!(
+            !matches!(
+                hits.hit(after, chip.y),
+                Some(HitTarget::MessagesAction(cyclops_ui::ChatAction::Scope))
+            ),
+            "the cell after the chip is border, not chip: {:?}",
+            hits.hit(after, chip.y)
+        );
     }
 
     /// A footer button fills under the pointer, the way every other chrome

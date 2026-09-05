@@ -22,7 +22,7 @@ use ratatui::text::Span;
 
 use crate::copy;
 use crate::files::{FileRow, FileTree, RowKind};
-use crate::input::mouse::{HitMap, HitTarget};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget};
 use crate::theme::{self, Paint};
 
 /// Disclosure markers, the same triangles the session tree uses for
@@ -215,7 +215,7 @@ fn paint_header(
     );
     // Clicking the folder name goes home: the focused pane's directory in
     // the agent view, the saved pinned folder in the pinned one.
-    hits.push(name_rect, HitTarget::FileRoot);
+    hits.push(name_rect, HitLayer::SidebarChrome, HitTarget::FileRoot);
 
     if area.width >= chip_width {
         let chip_rect = Rect::new(area.x + area.width - chip_width, area.y, chip_width, 1);
@@ -232,7 +232,11 @@ fn paint_header(
                 theme::menu_hint(paint)
             },
         );
-        hits.push(chip_rect, HitTarget::FilesViewToggle);
+        hits.push(
+            chip_rect,
+            HitLayer::SidebarChrome,
+            HitTarget::FilesViewToggle,
+        );
     }
 }
 
@@ -287,7 +291,7 @@ fn paint_nav(
                 theme::menu_hint(paint)
             },
         );
-        hits.push(reach, HitTarget::FileUp);
+        hits.push(reach, HitLayer::SidebarChrome, HitTarget::FileUp);
     }
 
     // Both arrows or neither, right-aligned as one block, so the pair keeps
@@ -317,7 +321,7 @@ fn paint_nav(
         };
         super::overlay_text(buf, row, at, row.y, glyph, style);
         if live {
-            hits.push(cell, target);
+            hits.push(cell, HitLayer::SidebarChrome, target);
         }
     }
 }
@@ -485,6 +489,7 @@ fn paint_row(
     let is_dir = matches!(row.kind, RowKind::Dir { .. });
     hits.push(
         rect,
+        HitLayer::SidebarChrome,
         HitTarget::FileRow {
             index,
             path: row.path.to_string_lossy().into_owned(),
@@ -494,11 +499,13 @@ fn paint_row(
     );
     // The chevron column keeps the open-in-place meaning the whole row used
     // to carry, now that clicking the name walks into the folder instead.
-    // Pushed AFTER the row so it wins its own cells: `HitMap::hit` scans in
-    // reverse. Same two-target shape as a workspace row's disclosure.
+    // Same layer as the row and pushed after it, so it wins its own cells
+    // (within a layer the last pushed answers). Same two-target shape as a
+    // workspace row's disclosure.
     if is_dir {
         hits.push(
             Rect::new(x, rect.y, width_of(DIR_SHUT).min(room), 1),
+            HitLayer::SidebarChrome,
             HitTarget::FileDisclosure {
                 path: row.path.to_string_lossy().into_owned(),
             },

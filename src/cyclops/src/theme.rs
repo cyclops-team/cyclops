@@ -7,7 +7,7 @@
 //!
 //! - one-shot commands read the selection at startup, so the next one
 //!   already has it,
-//! - `cyclops ui` and the daemon's pane borders hold a
+//! - `cyclops watch` and the daemon's pane borders hold a
 //!   `cyclops_theme::ThemeWatch`, which watches the config key as well as
 //!   the theme file, so they pick the switch up on their next repaint,
 //!   and the daemon nudge below makes that repaint happen now rather than
@@ -199,7 +199,7 @@ fn pad(s: &str, width: usize) -> String {
 /// three, and what differs is who has confirmed the screen.
 enum Switch {
     /// A daemon answered naming the theme just chosen. Pane borders and
-    /// any running `cyclops ui` are on it now.
+    /// any running `cyclops watch` are on it now.
     Live,
     /// Nothing answered on the socket. There is no screen to be wrong
     /// about; the next command reads the key.
@@ -221,7 +221,7 @@ enum Switch {
 ///    with the same result: it would repaint not one cell (see [`entries`],
 ///    which leaves it out of the listing for that reason).
 /// 3. Write the key, keeping the rest of the file exactly as written.
-/// 4. Tell the daemon, so pane borders and any running `cyclops ui`
+/// 4. Tell the daemon, so pane borders and any running `cyclops watch`
 ///    repaint now instead of on the next thing an agent does. Optional by
 ///    construction: the config is already written, and a down daemon
 ///    costs the switch nothing but the immediacy.

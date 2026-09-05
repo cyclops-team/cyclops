@@ -16,9 +16,6 @@ default_model_observed = "Gemini 3.6 Flash (High)"
 # gap below is a property of this vendor and a pane started here has it too.
 launch = "agy"
 
-[messaging]
-mailbox_capability_file = "~/.gemini/antigravity-cli/skills/cyclops/SKILL.md"
-
 [hooks]
 # From the binary's embedded docs (strings extraction) and confirmed live.
 config_mechanism = ".agents/hooks.json in the customization root"

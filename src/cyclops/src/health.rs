@@ -153,7 +153,6 @@ struct ConsumerReport {
     hook_state: &'static str,
     skill_path: PathBuf,
     skill_state: &'static str,
-    mailbox_transport: Option<&'static str>,
     complete: bool,
 }
 
@@ -1714,11 +1713,10 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             Ok(None) => AssetRead::Missing,
             Err(_) => AssetRead::Unproven,
         };
-        let (manifest_state, manifest_ready, ack_capable, mailbox_capability) = match manifest_file
-        {
-            AssetRead::Missing => ("missing", false, None, None),
-            AssetRead::Unproven => ("unproven", false, None, None),
-            AssetRead::Truncated => ("truncated", false, None, None),
+        let (manifest_state, manifest_ready, ack_capable) = match manifest_file {
+            AssetRead::Missing => ("missing", false, None),
+            AssetRead::Unproven => ("unproven", false, None),
+            AssetRead::Truncated => ("truncated", false, None),
             AssetRead::Bytes(bytes) => {
                 let shipped = crate::manifests::shipped_body(spec.id)
                     .expect("shipped consumer manifest")
@@ -1732,16 +1730,12 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
                     .ok()
                     .and_then(|body| cyclops_manifest::Manifest::parse(body, &manifest_path).ok());
                 match parsed {
-                    Some(parsed) if parsed.agent.id == spec.id => {
-                        let ack = parsed.hooks.ack.is_some();
-                        (
-                            state.word(),
-                            state.ready(),
-                            Some(ack),
-                            parsed.messaging.mailbox_capability_file,
-                        )
-                    }
-                    _ => ("invalid", false, None, None),
+                    Some(parsed) if parsed.agent.id == spec.id => (
+                        state.word(),
+                        state.ready(),
+                        Some(parsed.hooks.ack.is_some()),
+                    ),
+                    _ => ("invalid", false, None),
                 }
             }
         };
@@ -1765,10 +1759,6 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
         } else {
             ("not_installed", true)
         };
-        let mailbox_capability_path = mailbox_capability.as_deref().and_then(|declared| {
-            cyclops_manifest::mailbox_capability::resolve_path(declared, &user_home)
-        });
-        let mailbox_transport = mailbox_transport(installed, mailbox_capability_path.as_deref());
         let receipt_ready = !installed || spec.receipt.accepts(ack_capable);
         let complete = !installed
             || (install_state == "present"
@@ -1788,7 +1778,6 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             hook_state,
             skill_path,
             skill_state,
-            mailbox_transport,
             complete,
         });
     }
@@ -1851,23 +1840,6 @@ fn inspect_skill(asset: AssetRead) -> (&'static str, bool) {
             (state.word(), state.ready())
         }
     }
-}
-
-/// This mirrors the daemon's runtime capability proof. A non-private parent
-/// still blocks managed skill writes, but it does not turn current exact bytes
-/// into a direct-payload transport.
-fn mailbox_transport(installed: bool, capability_path: Option<&Path>) -> Option<&'static str> {
-    installed
-        .then(|| {
-            capability_path.map(|declared| {
-                if cyclops_manifest::mailbox_capability::is_current(declared) {
-                    "doorbell"
-                } else {
-                    "direct_payload"
-                }
-            })
-        })
-        .flatten()
 }
 
 fn inspect_operational_state(home: &Path) -> (ExternalStateReport, ExternalStateReport) {
@@ -2182,7 +2154,6 @@ fn report_json(report: &HealthReport) -> Value {
                     "path": consumer.skill_path.display().to_string(),
                     "state": consumer.skill_state,
                 },
-                "mailbox_transport": consumer.mailbox_transport,
             })).collect::<Vec<_>>(),
         },
         "build_cache": external_json(&report.build_cache),
@@ -2678,8 +2649,6 @@ mod tests {
 
         let asset = read_skill_asset(&location);
         assert_eq!(inspect_skill(asset), ("current", true));
-        assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
-        assert_eq!(mailbox_transport(true, Some(&skill)), Some("doorbell"));
     }
 
     fn private_scratch() -> tempfile::TempDir {

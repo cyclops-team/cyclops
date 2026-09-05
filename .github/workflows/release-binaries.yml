@@ -1,0 +1,122 @@
+name: release binaries
+
+# Builds the matched cyclops/cyclopsd pair for every published target and
+# uploads them to the GitHub Release for the pushed tag. Distinct from
+# release-evidence.yml: that workflow proves a beta candidate is safe to
+# release and never publishes anything; this one only packages and
+# publishes the binaries once a version has already been tagged. Neither
+# reads or writes the other's job names or artifacts.
+#
+# Native GitHub-hosted runners exist for three of the four targets; the
+# fourth (x86_64-apple-darwin) is cross-compiled from the arm64 macOS
+# runner, which is the one cross-compile Xcode's own toolchain needs no
+# extra linker for (unlike a foreign-OS cross-compile).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag is the one input an operator can get wrong: cut a release
+  # without bumping the workspace version, or bump it without tagging to
+  # match. Every asset name below embeds this version, so a mismatch has
+  # to fail here, before four builds run for nothing.
+  check-version:
+    name: tag matches the workspace version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: tag and Cargo.toml must name the same version
+        id: version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk -F'"' '/^version = /{ print $2; exit }' Cargo.toml)"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is the arm64 (Apple Silicon) image; GitHub's free
+          # tier has no native x86_64 macOS runner, only paid "-intel"
+          # large runners, so that target cross-compiles from here instead.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build the matched pair
+        run: cargo build --profile dist --target ${{ matrix.target }} -p cyclops -p cyclopsd
+      - name: Package cyclops, cyclopsd, and their checksums
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          stage="cyclops-$VERSION-$TARGET"
+          mkdir "$stage"
+          cp "target/$TARGET/dist/cyclops" "target/$TARGET/dist/cyclopsd" "$stage/"
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd "$stage" && sha256sum cyclops cyclopsd > SHA256SUMS )
+          else
+            ( cd "$stage" && shasum -a 256 cyclops cyclopsd > SHA256SUMS )
+          fi
+          tar czf "$stage.tar.gz" "$stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: cyclops-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: upload release assets
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload the matched pairs to the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber

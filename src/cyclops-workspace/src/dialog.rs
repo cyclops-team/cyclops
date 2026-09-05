@@ -63,7 +63,6 @@ pub enum Dialog {
         themes: ThemePicker,
         view: ViewSwitches,
         sound: SoundPicker,
-        delivery: ForceSubmitPicker,
     },
     /// The keybinding reference: every active binding, read-only, behind
     /// a viewport. A card of its own beside the settings card: nothing on
@@ -84,15 +83,13 @@ pub enum SettingsSection {
     Theme,
     View,
     Sound,
-    Delivery,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 4] = [
+    pub const ALL: [SettingsSection; 3] = [
         SettingsSection::Theme,
         SettingsSection::View,
         SettingsSection::Sound,
-        SettingsSection::Delivery,
     ];
 
     pub fn label(self) -> &'static str {
@@ -100,7 +97,6 @@ impl SettingsSection {
             SettingsSection::Theme => copy::SETTINGS_SECTION_THEME,
             SettingsSection::View => copy::SETTINGS_SECTION_VIEW,
             SettingsSection::Sound => copy::SETTINGS_SECTION_SOUND,
-            SettingsSection::Delivery => copy::SETTINGS_SECTION_DELIVERY,
         }
     }
 
@@ -142,65 +138,6 @@ pub struct ViewSwitches {
     pub tab_bar: bool,
     /// Whether the sidebar's file panel shows (`files_rows > 0`).
     pub files: bool,
-}
-
-/// Explicitly dangerous post-paste escape hatch. The timer is whole seconds
-/// because the UI is an operator choice, not a transport tuning surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForceSubmitPicker {
-    pub selected: usize,
-    pub enabled: bool,
-    pub delay_seconds: u8,
-    pub delay_label: String,
-    pub notice: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForceSubmitRow {
-    Enabled,
-    Delay,
-}
-
-impl ForceSubmitPicker {
-    pub const ROWS: [ForceSubmitRow; 2] = [ForceSubmitRow::Enabled, ForceSubmitRow::Delay];
-
-    pub fn new(enabled: bool, delay_seconds: u8) -> Self {
-        let delay_seconds = delay_seconds.min(20);
-        Self {
-            selected: 0,
-            enabled,
-            delay_seconds,
-            delay_label: force_submit_delay_label(delay_seconds),
-            notice: None,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        Self::ROWS.len()
-    }
-
-    pub fn selected_row(&self) -> Option<ForceSubmitRow> {
-        Self::ROWS.get(self.selected).copied()
-    }
-
-    pub fn adjust_delay(&mut self, delta: i16) {
-        let next = i16::from(self.delay_seconds)
-            .saturating_add(delta)
-            .clamp(0, 20);
-        self.delay_seconds = u8::try_from(next).expect("0 through 20 fits u8");
-        self.delay_label = force_submit_delay_label(self.delay_seconds);
-    }
-}
-
-fn force_submit_delay_label(seconds: u8) -> String {
-    let filled = usize::from(seconds / 2);
-    format!(
-        "{}  [{}{}] {}s",
-        copy::FORCE_SUBMIT_DELAY,
-        "■".repeat(filled),
-        "·".repeat(10usize.saturating_sub(filled)),
-        seconds
-    )
 }
 
 /// One row of the view section, by the surface it switches.
@@ -445,8 +382,6 @@ pub enum DialogKeyAction {
     ScrollEnd,
     /// Tab (forward) or Shift+Tab (back) across the settings sections.
     SwitchSection(i16),
-    /// Left/right adjustment for a selected settings slider.
-    Adjust(i16),
     Ignore,
 }
 
@@ -500,8 +435,6 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
             KeyCode::End => DialogKeyAction::ScrollEnd,
             KeyCode::Tab => DialogKeyAction::SwitchSection(1),
             KeyCode::BackTab => DialogKeyAction::SwitchSection(-1),
-            KeyCode::Left => DialogKeyAction::Adjust(-1),
-            KeyCode::Right => DialogKeyAction::Adjust(1),
             _ => DialogKeyAction::Ignore,
         };
     }
@@ -769,7 +702,6 @@ pub fn move_settings_selection(dialog: &mut Dialog, delta: i16) {
         themes,
         view,
         sound,
-        delivery,
     } = dialog
     else {
         return;
@@ -784,9 +716,6 @@ pub fn move_settings_selection(dialog: &mut Dialog, delta: i16) {
         SettingsSection::Sound => {
             sound.selected = move_selection(sound.selected, delta, sound.len());
         }
-        SettingsSection::Delivery => {
-            delivery.selected = move_selection(delivery.selected, delta, delivery.len());
-        }
     }
 }
 
@@ -797,7 +726,6 @@ pub fn jump_settings_selection(dialog: &mut Dialog, to_end: bool) {
         themes,
         view,
         sound,
-        delivery,
     } = dialog
     else {
         return;
@@ -807,7 +735,6 @@ pub fn jump_settings_selection(dialog: &mut Dialog, to_end: bool) {
         SettingsSection::Theme => themes.selected = last(themes.names.len()),
         SettingsSection::View => view.selected = last(view.len()),
         SettingsSection::Sound => sound.selected = last(sound.len()),
-        SettingsSection::Delivery => delivery.selected = last(delivery.len()),
     }
 }
 
@@ -829,7 +756,6 @@ pub fn select_settings_row(dialog: &mut Dialog, index: usize) {
         themes,
         view,
         sound,
-        delivery,
         ..
     } = dialog
     else {
@@ -839,26 +765,8 @@ pub fn select_settings_row(dialog: &mut Dialog, index: usize) {
         SettingsSection::Theme if index < themes.names.len() => themes.selected = index,
         SettingsSection::View if index < view.len() => view.selected = index,
         SettingsSection::Sound if index < sound.len() => sound.selected = index,
-        SettingsSection::Delivery if index < delivery.len() => delivery.selected = index,
         _ => {}
     }
-}
-
-pub fn adjust_force_submit_delay(dialog: &mut Dialog, delta: i16) -> bool {
-    let Dialog::Settings {
-        section: SettingsSection::Delivery,
-        delivery,
-        ..
-    } = dialog
-    else {
-        return false;
-    };
-    if delivery.selected_row() != Some(ForceSubmitRow::Delay) {
-        return false;
-    }
-    let before = delivery.delay_seconds;
-    delivery.adjust_delay(delta);
-    before != delivery.delay_seconds
 }
 
 /// Show the section `delta` steps along (Tab, Shift+Tab, a chip click).
@@ -987,7 +895,6 @@ mod tests {
                 vec!["bow-ripple".into(), "system".into()],
                 "bow-ripple",
             ),
-            delivery: ForceSubmitPicker::new(false, 5),
         }
     }
 
@@ -1054,34 +961,6 @@ mod tests {
         assert_eq!(
             dialog_key_action(&dialog, &key(KeyCode::Char('d'))),
             DialogKeyAction::Ignore
-        );
-    }
-
-    #[test]
-    fn delivery_delay_adjustment_is_explicit_and_clamped() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
-        let mut dialog = settings(SettingsSection::Delivery);
-        assert_eq!(
-            dialog_key_action(&dialog, &key(KeyCode::Right)),
-            DialogKeyAction::Adjust(1)
-        );
-        assert!(
-            !adjust_force_submit_delay(&mut dialog, 1),
-            "the toggle row is not the slider"
-        );
-        move_settings_selection(&mut dialog, 1);
-        assert!(adjust_force_submit_delay(&mut dialog, -20));
-        assert!(!adjust_force_submit_delay(&mut dialog, -1));
-        assert!(adjust_force_submit_delay(&mut dialog, 40));
-        assert!(!adjust_force_submit_delay(&mut dialog, 1));
-        let Dialog::Settings { delivery, .. } = dialog else {
-            unreachable!()
-        };
-        assert_eq!(delivery.delay_seconds, 20);
-        assert!(
-            delivery.delay_label.ends_with("20s"),
-            "{}",
-            delivery.delay_label
         );
     }
 
@@ -1213,14 +1092,11 @@ mod tests {
         switch_settings_section(&mut dialog, 1);
         move_settings_selection(&mut dialog, -1);
         switch_settings_section(&mut dialog, 1);
-        move_settings_selection(&mut dialog, 1);
-        switch_settings_section(&mut dialog, 1);
         let Dialog::Settings {
             section,
             themes,
             view,
             sound,
-            delivery,
             ..
         } = &dialog
         else {
@@ -1231,14 +1107,13 @@ mod tests {
         assert_eq!(view.selected, 1, "the view cursor moved on its own");
         assert_eq!(sound.selected, 0, "the sound cursor moved on its own");
         assert_eq!(sound.selected_row(), Some(SoundRow::Switch(true)));
-        assert_eq!(delivery.selected, 1, "the delivery cursor moved on its own");
 
         let mut back = settings(SettingsSection::Theme);
         switch_settings_section(&mut back, -1);
         assert!(matches!(
             back,
             Dialog::Settings {
-                section: SettingsSection::Delivery,
+                section: SettingsSection::Sound,
                 ..
             }
         ));

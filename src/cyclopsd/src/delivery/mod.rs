@@ -1,50 +1,42 @@
-//! The delivery pipeline (docs/development/DELIVERY.md is the spec, and the flow with
-//! its decision points drawn is docs/development/ARCHITECTURE.md).
+//! The notification pipeline (docs/development/DELIVERY.md is the spec, and
+//! the flow with its decision points drawn is docs/development/ARCHITECTURE.md).
 //!
-//! One worker per target pane; deliveries to one recipient are strictly
-//! FIFO. Direct-delivery transitions append to the session ledger. Mailbox
-//! notification transitions append only to the workspace journal through
-//! `NotificationContext`. Failures queue or park; they never drop (limbo is
-//! a bug).
+//! One worker per durable recipient; notifications to one mailbox are
+//! strictly FIFO. Every transition is a content-free workspace journal fact
+//! appended through `NotificationContext`. Failures queue or block durably;
+//! they never drop.
 //!
-//! Four things live here that read like they belong elsewhere, and each
+//! Three things live here that read like they belong elsewhere, and each
 //! one is here because it needs the same handle the pipeline holds:
-//! `admin_notify` (a ping usually points at a delivery), `close_limbo`
-//! (the retained restart sweep, entered only through `compatibility.rs`),
-//! `agent_wait` and
-//! `wait_pinned` (send-and-wait pins on the pid the submit went to), and
+//! `admin_notify` (a ping usually points at a notification), `agent_wait`
+//! (a pane-state wait pinned to the occupant present at its start), and
 //! `About`, the item a ping names so a reader can stop showing it.
 //!
 //! What is NOT decided here: whether a pane is idle (`fusion.rs`), which
 //! keys dismiss a modal (`cyclops-manifest` data), whether a finished
-//! delivery still needs a human (`cyclops_proto::attention`), and how any
-//! of it is worded for a person (the CLI).
+//! notification still needs a human (`cyclops_proto::attention`), and how
+//! any of it is worded for a person (the CLI).
 //!
 //! Zero-polling shape: workers sleep on queue notifies and wake on watcher
-//! or fusion events. Every timer is a one-shot tied to one delivery: the
+//! or fusion events. Every timer is a one-shot tied to one notification: the
 //! paste verification re-reads, the tier-1 ACK window, the screen-evidence
-//! checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
-//! deadline, the gate's single wedged-hold ping, and the two deadlines a
-//! caller asked for (`receipt_block_ms`, and `timeout_ms` on a wait). Nothing
-//! runs on an interval.
+//! checkpoints, the decline-key spacing, the two bounded re-observations of
+//! a hold that announces no event, the gate's single wedged-hold ping, and
+//! the two deadlines a caller asked for (`receipt_block_ms`, and `timeout_ms`
+//! on a wait). Nothing runs on an interval.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use cyclops_manifest::{
-    mailbox_capability, strip_csi, AckEvidence, Manifest, UnstyledComposerProof,
-};
+use cyclops_manifest::{strip_csi, AckEvidence, Manifest, UnstyledComposerProof};
 use cyclops_proto::{
-    AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
-    Detection, Event, Kind, LedgerLine, MsgSendParams, MsgSendResult, NotificationAttemptId,
-    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    AgentState, ComposerSemantic, DeliveryState, Detection, Event, Kind, LedgerLine,
+    NotificationAttemptId, NotificationAttentionCause, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
-    NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
-    ProcessInstanceId, QuiesceResult, RecipientKey, StatusDiagnostic, VerifiedBy, WaitUntil,
-    WireError,
+    NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey,
+    StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -54,9 +46,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::messaging::{MessagingPreWriteBlock, MessagingPreWriteBlockOutcome};
-use crate::notification_adapter::{
-    ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
-};
+use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
 
 pub(crate) mod gate;
@@ -68,9 +58,6 @@ pub(crate) use gate::*;
 pub use inject::*;
 pub use terminal::*;
 pub(crate) use worker::*;
-
-#[cfg(test)]
-use cyclops_proto::NotificationRouteEvidenceId;
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
 /// tier within 5s goes to retry_queued).
@@ -93,7 +80,7 @@ pub(crate) const DECLINE_SPACING: Duration = Duration::from_millis(250);
 /// Attempts to auto-dismiss one modal rule before treating it as
 /// non-dismissable (hold plus admin notify). Never loop.
 pub(crate) const MAX_DECLINES: u32 = 3;
-/// Default and ceiling for agent.wait / send-and-wait timeouts.
+/// Default and ceiling for agent.wait timeouts.
 pub(crate) const WAIT_DEFAULT_MS: u64 = 60_000;
 pub(crate) const WAIT_MAX_MS: u64 = 600_000;
 /// Default and ceiling for `daemon.quiesce`: how long to wait for
@@ -113,21 +100,16 @@ pub(crate) const QUIESCE_HOLD_FALLBACK_MS: u64 = 30_000;
 pub(crate) const ACK_REGISTRY_CAP: usize = 32;
 pub(crate) const NO_LONGER_CURRENT_BEFORE_WRITE: &str = "notification_no_longer_current";
 pub(crate) const NOTIFICATION_RECORD_FAILED: &str = "notification_record_failed";
-pub(crate) const CLAIMED_STAGED_SETTLEMENT_FAILED: &str = "claimed_staged_settlement_failed";
 
 /// Delivery engine state. Lives in [`Inner`]; all behavior is free
 /// functions taking the daemon state so nothing here holds locks across
 /// awaits by construction.
 pub(crate) struct Engine {
-    /// Legacy direct-delivery workers, keyed by exact watched pane route.
-    pub(crate) workers: StdMutex<HashMap<PaneKey, LegacyWorker>>,
     /// Active mailbox workers and their tasks, keyed by durable recipient.
     pub(crate) notification_workers: StdMutex<HashMap<RecipientKey, NotificationWorker>>,
-    /// Message ids ever issued or seen in the ledgers (unique per ledger).
-    pub(crate) issued: StdMutex<HashSet<String>>,
     /// Per-delivery unique tmux buffer names.
     pub(crate) buffer_seq: AtomicU64,
-    /// Deliveries awaiting or upgradeable by a hook ACK, per exact route.
+    /// Notifications awaiting or upgradeable by a hook ACK, per exact route.
     pub(crate) acks: StdMutex<HashMap<PaneKey, Vec<Arc<DeliveryHandle>>>>,
     /// Weak refs to every handle the pipeline has created, for the
     /// quiesce sweep. Pruned as it is read; the pipeline itself never
@@ -195,9 +177,7 @@ impl Engine {
     pub(crate) fn new() -> Engine {
         let (descendant_stop, _) = watch::channel(false);
         Engine {
-            workers: StdMutex::new(HashMap::new()),
             notification_workers: StdMutex::new(HashMap::new()),
-            issued: StdMutex::new(HashSet::new()),
             buffer_seq: AtomicU64::new(0),
             acks: StdMutex::new(HashMap::new()),
             open: StdMutex::new(Vec::new()),
@@ -253,9 +233,6 @@ impl Engine {
         self.stopping.store(true, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
         self.descendant_stop.send_replace(true);
-        for entry in self.workers.lock().expect("workers lock").values() {
-            entry.worker.notify.notify_waiters();
-        }
         for entry in self
             .notification_workers
             .lock()
@@ -313,10 +290,7 @@ impl Engine {
     /// Evidence-driven reopening replaces the index with a fresh handle for
     /// the same durable attempt. The returning stale handle must not erase it.
     pub(crate) fn retire_notification_run(&self, handle: &Arc<DeliveryHandle>) -> bool {
-        let Some(notification) = &handle.notification else {
-            return false;
-        };
-        let attempt_id = notification.attempt_id();
+        let attempt_id = handle.notification.attempt_id();
         let mut active = self
             .notification_attempts
             .lock()
@@ -337,10 +311,7 @@ impl Engine {
         old: &Arc<DeliveryHandle>,
         new: &Arc<DeliveryHandle>,
     ) -> bool {
-        let Some(notification) = &old.notification else {
-            return false;
-        };
-        let attempt_id = notification.attempt_id();
+        let attempt_id = old.notification.attempt_id();
         let mut active = self
             .notification_attempts
             .lock()
@@ -359,66 +330,9 @@ impl Engine {
         owns_entry
     }
 
-    /// Run one synchronous queue action while this exact legacy worker is
-    /// published in the registry.
-    ///
-    /// Retirement takes the same registry lock before checking the worker
-    /// queue. Keeping lookup, creation, and queue mutation under that lock
-    /// means an idle retirement can never remove a worker between a producer
-    /// finding it and publishing the next handle.
-    pub(crate) fn with_legacy_worker<T, S, F>(
-        &self,
-        pane: PaneKey,
-        spawn: S,
-        action: F,
-    ) -> Option<T>
-    where
-        S: FnOnce(Arc<Worker>) -> JoinHandle<()>,
-        F: FnOnce(&Arc<Worker>) -> T,
-    {
-        let mut entries = self.workers.lock().expect("workers lock");
-        if self.stopping.load(Ordering::SeqCst) {
-            return None;
-        }
-        if !entries.contains_key(&pane) {
-            let worker = Arc::new(Worker::new());
-            let task = spawn(Arc::clone(&worker));
-            entries.insert(pane.clone(), LegacyWorker { worker, task });
-        }
-        let worker = Arc::clone(&entries.get(&pane).expect("worker inserted above").worker);
-        Some(action(&worker))
-    }
-
-    /// Remove this exact legacy worker only while its FIFO is still empty.
-    pub(crate) fn retire_legacy_worker(&self, pane: &PaneKey, worker: &Arc<Worker>) -> bool {
-        let mut entries = self.workers.lock().expect("workers lock");
-        let Some(entry) = entries.get(pane) else {
-            return true;
-        };
-        if !Arc::ptr_eq(&entry.worker, worker) {
-            return true;
-        }
-        if !worker.is_idle() {
-            return false;
-        }
-        entries.remove(pane);
-        true
-    }
-
-    pub(crate) fn legacy_worker_is_current(&self, pane: &PaneKey, worker: &Arc<Worker>) -> bool {
-        self.workers
-            .lock()
-            .expect("workers lock")
-            .get(pane)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.worker, worker))
-    }
-
     /// Un-hold the pipeline and wake every worker.
     pub(crate) fn resume_workers(&self) {
         self.paused.store(false, Ordering::SeqCst);
-        for entry in self.workers.lock().expect("workers lock").values() {
-            entry.worker.notify.notify_one();
-        }
         for entry in self
             .notification_workers
             .lock()
@@ -538,13 +452,6 @@ impl Engine {
         .collect()
     }
 
-    pub(crate) fn take_legacy_worker_tasks(&self) -> Vec<JoinHandle<()>> {
-        std::mem::take(&mut *self.workers.lock().expect("workers lock"))
-            .into_values()
-            .map(|entry| entry.task)
-            .collect()
-    }
-
     /// Content-free faults for exact notification work that stopped in memory.
     pub(crate) fn notification_worker_diagnostics(&self) -> Vec<StatusDiagnostic> {
         self.notification_workers
@@ -555,11 +462,9 @@ impl Engine {
                 let state = entry.worker.state.lock().expect("worker state lock");
                 let fault = state.fault.as_ref()?;
                 let handle = state.current.as_ref().or_else(|| state.queue.front())?;
-                let notification = handle.notification.as_ref()?;
+                let notification = &handle.notification;
                 Some(StatusDiagnostic {
-                    code: if fault == CLAIMED_STAGED_SETTLEMENT_FAILED {
-                        "notification_settlement_storage_failed"
-                    } else if fault.starts_with("notification pre-write block storage failed:") {
+                    code: if fault.starts_with("notification pre-write block storage failed:") {
                         "notification_prewrite_storage_failed"
                     } else if fault.starts_with("notification recovery failed:") {
                         "notification_recovery_storage_failed"
@@ -617,15 +522,12 @@ impl Engine {
         let current = state
             .current
             .as_ref()
-            .and_then(|handle| handle.notification.as_ref())
-            .is_some_and(|notification| notification.attempt_id() == attempt_id);
+            .is_some_and(|handle| handle.notification.attempt_id() == attempt_id);
         if current
-            || state.queue.iter().any(|handle| {
-                handle
-                    .notification
-                    .as_ref()
-                    .is_some_and(|notification| notification.attempt_id() == attempt_id)
-            })
+            || state
+                .queue
+                .iter()
+                .any(|handle| handle.notification.attempt_id() == attempt_id)
         {
             None
         } else {
@@ -645,99 +547,39 @@ impl Engine {
         let entry = workers.get(&recipient)?;
         let state = entry.worker.state.lock().expect("worker state lock");
         let current = state.current.as_ref()?;
-        let notif_attempt = current.notification.as_ref().map(|n| n.attempt_id());
-        Some((current.msg_id.clone(), notif_attempt))
-    }
-
-    #[doc(hidden)]
-    pub(crate) fn legacy_worker_current_for_test(&self, key: &PaneKey) -> Option<String> {
-        let workers = self.workers.lock().expect("workers lock");
-        let entry = workers.get(key)?;
-        let state = entry.worker.state.lock().expect("worker state lock");
-        state.current.as_ref().map(|c| c.msg_id.clone())
-    }
-
-    /// Seed the issued-id set from a ledger so new ids stay unique per
-    /// ledger across daemon restarts.
-    pub(crate) fn preload_ids(&self, lines: &[LedgerLine]) {
-        let mut issued = self.issued.lock().expect("issued lock");
-        for l in lines {
-            if matches!(l.kind, Kind::Msg | Kind::Fyi) {
-                issued.insert(l.id.clone());
-            }
-        }
-    }
-
-    /// Mint a short unique message id, e.g. "m-3f9c2a".
-    pub(crate) fn mint_msg_id(&self) -> String {
-        self.mint_msg_id_with(|| format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]))
-    }
-
-    pub(crate) fn mint_msg_id_with(&self, mut candidate: impl FnMut() -> String) -> String {
-        let mut issued = self.issued.lock().expect("issued lock");
-        loop {
-            let id = candidate();
-            if issued.insert(id.clone()) {
-                return id;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mint_msg_id_from(&self, candidates: &[&str]) -> String {
-        let mut candidates = candidates.iter();
-        self.mint_msg_id_with(|| {
-            candidates
-                .next()
-                .expect("test candidate sequence exhausted")
-                .to_string()
-        })
+        Some((
+            current.msg_id.clone(),
+            Some(current.notification.attempt_id()),
+        ))
     }
 }
 
-/// One recipient's delivery, shared between the worker, the ACK matcher,
-/// and receipt waiters.
+/// One recipient's notification attempt, shared between the worker, the
+/// ACK matcher, and receipt waiters.
 pub(crate) struct DeliveryHandle {
     pub(crate) msg_id: String,
     /// Recipient as addressed (label, or pane id when unlabeled).
     pub(crate) to: String,
     pub(crate) pane_id: String,
     pub(crate) session_idx: usize,
-    /// Session files this delivery's state lines append to. Normally just
-    /// the hosting session; an unresolvable recipient records into every
-    /// session file that carries the msg line, so each file stays a
-    /// complete stream.
-    pub(crate) ledger_sessions: Vec<usize>,
+    /// The exact bytes selected at the write boundary. Empty until then.
     pub(crate) payload: StdMutex<String>,
     /// Durable one-shot notification facts emitted at this worker's real boundaries.
-    pub(crate) notification: Option<NotificationContext>,
+    pub(crate) notification: NotificationContext,
     /// Payload shape persisted at the notification write boundary.
     pub(crate) notification_transport: StdMutex<Option<cyclops_proto::NotificationTransport>>,
     pub(crate) state: StdMutex<HandleState>,
     pub(crate) state_tx: watch::Sender<DeliveryState>,
-    /// Wakes the worker when the ACK matcher resolved this delivery.
+    /// Wakes the worker when the ACK matcher resolved this notification.
     pub(crate) ack: Notify,
     /// Wakes a held gate after the same claim fact withdraws its attempt.
     pub(crate) cancel: Notify,
-    /// Working evidence at or after this delivery's submit.
-    ///
-    /// The legacy composed wait uses this only to reject a working phase
-    /// that predates the submit. It does not correlate a turn to a message.
+    /// Working evidence at or after this notification's submit. Tier-2
+    /// receipt evidence only; it does not correlate a turn to a message.
     pub(crate) working_seen: AtomicBool,
-    /// A receiver opened before the submit key and handed to a composed wait.
-    /// It may contain older broadcasts, so the wait treats it only as a
-    /// source of an exact post-submit Working fact. Its state sequence never
-    /// becomes the wait's live state.
-    pub(crate) post_submit_turn_events: StdMutex<Option<broadcast::Receiver<Event>>>,
-    /// pane_pid of the occupant this delivery was submitted to, recorded
-    /// right before the submit key. Send-and-wait pins its wait on THIS
-    /// occupant, not whoever lives in the pane when the wait starts; an
-    /// impostor that swaps in between must read occupant_changed, never a
-    /// report about itself. 0 until a submit happened.
-    pub(crate) submitted_pid: AtomicI32,
     /// The admitted AGENT identity the submit key reached, birth included
     /// so a reused pid is a different agent rather than an heir to this
-    /// delivery's trust.
+    /// notification's trust.
     pub(crate) submitted_agent: StdMutex<Option<crate::identity::ProcId>>,
     /// When the submit key went out. A screen-lifecycle receipt carries
     /// this mark for diagnosis. Exact lifecycle release ignores it and
@@ -752,15 +594,9 @@ pub(crate) struct DeliveryHandle {
     pub(crate) write_boundary_crossed: AtomicBool,
     /// One automatic supervisor recovery is allowed for this exact run.
     pub(crate) worker_recoveries: AtomicU64,
-    /// A readiness edge observed while this claimed-barrier run was active.
-    /// Consumed only after the attempt index releases this handle.
-    pub(crate) claimed_notification_rerun_requested: AtomicBool,
-    /// This ordinary notification was admitted immediately before paste while
-    /// the pane was visibly Working and its composer was positively clean or
-    /// ghosted. The staged doorbell naturally reads as input afterward, so
-    /// this one-attempt capability carries the pre-paste proof to the final
-    /// exact-byte submit check. It is never restored or used by recovery.
-    pub(crate) working_clean_submit_admitted: AtomicBool,
+    /// The sender asked for a raw write: the whole message, no composer
+    /// check, no receipt. Read once from the message at enqueue.
+    pub(crate) raw: bool,
 }
 
 /// Evidence from a vendor hook that landed before the worker consumed it.
@@ -786,11 +622,9 @@ pub(crate) struct HandleState {
     pub(crate) attempts: u32,
     pub(crate) verified_by: Option<VerifiedBy>,
     pub(crate) cause: Option<String>,
-    /// Human hint carried into receipts (quota reset, attention cause).
-    pub(crate) note: Option<String>,
     /// Normalized gate hold token for the in-flight head, if any.
     pub(crate) held_by: Option<String>,
-    /// An acknowledgement that arrived before the delivery reached the
+    /// An acknowledgement that arrived before the notification reached the
     /// state that consumes one.
     ///
     /// Kept HERE, under the same lock as the state, because installing it
@@ -799,66 +633,37 @@ pub(crate) struct HandleState {
     /// `Submitted` and consume in between: the record is then written
     /// after the only read of it, and a valid acknowledgement is lost.
     pub(crate) early_ack: Option<PendingAck>,
-    /// Monotonic count of direct-delivery barrier claims, including
-    /// refused ones. Mailbox notifications use their durable attempt id.
-    /// Separate from `attempts` because a refused claim wrote nothing and
-    /// must not cost transport budget.
-    pub(crate) claims: u32,
     /// Count of write-boundary refusals that wrote no pane bytes. Attempts
     /// remain append-only, so retry accounting subtracts this cumulative
     /// count rather than charging a refusal as transport work.
     pub(crate) regates: u32,
-    /// Binding and capability each receive one immediate re-proof after an
-    /// exact pane or readiness edge. Repeated refusal under unchanged
-    /// evidence settles as a durable pre-write block.
-    pub(crate) regate_reproof_used: [bool; 2],
-    /// The barrier claim this delivery currently holds. Set only when a
+    /// The barrier claim this notification currently holds. Set only when a
     /// claim was granted, and compared before any later settlement so a
-    /// receipt cannot release a barrier this delivery no longer owns.
+    /// receipt cannot release a barrier this notification no longer owns.
     pub(crate) barrier: Option<String>,
 }
 
-/// The pre-Enter event receiver travels with the exact delivery it observed.
-/// It is consumed only as a fact source by the composed `send --wait` path;
-/// the wait itself starts a fresh live receiver after its baseline.
-pub(crate) struct SubmittedTurnEvidence {
-    pub(crate) events: broadcast::Receiver<Event>,
-    pub(crate) handle: Arc<DeliveryHandle>,
-}
-
-/// Identity facts a wait must preserve from a preceding delivery.
-#[derive(Default)]
-pub(crate) struct WaitPin {
-    pub(crate) submitted_pid: Option<i32>,
-    pub(crate) turn_evidence: Option<SubmittedTurnEvidence>,
-}
-
 impl DeliveryHandle {
-    /// This attempt's claim on a pane's composer barrier.
-    ///
-    /// Content-free and unique per claim. Mailbox notifications use the
-    /// durable attempt id; direct deliveries use message id plus claim.
-    /// Does this hook prompt carry exactly the payload this delivery
-    /// rendered? The bytes stay inside the handle; see `prompt_matches`
-    /// for why nothing weaker is accepted.
+    /// Does this hook prompt carry exactly the payload this notification
+    /// wrote? The bytes stay inside the handle; see `prompt_matches` for
+    /// why nothing weaker is accepted. Nothing matches before the write
+    /// boundary selected the bytes.
     pub(crate) fn claims_prompt(&self, text: &str) -> bool {
-        prompt_matches(text, &self.payload.lock().expect("payload lock"))
+        let payload = self.payload.lock().expect("payload lock");
+        !payload.is_empty() && prompt_matches(text, &payload)
     }
 
+    /// This attempt's claim on a pane's composer barrier: the durable
+    /// attempt id, content-free and unique per attempt.
     pub(crate) fn barrier_owner(&self) -> String {
-        if let Some(notification) = &self.notification {
-            return notification.attempt_id().to_string();
-        }
-        let mut st = self.state.lock().expect("handle state lock");
-        st.claims += 1;
-        format!("{}#{}", self.msg_id, st.claims)
+        self.notification.attempt_id().to_string()
     }
 
     /// Is this report from the process and rules the submit key reached?
     ///
     /// False before a submit has happened at all, which is the point: the
     /// ACK registry is deliberately populated earlier so a fast hook is
-    /// not missed, and a delivery that has not been submitted has no
+    /// not missed, and a notification that has not been submitted has no
     /// binding for a hook to match.
     pub(crate) fn submitted_binding_is(
         &self,
@@ -876,100 +681,20 @@ impl DeliveryHandle {
             == Some(manifest_id)
     }
 
-    pub(crate) fn replace_post_submit_turn_events(&self, events: broadcast::Receiver<Event>) {
-        *self
-            .post_submit_turn_events
-            .lock()
-            .expect("post-submit turn events lock") = Some(events);
-    }
-
-    pub(crate) fn take_post_submit_turn_evidence(
-        self: &Arc<Self>,
-    ) -> Option<SubmittedTurnEvidence> {
-        self.post_submit_turn_events
-            .lock()
-            .expect("post-submit turn events lock")
-            .take()
-            .map(|events| SubmittedTurnEvidence {
-                events,
-                handle: Arc::clone(self),
-            })
-    }
-
-    pub(crate) fn new(
-        msg_id: &str,
-        to: &str,
-        pane_id: &str,
-        session_idx: usize,
-        payload: String,
-    ) -> Arc<Self> {
-        Self::build(
-            msg_id,
-            to,
-            pane_id,
-            session_idx,
-            vec![session_idx],
-            payload,
-            None,
-        )
-    }
-
-    pub(crate) fn with_ledger_sessions(
-        msg_id: &str,
-        to: &str,
-        pane_id: &str,
-        session_idx: usize,
-        ledger_sessions: Vec<usize>,
-        payload: String,
-    ) -> Arc<Self> {
-        Self::build(
-            msg_id,
-            to,
-            pane_id,
-            session_idx,
-            ledger_sessions,
-            payload,
-            None,
-        )
-    }
-
     pub(crate) fn for_notification(
         to: &str,
         pane_id: &str,
         session_idx: usize,
-        doorbell: String,
         notification: NotificationContext,
     ) -> Arc<Self> {
-        let msg_id = notification.message_id().to_string();
-        Self::build(
-            &msg_id,
-            to,
-            pane_id,
-            session_idx,
-            vec![session_idx],
-            doorbell,
-            Some(notification),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build(
-        msg_id: &str,
-        to: &str,
-        pane_id: &str,
-        session_idx: usize,
-        ledger_sessions: Vec<usize>,
-        payload: String,
-        notification: Option<NotificationContext>,
-    ) -> Arc<Self> {
         let (state_tx, _) = watch::channel(DeliveryState::Queued);
+        let raw = notification.raw_transport();
         Arc::new(DeliveryHandle {
-            msg_id: msg_id.to_string(),
+            msg_id: notification.message_id().to_string(),
             to: to.to_string(),
             pane_id: pane_id.to_string(),
             session_idx,
-            ledger_sessions,
-            payload: StdMutex::new(payload),
+            payload: StdMutex::new(String::new()),
             notification,
             notification_transport: StdMutex::new(None),
             state: StdMutex::new(HandleState {
@@ -977,30 +702,25 @@ impl DeliveryHandle {
                 attempts: 0,
                 verified_by: None,
                 cause: None,
-                note: None,
                 held_by: None,
                 early_ack: None,
-                claims: 0,
                 regates: 0,
-                regate_reproof_used: [false; 2],
                 barrier: None,
             }),
             state_tx,
             ack: Notify::new(),
             cancel: Notify::new(),
             working_seen: AtomicBool::new(false),
-            post_submit_turn_events: StdMutex::new(None),
-            submitted_pid: AtomicI32::new(0),
             submitted_agent: StdMutex::new(None),
             submitted_at_ms: std::sync::atomic::AtomicU64::new(0),
             submitted_manifest: StdMutex::new(None),
             write_boundary_crossed: AtomicBool::new(false),
             worker_recoveries: AtomicU64::new(0),
-            claimed_notification_rerun_requested: AtomicBool::new(false),
-            working_clean_submit_admitted: AtomicBool::new(false),
+            raw,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> String {
         self.payload.lock().expect("payload lock").clone()
     }
@@ -1024,40 +744,6 @@ impl DeliveryHandle {
             .expect("notification transport lock")
     }
 
-    pub(crate) fn set_working_clean_submit_admitted(&self, admitted: bool) {
-        self.working_clean_submit_admitted
-            .store(admitted, Ordering::SeqCst);
-    }
-
-    pub(crate) fn working_clean_submit_admitted(&self) -> bool {
-        self.working_clean_submit_admitted.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn restore_claimed_notification_barrier(&self) {
-        let attempt_id = self
-            .notification
-            .as_ref()
-            .expect("staged recovery belongs to a notification")
-            .attempt_id();
-        {
-            let mut state = self.state.lock().expect("handle state lock");
-            state.state = DeliveryState::Staged;
-            state.barrier = Some(attempt_id.to_string());
-        }
-        self.state_tx.send_replace(DeliveryState::Staged);
-        *self
-            .notification_transport
-            .lock()
-            .expect("notification transport lock") = Some(NotificationTransport::Doorbell);
-        self.write_boundary_crossed.store(true, Ordering::SeqCst);
-    }
-
-    /// Direct sends own session delivery state. Mailbox notifications use
-    /// only their durable workspace notification record.
-    pub(crate) fn owns_session_delivery_state(&self) -> bool {
-        self.notification.is_none()
-    }
-
     pub(crate) fn state(&self) -> DeliveryState {
         self.state.lock().expect("handle state lock").state
     }
@@ -1070,7 +756,6 @@ impl DeliveryHandle {
         Option<VerifiedBy>,
         Option<String>,
         Option<String>,
-        Option<String>,
     ) {
         let st = self.state.lock().expect("handle state lock");
         (
@@ -1078,7 +763,6 @@ impl DeliveryHandle {
             st.attempts,
             st.verified_by,
             st.cause.clone(),
-            st.note.clone(),
             st.held_by.clone(),
         )
     }
@@ -1100,24 +784,10 @@ impl DeliveryHandle {
 pub(crate) struct About {
     /// The pane whose blocked state raised the ping.
     pub(crate) pane_id: Option<String>,
-    /// The recipient of the delivery the ping is about. That delivery's
-    /// id is the ping's own `msg_id`, so this pairs with `Some(msg_id)`.
+    /// The recipient of the notification the ping is about. That
+    /// notification's message id is the ping's own `msg_id`, so this pairs
+    /// with `Some(msg_id)`.
     pub(crate) to: Option<String>,
-    /// Every delivery a ping about SEVERAL of them names, when one ping
-    /// covers a batch. The ping's own `msg_id` can only name one, and the
-    /// restart closure ends a whole run's worth at once.
-    pub(crate) deliveries: Vec<DeliveryRef>,
-}
-
-/// One delivery a batch ping points at, keyed the way the register keys
-/// it: recipient plus message.
-///
-/// Named fields, not a pair: both are strings, they sit next to each
-/// other, and a transposition would compile and then quietly point every
-/// ping at nothing.
-pub(crate) struct DeliveryRef {
-    pub(crate) to: String,
-    pub(crate) msg_id: String,
 }
 
 impl About {
@@ -1129,28 +799,18 @@ impl About {
         }
     }
 
-    /// A ping about one delivery to `to`. Pass the message id as `msg_id`
-    /// or the ping names a recipient without saying which delivery.
+    /// A ping about one notification to `to`. Pass the message id as
+    /// `msg_id` or the ping names a recipient without saying which message.
     pub(crate) fn delivery(to: &str) -> About {
         About {
             to: Some(to.to_string()),
             ..About::default()
         }
     }
-
-    /// A ping about many deliveries at once. A reader holds it against
-    /// the register per item and shows it while ANY of them still stands,
-    /// so one summary line cannot outlive the whole batch it summarizes.
-    pub(crate) fn deliveries(deliveries: Vec<DeliveryRef>) -> About {
-        About {
-            deliveries,
-            ..About::default()
-        }
-    }
 }
 
 /// Write a kind=system admin notification line and broadcast the event.
-/// `session_idx` scopes internal (delivery-driven) notifications to the
+/// `session_idx` scopes internal (notification-driven) pings to the
 /// recipient's ledger; None (external admin.notify) writes to every active
 /// canonical session ledger so any live single-session reader sees it.
 pub(crate) fn admin_notify(
@@ -1174,20 +834,6 @@ pub(crate) fn admin_notify(
     }
     if let Some(to) = &about.to {
         about_fields.insert("to".into(), json!(to));
-    }
-    if !about.deliveries.is_empty() {
-        // The batch form of the `to` field above, spelled the same way:
-        // recipient plus message id, which is the register's key for the
-        // delivery half. Additive and absent when the ping names one item
-        // or none.
-        about_fields.insert(
-            "deliveries".into(),
-            json!(about
-                .deliveries
-                .iter()
-                .map(|d| json!({"to": d.to, "id": d.msg_id}))
-                .collect::<Vec<_>>()),
-        );
     }
     let with_about = |mut v: Value| {
         if let Value::Object(map) = &mut v {
@@ -1245,9 +891,9 @@ pub(crate) fn admin_notify(
 /// Those windows are seconds by construction: the verify re-reads and the
 /// acknowledgment deadline. On a healthy fleet this answers quickly.
 ///
-/// Deliveries that have not reached a pane do not block quiet: a restart
-/// requeues them ([`close_limbo`]). Quiet keeps the pipeline held for the
-/// stop that should follow, with a bounded self-release in case the
+/// Notifications that have not reached a pane do not block quiet: they are
+/// durably queued and the next boot schedules them again. Quiet keeps the
+/// pipeline held for the stop that should follow, with a bounded self-release in case the
 /// caller died between the answer and the signal. Not-quiet releases the
 /// hold immediately and names what is still moving.
 pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> QuiesceResult {
@@ -1311,682 +957,6 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
     }
 }
 
-// ---------------------------------------------------------------------------
-// Restart recovery
-// ---------------------------------------------------------------------------
-
-/// Resolve deliveries a previous daemon run left unresolved. This runs once
-/// at boot over the replayed session ledgers. The pre-write boundary decides
-/// each chain's fate, using the same boundary
-/// the running pipeline retries by:
-///
-/// - Before the paste (queued, gating, retry_queued): nothing has touched
-///   the pane, so the chain is requeued. The payload is rebuilt from the message
-///   line, handle re-enqueued, and the delivery re-enters the gate as if
-///   the restart were a long hold. One aggregated FYI names them.
-/// - Past the paste: the outcome is unknowable from here, so the chain
-///   closes as attention_required (cause: daemon_restart) and ONE
-///   aggregated action-required admin.notify lists everything closed.
-/// - A pre-paste chain whose recipient no longer maps to any pane (label
-///   not adopted, session not watched this boot) has nothing to requeue
-///   into and closes the same way.
-///
-/// A msg line's `hosted` list names the recipients whose chains live in
-/// that file, so a chain recorded in another session's file is never
-/// falsely closed here; a delivery that died before its first state line
-/// still closes through its hosted msg record.
-pub(crate) fn close_limbo(
-    inner: &Arc<Inner>,
-    replayed: &[(usize, Vec<LedgerLine>)],
-    _boundary: &crate::compatibility::BoundaryToken,
-) {
-    /// What `render_payload` needs to rebuild a requeued delivery's bytes,
-    /// straight off the msg line.
-    struct Envelope {
-        from: String,
-        subject: String,
-        body: String,
-        fyi: bool,
-    }
-    struct Chain {
-        state: DeliveryState,
-        attempts: u32,
-        owner: usize,
-        owners: BTreeSet<usize>,
-        rank: u64,
-    }
-    fn consider(
-        chains: &mut HashMap<(String, String), Chain>,
-        key: (String, String),
-        state: DeliveryState,
-        attempts: u32,
-        owner: usize,
-        rank: u64,
-    ) {
-        match chains.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Chain {
-                    state,
-                    attempts,
-                    owner,
-                    owners: BTreeSet::from([owner]),
-                    rank,
-                });
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let current = entry.get_mut();
-                current.owners.insert(owner);
-                // A terminal fact in the configured root closes unresolved
-                // history in a linked journal. Otherwise the family's
-                // descendant-first/root-last scan is its causal order; wall
-                // clocks from separate journal files are not comparable.
-                let terminal_wins = receipt_resolved(state) && !receipt_resolved(current.state);
-                let same_class_is_newer = receipt_resolved(state)
-                    == receipt_resolved(current.state)
-                    && rank > current.rank;
-                if terminal_wins || same_class_is_newer {
-                    current.state = state;
-                    current.attempts = attempts;
-                    current.owner = owner;
-                    current.rank = rank;
-                }
-            }
-        }
-    }
-    let workspace_ids = match &inner.mailbox {
-        Some(service) => match service.workspace_message_ids() {
-            Ok(ids) => ids,
-            Err(error) => {
-                // Recovery must fail closed when ownership is unreadable.
-                // Closing a compatibility copy here would create a second
-                // terminal authority for a workspace-owned notification.
-                error!(error = %error, "workspace ownership unavailable during limbo recovery");
-                return;
-            }
-        },
-        None => HashSet::new(),
-    };
-    let mut closed: Vec<String> = Vec::new();
-    let mut requeued: Vec<String> = Vec::new();
-    // The same closures as identities, so the one ping can name them and
-    // a reader can hold it to the register (cyclops-ui `App::admits`).
-    let mut named: Vec<DeliveryRef> = Vec::new();
-    // Families are descendants-first and configured-root-last. Fold all of
-    // them before acting so one (message, recipient) can mint at most one
-    // recovery handle during this boot.
-    let mut chains: HashMap<(String, String), Chain> = HashMap::new();
-    let mut envelopes: HashMap<(String, usize), Envelope> = HashMap::new();
-    let mut scan_order = 0_u64;
-    for (idx, lines) in replayed {
-        for line in lines {
-            scan_order = scan_order.saturating_add(1);
-            if !legacy_recovery_owns(&line.id, &workspace_ids) {
-                continue;
-            }
-            match line.kind {
-                Kind::Msg | Kind::Fyi => {
-                    envelopes
-                        .entry((line.id.clone(), *idx))
-                        .or_insert(Envelope {
-                            from: line.from.clone(),
-                            subject: line.subject.clone().unwrap_or_default(),
-                            body: line.body.clone().unwrap_or_default(),
-                            fyi: matches!(line.kind, Kind::Fyi),
-                        });
-                    // `hosted` names the recipients whose chains live in
-                    // this file. Ledgers from before the field existed were
-                    // single-file: a msg line with no hosted list hosts
-                    // every recipient it names, so those chains still get
-                    // closed instead of dangling forever.
-                    let hosted: Option<HashSet<&str>> = line
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("hosted"))
-                        .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(Value::as_str).collect());
-                    for d in &line.deliveries {
-                        let is_hosted = hosted.as_ref().is_none_or(|h| h.contains(d.to.as_str()));
-                        if is_hosted {
-                            consider(
-                                &mut chains,
-                                (line.id.clone(), d.to.clone()),
-                                d.state,
-                                d.attempts,
-                                *idx,
-                                scan_order,
-                            );
-                        }
-                    }
-                }
-                Kind::State => {
-                    let Some(data) = &line.data else { continue };
-                    let (Some(to), Ok(state)) = (
-                        data["to"].as_str(),
-                        serde_json::from_value::<DeliveryState>(data["to_state"].clone()),
-                    ) else {
-                        continue; // fused-state line, not a delivery line
-                    };
-                    let record = line.deliveries.first();
-                    consider(
-                        &mut chains,
-                        (line.id.clone(), to.to_string()),
-                        state,
-                        record.map(|delivery| delivery.attempts).unwrap_or(0),
-                        *idx,
-                        scan_order,
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut dangling: Vec<_> = chains
-        .into_iter()
-        .filter(|(_, chain)| !receipt_resolved(chain.state))
-        .collect();
-    dangling.sort_by(|a, b| a.0.cmp(&b.0));
-    for ((id, to), chain) in dangling {
-        if chain.owners.len() != 1 {
-            error!(
-                message_id = id,
-                recipient = to,
-                owners = ?chain.owners,
-                "legacy restart chain has more than one configured owner; leaving it untouched"
-            );
-            continue;
-        }
-        let Chain {
-            state,
-            attempts,
-            owner: idx,
-            ..
-        } = chain;
-        if receipt_is_queued(state) {
-            let target = envelopes
-                .get(&(id.clone(), idx))
-                .zip(requeue_target(inner, &to, idx));
-            if let Some((env, (sess_idx, pane_id))) = target {
-                let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
-                // Gating cannot survive the run that was doing the
-                // gating; the recorded step back is retry_queued, the
-                // pre-paste retry state. Queued and retry_queued are
-                // already accurate and re-enter silently.
-                let requeue_state = if state == DeliveryState::Gating {
-                    let record = Delivery {
-                        to: to.clone(),
-                        state: DeliveryState::RetryQueued,
-                        verified_by: None,
-                        attempts,
-                        ts: unix_ms(),
-                        cause: Some("daemon_restart".to_string()),
-                    };
-                    emit_delivery_state(
-                        inner,
-                        &[idx],
-                        &id,
-                        &to,
-                        inner.recipient_key(sess_idx, &pane_id),
-                        state,
-                        DeliveryState::RetryQueued,
-                        Some("daemon_restart"),
-                        None,
-                        &record,
-                    );
-                    DeliveryState::RetryQueued
-                } else {
-                    state
-                };
-                let handle = DeliveryHandle::with_ledger_sessions(
-                    &id,
-                    &to,
-                    &pane_id,
-                    sess_idx,
-                    vec![idx],
-                    payload,
-                );
-                {
-                    let mut st = handle.state.lock().expect("handle state lock");
-                    st.state = requeue_state;
-                    st.attempts = attempts;
-                }
-                inner.engine.track(&handle);
-                let Some(()) = with_worker(inner, sess_idx, &pane_id, |worker| {
-                    worker.enqueue_back(handle);
-                    worker.notify.notify_one();
-                }) else {
-                    continue;
-                };
-                requeued.push(format!("{id} -> {to}"));
-                continue;
-            }
-            // No pane to requeue into: close below, like any other
-            // chain the restart cannot carry forward.
-        }
-        // A post-write delivery cannot be requeued after restart. Its
-        // mutable recipient label does not prove which pane may still
-        // hold the payload, so the ambiguous outcome closes below.
-        let record = Delivery {
-            to: to.clone(),
-            state: DeliveryState::AttentionRequired,
-            verified_by: None,
-            attempts,
-            ts: unix_ms(),
-            cause: Some("daemon_restart".to_string()),
-        };
-        emit_delivery_state(
-            inner,
-            &[idx],
-            &id,
-            &to,
-            None,
-            state,
-            DeliveryState::AttentionRequired,
-            Some("daemon_restart"),
-            None,
-            &record,
-        );
-        closed.push(format!("{id} -> {to}"));
-        named.push(DeliveryRef {
-            to: to.clone(),
-            msg_id: id.clone(),
-        });
-    }
-    if !requeued.is_empty() {
-        requeued.sort();
-        requeued.dedup();
-        // Fyi, not action-required: these deliveries are being handled,
-        // and a ping that claims a human is needed while naming nothing a
-        // human can do contradicts the calm-view contract.
-        admin_notify(
-            inner,
-            NotifyLevel::Fyi,
-            "deliveries requeued after daemon restart",
-            &format!(
-                "nothing had reached a pane; requeued: {}",
-                requeued.join(", ")
-            ),
-            None,
-            None,
-            About::default(),
-        );
-    }
-    if closed.is_empty() {
-        return;
-    }
-    closed.sort();
-    closed.dedup();
-    admin_notify(
-        inner,
-        NotifyLevel::ActionRequired,
-        "deliveries interrupted by daemon restart",
-        &format!(
-            "closed as attention_required (cause: daemon_restart): {}",
-            closed.join(", ")
-        ),
-        None,
-        None,
-        // Every delivery this closed, by name. One ping over many is
-        // still a ping about each of them: it claims a human is needed,
-        // so a calm stream has to be able to ask the register whether any
-        // of them still does. Naming nothing is what put a closed eye
-        // over "action required" once the batch had been dealt with.
-        About::deliveries(named),
-    );
-}
-
-pub(crate) fn legacy_recovery_owns(message_id: &str, workspace_ids: &HashSet<String>) -> bool {
-    !workspace_ids.contains(message_id)
-}
-
-/// Where a requeued delivery should go: the adopted pane for a label, in
-/// the session the adoption names, provided that session is watched this
-/// boot; or the name itself when it already is a pane id (such a chain
-/// lives in the session file that hosted it, which is the session the
-/// pane resolved into at send time). None means there is nothing to
-/// requeue into and the chain closes instead.
-pub(crate) fn requeue_target(
-    inner: &Arc<Inner>,
-    to: &str,
-    hosted_idx: usize,
-) -> Option<(usize, String)> {
-    let adopted = {
-        let reg = inner.registry.lock().expect("registry lock");
-        reg.for_label(to)
-            .map(|adoption| (adoption.session.clone(), adoption.pane_id.clone()))
-    };
-    if let Some((session, pane)) = adopted {
-        return inner.session_index(&session).map(|idx| (idx, pane));
-    }
-    to.starts_with('%').then(|| (hosted_idx, to.to_string()))
-}
-
-// ---------------------------------------------------------------------------
-// msg.send
-// ---------------------------------------------------------------------------
-
-/// The msg.send entry: ledger the message, fan deliveries out to per-pane
-/// workers, and build receipts per DELIVERY.md semantics (block on the
-/// idle path up to receipt_block_ms, immediate queued/parked otherwise).
-pub(crate) async fn msg_send(
-    inner: &Arc<Inner>,
-    from: &str,
-    params: MsgSendParams,
-    _boundary: &crate::compatibility::BoundaryToken,
-) -> Result<Value, WireError> {
-    if inner.session_count() == 0 {
-        return Err(wire_err("no_such_target", "no sessions are watched"));
-    }
-    let typed = expand_recipients(inner, &params.to)?;
-
-    // Resolve each recipient before writing the msg line, and canonicalize
-    // the resolved ones to their ledger name: the pane's label, or the
-    // pane id when unlabeled. "%1" and its label are the same recipient;
-    // the record carries one name, so history filters match however the
-    // sender addressed it. Unresolvable names stay as typed (the
-    // attention_required record should show what was asked for).
-    let mut resolved: Vec<(String, Option<(usize, String)>)> = Vec::new();
-    let mut canonical_seen: HashSet<String> = HashSet::new();
-    for n in &typed {
-        let target = inner.resolve_recipient(n);
-        let name = match &target {
-            Some((session_idx, pane_id)) => inner
-                .label_for_route(*session_idx, pane_id)
-                .unwrap_or_else(|| pane_id.clone()),
-            None => n.clone(),
-        };
-        if canonical_seen.insert(name.clone()) {
-            resolved.push((name, target));
-        }
-    }
-    let names: Vec<String> = resolved.iter().map(|(n, _)| n.clone()).collect();
-
-    let msg_id = inner.engine.mint_msg_id();
-    let payload = render_payload(&msg_id, from, &params.subject, &params.body, params.fyi);
-    let now = unix_ms();
-    let deliveries: Vec<Delivery> = names
-        .iter()
-        .map(|n| Delivery {
-            to: n.clone(),
-            state: DeliveryState::Queued,
-            verified_by: None,
-            attempts: 0,
-            ts: now,
-            cause: None,
-        })
-        .collect();
-    let line = LedgerLine {
-        seq: 0,
-        boot_id: String::new(),
-        id: msg_id.clone(),
-        ts: 0,
-        kind: if params.fyi { Kind::Fyi } else { Kind::Msg },
-        from: from.to_string(),
-        to: names.clone(),
-        subject: Some(params.subject.clone()),
-        body: if params.body.is_empty() {
-            None
-        } else {
-            Some(params.body.clone())
-        },
-        reply_to: params.reply_to.clone(),
-        deliveries,
-        data: None,
-    };
-    // One msg fact. With recipients across sessions the same line lands in
-    // each involved per-session file; each file stays a complete stream.
-    // Each copy names the recipients whose delivery chains that file hosts,
-    // so a restart can tell a chain that belongs elsewhere from one that
-    // died before its first state line.
-    let mut involved: Vec<usize> = resolved
-        .iter()
-        .filter_map(|(_, r)| r.as_ref().map(|(idx, _)| *idx))
-        .collect();
-    involved.sort_unstable();
-    involved.dedup();
-    if involved.is_empty() {
-        involved.push(0);
-    }
-    let mut first_seq = None;
-    for idx in &involved {
-        let mut copy = line.clone();
-        let mut hosted: Vec<&str> = resolved
-            .iter()
-            .filter(|(_, r)| r.as_ref().is_some_and(|(i, _)| i == idx))
-            .map(|(n, _)| n.as_str())
-            .collect();
-        // Unresolvable recipients record their chain in every involved
-        // file; every file hosts them.
-        hosted.extend(
-            resolved
-                .iter()
-                .filter(|(_, r)| r.is_none())
-                .map(|(n, _)| n.as_str()),
-        );
-        copy.data = Some(json!({ "hosted": hosted }));
-        let seq = inner.append_line(*idx, copy);
-        if first_seq.is_none() {
-            first_seq = seq;
-        }
-    }
-    let seq = first_seq.unwrap_or(0);
-    // The session ledger owns the legacy payload. The push is a resting-row
-    // edge shared by every subscriber, so it carries metadata only; authorized
-    // body reads go through msg.history/msg.thread instead.
-    inner.emit(
-        "msg",
-        json!({
-            "id": msg_id,
-            "from": from,
-            "to": names,
-            "subject": params.subject,
-            "fyi": params.fyi,
-            "reply_to": params.reply_to,
-        }),
-        first_seq,
-    );
-
-    // Fan out. Each delivery record advances independently.
-    let mut handles: Vec<Arc<DeliveryHandle>> = Vec::with_capacity(resolved.len());
-    let mut blocking: Vec<Arc<DeliveryHandle>> = Vec::new();
-    for (name, target) in &resolved {
-        match target {
-            None => {
-                // Gate step 1: unresolvable recipient needs a human. The
-                // resolution line lands in every file that carries the msg
-                // line, never a session the message does not involve.
-                let handle = DeliveryHandle::with_ledger_sessions(
-                    &msg_id,
-                    name,
-                    "",
-                    involved[0],
-                    involved.clone(),
-                    String::new(),
-                );
-                advance(
-                    inner,
-                    &handle,
-                    &[DeliveryState::Queued],
-                    Step::to(DeliveryState::AttentionRequired)
-                        .cause("no_such_pane")
-                        .note(format!("no pane for {name:?}")),
-                );
-                admin_notify(
-                    inner,
-                    NotifyLevel::ActionRequired,
-                    &format!("delivery to {name} needs attention"),
-                    &format!("message {msg_id}: no such pane for {name:?}"),
-                    Some(&msg_id),
-                    None,
-                    About::delivery(name),
-                );
-                handles.push(handle);
-            }
-            Some((session_idx, pane_id)) => {
-                let handle =
-                    DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
-                inner.engine.track(&handle);
-                crate::sync_pane_unread(inner, pane_id).await;
-                let answers_now = gate_answers_now(inner, *session_idx, pane_id);
-                let hold = (!answers_now)
-                    .then(|| initial_hold(inner, *session_idx, pane_id).map(str::to_string))
-                    .flatten();
-                let Some((parked_hint, first_in_line)) =
-                    with_worker(inner, *session_idx, pane_id, |worker| {
-                        let parked_hint = worker.parked.lock().expect("parked lock").clone();
-                        if parked_hint.is_some() {
-                            return (parked_hint, false);
-                        }
-                        let first_in_line = worker.is_idle();
-                        if first_in_line {
-                            handle.set_hold(hold.as_deref());
-                        }
-                        worker.enqueue_back(Arc::clone(&handle));
-                        worker.notify.notify_one();
-                        (None, first_in_line)
-                    })
-                else {
-                    advance(
-                        inner,
-                        &handle,
-                        &[DeliveryState::Queued],
-                        Step::to(DeliveryState::AttentionRequired).cause("daemon_stopping"),
-                    );
-                    handles.push(handle);
-                    continue;
-                };
-                if let Some(hint) = parked_hint {
-                    // Parked recipients never auto-retry; new sends park
-                    // immediately with the reset hint.
-                    advance(
-                        inner,
-                        &handle,
-                        &[DeliveryState::Queued],
-                        Step::to(DeliveryState::ParkedBlockedQuota)
-                            .cause("blocked_quota")
-                            .note(hint),
-                    );
-                } else {
-                    if first_in_line && answers_now {
-                        blocking.push(Arc::clone(&handle));
-                    }
-                }
-                handles.push(handle);
-            }
-        }
-    }
-
-    // Receipts: block only where the verdict is coming, capped by
-    // receipt_block_ms.
-    let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
-    for handle in &blocking {
-        let mut rx = handle.state_tx.subscribe();
-        let _ = tokio::time::timeout_at(deadline, rx.wait_for(|s| receipt_resolved(*s))).await;
-    }
-    let receipts: Vec<DeliveryReceipt> = handles.iter().map(|h| receipt_of(inner, h)).collect();
-
-    let result = MsgSendResult {
-        msg_id: msg_id.clone(),
-        seq,
-        deliveries: receipts,
-        inserted: Some(true),
-    };
-    let mut value = serde_json::to_value(result).expect("msg.send result serializes");
-
-    // Send-and-wait composes agent.wait onto the same call: the wait
-    // starts only AFTER the delivery reaches a resolved state
-    // (DELIVERY.md), so `turn_ended` can never be satisfied by a turn that
-    // predates the delivery. A delivery that ends anywhere but delivered
-    // has no turn to watch; its entry reports the delivery state instead
-    // of a fabricated wait result. Every entry carries the same
-    // {outcome, state, waited_ms} shape agent.wait resolves with.
-    if let Some(spec) = &params.wait {
-        // Test seam after the initial receipt snapshot but before the
-        // combined wait resolves each delivery and begins pane observation.
-        // It lets tests order those two boundaries deterministically and is
-        // a no-op in production.
-        inject_pause(inner, "pre_wait").await;
-        let timeout = spec.timeout_ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MAX_MS);
-        let wait_deadline = Instant::now() + Duration::from_millis(timeout);
-        let mut waits = Vec::new();
-        for handle in handles.iter() {
-            if handle.pane_id.is_empty() {
-                // Every recipient reports (DELIVERY.md). A pane-less
-                // recipient resolved at send time (attention_required);
-                // there is no pane to watch, so the state is null and the
-                // delivery field carries the resolution.
-                waits.push(json!({
-                    "to": handle.to,
-                    "outcome": WaitOutcome::NotDelivered,
-                    "state": Value::Null,
-                    "waited_ms": 0,
-                    "delivery": handle.state(),
-                }));
-                continue;
-            }
-            let started = Instant::now();
-            let mut rx = handle.state_tx.subscribe();
-            let resolved =
-                tokio::time::timeout_at(wait_deadline, rx.wait_for(|s| receipt_resolved(*s)))
-                    .await
-                    .is_ok();
-            let delivery_state = handle.state();
-            let delivered = matches!(
-                delivery_state,
-                DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
-            );
-            if !delivered {
-                // Resolved but not delivered: no turn to watch. Unresolved
-                // by the deadline: the wait timed out waiting for the
-                // delivery itself.
-                waits.push(json!({
-                    "to": handle.to,
-                    "outcome": if resolved {
-                        WaitOutcome::NotDelivered
-                    } else {
-                        WaitOutcome::Timeout
-                    },
-                    "state": inner.cached_state(handle.session_idx, &handle.pane_id),
-                    "waited_ms": started.elapsed().as_millis() as u64,
-                    "delivery": delivery_state,
-                }));
-                continue;
-            }
-            let remaining = wait_deadline.saturating_duration_since(Instant::now());
-            // A working edge after submit is the legacy wait's time bound.
-            // It does not identify which message or task the turn handled.
-            let working_pre = handle.working_seen.load(Ordering::SeqCst);
-            // Pin the wait on the occupant the delivery was SUBMITTED to,
-            // not whoever lives in the pane now: an occupant swap between
-            // submit and wait start must read occupant_changed instead of
-            // answering for the impostor.
-            let submitted = handle.submitted_pid.load(Ordering::SeqCst);
-            let turn_evidence = handle.take_post_submit_turn_evidence();
-            let end = wait_pinned(
-                inner,
-                handle.session_idx,
-                &handle.pane_id,
-                spec.until,
-                remaining,
-                working_pre,
-                WaitPin {
-                    submitted_pid: (submitted != 0).then_some(submitted),
-                    turn_evidence,
-                },
-            )
-            .await;
-            waits.push(json!({
-                "to": handle.to,
-                "outcome": end.outcome,
-                "state": end.state,
-                "waited_ms": end.waited_ms,
-                "delivery": delivery_state,
-            }));
-        }
-        value["wait"] = Value::Array(waits);
-    }
-    Ok(value)
-}
-
 pub(crate) fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
     WireError {
         code: code.to_string(),
@@ -2026,115 +996,9 @@ pub(crate) fn receipt_is_queued(s: DeliveryState) -> bool {
     )
 }
 
-pub(crate) fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryReceipt {
-    let (state, _, _, cause, note, held_by) = handle.snapshot();
-    // The pane the delivery resolved to, so the caller can name it and
-    // build the per-pane fix. Empty for a recipient that answered to no
-    // pane, which is the one case there is nothing to name.
-    let pane = (!handle.pane_id.is_empty()).then(|| handle.pane_id.clone());
-    if receipt_resolved(state) {
-        return DeliveryReceipt {
-            to: handle.to.clone(),
-            state,
-            notification_state: None,
-            quota_state: None,
-            notification_settlement: None,
-            pre_write_cause: None,
-            wake_block: None,
-            position: None,
-            // The gate's machine cause travels as-is when the daemon had
-            // no detail to add; wording it belongs to the surface showing
-            // it (cyclops_ui::grid::cause_words), not here.
-            note: note.or(cause),
-            pane,
-            held_by: None,
-        };
-    }
-    if !receipt_is_queued(state) {
-        return DeliveryReceipt {
-            to: handle.to.clone(),
-            state,
-            notification_state: None,
-            quota_state: None,
-            notification_settlement: None,
-            pre_write_cause: None,
-            wake_block: None,
-            position: None,
-            note: None,
-            pane,
-            held_by: None,
-        };
-    }
-    let position = inner
-        .engine
-        .workers
-        .lock()
-        .expect("workers lock")
-        .get(&PaneKey::new(handle.session_idx, &handle.pane_id))
-        .map(|entry| entry.worker.position_of(handle));
-    // A prior job can finish between enqueue and this snapshot. If that
-    // handoff makes this handle position zero, recover the current target
-    // hold synchronously; followers never inherit the head's token.
-    let fallback = (position == Some(0) && held_by.is_none())
-        .then(|| initial_hold(inner, handle.session_idx, &handle.pane_id).map(str::to_string))
-        .flatten();
-    let held_by = held_by_for_position(position, held_by, fallback);
-    DeliveryReceipt {
-        to: handle.to.clone(),
-        state: DeliveryState::Queued,
-        notification_state: None,
-        quota_state: None,
-        notification_settlement: None,
-        pre_write_cause: None,
-        wake_block: None,
-        position,
-        note: None,
-        pane,
-        held_by,
-    }
-}
-
-pub(crate) fn held_by_for_position(
-    position: Option<u32>,
-    held_by: Option<String>,
-    fallback: Option<String>,
-) -> Option<String> {
-    (position == Some(0))
-        .then(|| held_by.or(fallback))
-        .flatten()
-}
-
-/// Expand the to-list: "*" means every labeled pane (explicit adoption is
-/// the broadcast domain). Order is preserved, duplicates dropped.
-pub(crate) fn expand_recipients(
-    inner: &Arc<Inner>,
-    to: &[String],
-) -> Result<Vec<String>, WireError> {
-    let mut names: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    for t in to {
-        if t == "*" {
-            let mut labels: Vec<String> = inner.labels().into_values().collect();
-            labels.sort();
-            for l in labels {
-                if seen.insert(l.clone()) {
-                    names.push(l);
-                }
-            }
-        } else if !t.is_empty() && seen.insert(t.clone()) {
-            names.push(t.clone());
-        }
-    }
-    if names.is_empty() {
-        return Err(wire_err(
-            "bad_request",
-            "no recipients: give labels, pane ids, or \"*\" with labeled panes",
-        ));
-    }
-    Ok(names)
-}
-
-#[allow(dead_code)]
+/// Attach one durable queued attempt to its recipient's FIFO worker.
+///
+/// Recipient selection and oldest-pending policy belong to the coordinator.
 pub(crate) fn enqueue_notification_attempt(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -2145,7 +1009,6 @@ pub(crate) fn enqueue_notification_attempt(
 ) -> Result<Arc<DeliveryHandle>, NotificationEnqueueRefusal> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
-    let claimed_barrier = notification.claimed_notification_barrier();
     let mut active = inner
         .engine
         .notification_attempts
@@ -2158,11 +1021,6 @@ pub(crate) fn enqueue_notification_attempt(
             let refusal = inner
                 .engine
                 .notification_worker_refusal(recipient, attempt_id);
-            if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
-                handle
-                    .claimed_notification_rerun_requested
-                    .store(true, Ordering::SeqCst);
-            }
             return if let Some(refusal) = refusal {
                 Err(refusal)
             } else {
@@ -2170,42 +1028,8 @@ pub(crate) fn enqueue_notification_attempt(
             };
         }
     }
-    let claimed_barrier = match claimed_barrier {
-        Ok(barrier) => barrier,
-        Err(error) => {
-            error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
-            return Err(NotificationEnqueueRefusal::ClassificationUnavailable);
-        }
-    };
-    let doorbell = if claimed_barrier.is_some() {
-        let record = match notification.current_record() {
-            Ok(record) => record,
-            Err(error) => {
-                error!(message_id = %notification.message_id(), %error, "cannot rebuild claimed staged notification");
-                return Err(NotificationEnqueueRefusal::PayloadUnavailable);
-            }
-        };
-        // Recovery owns the durable error result. An empty handle payload is
-        // never written on this path; it lets the worker append one exact
-        // attention cause for a missing message or unsupported format.
-        notification
-            .message_line()
-            .ok()
-            .and_then(|message| expected_notification_payload(&record, &message))
-            .unwrap_or_default()
-    } else {
-        cyclops_proto::render_doorbell_v3(notification.attempt_id())
-    };
-    let handle = DeliveryHandle::for_notification(
-        display_recipient,
-        pane_id,
-        session_idx,
-        doorbell,
-        notification,
-    );
-    if claimed_barrier.is_some() {
-        handle.restore_claimed_notification_barrier();
-    }
+    let handle =
+        DeliveryHandle::for_notification(display_recipient, pane_id, session_idx, notification);
     active.insert(attempt_id, Arc::downgrade(&handle));
     drop(active);
     inner.engine.track(&handle);
@@ -2236,21 +1060,17 @@ pub(crate) fn enqueue_notification_attempt(
 /// rather than passing as turn-ended. This state sequence carries no turn or
 /// message identity and says nothing about write readiness.
 ///
-/// Pinning: (pane_id, pane_pid) recorded at start, or supplied by the
-/// caller as `pinned` when the wait answers for an earlier moment (the
-/// send-and-wait path pins the occupant its delivery was SUBMITTED to).
-/// The pane vanishing, dying, or changing root pid resolves
-/// OccupantChanged, never a false success. The watcher emits a PanePid edge
-/// for a root replacement, and every other pane wake still rechecks the pin
-/// as a fail-closed defense against a delayed or lagged event.
-pub(crate) async fn wait_pinned(
+/// Pinning: (pane_id, pane_pid) recorded at start. The pane vanishing,
+/// dying, or changing root pid resolves OccupantChanged, never a false
+/// success. The watcher emits a PanePid edge for a root replacement, and
+/// every other pane wake still rechecks the pin as a fail-closed defense
+/// against a delayed or lagged event.
+pub(crate) async fn wait_for_pane_state(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
     until: WaitUntil,
     timeout: Duration,
-    working_pre: bool,
-    pin: WaitPin,
 ) -> WaitEnd {
     let started = Instant::now();
     let deadline = started + timeout;
@@ -2259,23 +1079,10 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    // Subscribe before the baseline refresh. A composed send also carries a
-    // fact-only receiver from before Enter; this fresh receiver owns the
-    // current and future state sequence, so stale state cannot replay after
-    // the baseline.
-    let WaitPin {
-        submitted_pid: pinned,
-        turn_evidence,
-    } = pin;
+    // Subscribe before the baseline refresh so the receiver owns the
+    // current and future state sequence and stale state cannot replay
+    // after the baseline.
     let mut ev_rx = inner.events.subscribe();
-    let (submitted_turn_handle, handoff_working) = match turn_evidence {
-        Some(mut evidence) => {
-            let handoff_working =
-                record_buffered_working_evidence(&mut evidence.events, &evidence.handle);
-            (Some(evidence.handle), handoff_working)
-        }
-        None => (None, false),
-    };
     let watcher = inner.watcher_of(session_idx);
     let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
     if let Some(watcher) = watcher.as_ref() {
@@ -2309,9 +1116,7 @@ pub(crate) async fn wait_pinned(
         return end(WaitOutcome::OccupantChanged, state);
     };
     let pinned_pid = row.pane_pid;
-    let Some(pinned_fg) =
-        fusion::foreground_pid_checked(row.pane_pid).filter(|fg| pinned.is_none_or(|p| p == *fg))
-    else {
+    let Some(pinned_fg) = fusion::foreground_pid_checked(row.pane_pid) else {
         return end(WaitOutcome::OccupantChanged, state);
     };
     // Re-proving the foreground costs a process spawn, so it runs on the
@@ -2329,15 +1134,8 @@ pub(crate) async fn wait_pinned(
         occupant_gone(inner, session_idx, pane_id, pinned_pid)
             || fusion::foreground_pid_checked(pinned_pid) != Some(pinned_fg)
     };
-    let mut working_seen = working_pre
-        || handoff_working
-        || (submitted_turn_handle.is_none()
-            && state == AgentState::Working
-            && fusion::cached_working_confirmed(inner, session_idx, pane_id));
-    // Test-only boundary after the fresh baseline and fact-only handoff. It
-    // lets the regression prove that historical events cannot finish a newer
-    // current turn before the live pane stream wakes it.
-    inject_pause(inner, "post_wait_baseline").await;
+    let mut working_seen = state == AgentState::Working
+        && fusion::cached_working_confirmed(inner, session_idx, pane_id);
     loop {
         if state == AgentState::Dead {
             return end(WaitOutcome::OccupantChanged, state);
@@ -2368,12 +1166,7 @@ pub(crate) async fn wait_pinned(
                 {
                     if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
                         state = s;
-                        if state == AgentState::Working
-                            && wait_working_event_is_eligible(
-                                &e,
-                                submitted_turn_handle.as_ref(),
-                            )
-                        {
+                        if state == AgentState::Working && confirmed_working_state_event(&e) {
                             working_seen = true;
                         }
                     }
@@ -2407,8 +1200,7 @@ pub(crate) async fn wait_pinned(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.
                     state = inner.cached_state(session_idx, pane_id);
-                    if submitted_turn_handle.is_none()
-                        && state == AgentState::Working
+                    if state == AgentState::Working
                         && fusion::cached_working_confirmed(inner, session_idx, pane_id)
                     {
                         working_seen = true;
@@ -2436,10 +1228,6 @@ pub(crate) async fn wait_pinned(
                     if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
-                    // Test-only proof that a composed wait reached a live
-                    // pane wake after its baseline. A stale historical Idle
-                    // would have returned before reaching this point.
-                    inject_pause(inner, "wait_pane_wake").await;
                 }
                 Ok(PaneEvent::Disconnected) | Err(broadcast::error::RecvError::Closed) => {
                     pane_rx = None;
@@ -2474,18 +1262,16 @@ pub(crate) async fn agent_wait(
         .unwrap_or(WAIT_DEFAULT_MS)
         .min(WAIT_MAX_MS);
     let until_word = until_word(params.until);
-    let end = wait_pinned(
+    let end = wait_for_pane_state(
         inner,
         session_idx,
         &pane_id,
         params.until,
         Duration::from_millis(timeout),
-        false,
-        WaitPin::default(),
     )
     .await;
-    // `outcome` mirrors the send-and-wait entry shape: "reached" on
-    // success, and the same word the error code carries otherwise.
+    // `outcome` is "reached" on success, and the same word the error code
+    // carries otherwise.
     let data = json!({
         "target": params.target,
         "pane_id": pane_id,
@@ -2504,7 +1290,7 @@ pub(crate) async fn agent_wait(
             ),
             data: Some(data),
         }),
-        WaitOutcome::OccupantChanged | WaitOutcome::NotDelivered => Err(WireError {
+        WaitOutcome::OccupantChanged => Err(WireError {
             code: "occupant_changed".to_string(),
             message: format!(
                 "the pane behind {} died or changed occupant while waiting",

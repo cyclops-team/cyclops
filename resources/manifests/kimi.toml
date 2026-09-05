@@ -17,9 +17,6 @@ process_names = ["kimi", "kimi-code"]
 argv_basenames = ["kimi", "kimi-code"]
 launch = "kimi"
 
-[messaging]
-mailbox_capability_file = "~/.kimi-code/skills/cyclops/SKILL.md"
-
 [hooks]
 config_mechanism = "config.toml in ~/.kimi-code/"
 turn_start = "UserPromptSubmit"

@@ -112,9 +112,7 @@ fn session_model_from_snapshot(session: &SnapshotSession) -> Result<SessionModel
 fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
     let known: Vec<String> = window.panes.iter().map(|p| p.id.clone()).collect();
     let mut minimized = std::collections::HashMap::new();
-    let mut minimization_provenance = std::collections::HashMap::new();
     for pane in &window.panes {
-        minimization_provenance.insert(pane.id.clone(), pane.minimization.clone());
         if let Some(was) = pane.minimization.original_height() {
             minimized.insert(pane.id.clone(), was);
         }
@@ -156,7 +154,6 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
         active_pane,
         zoomed: window.zoomed,
         minimized,
-        minimization_provenance,
     })
 }
 
@@ -529,7 +526,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -587,7 +583,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -674,7 +669,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();

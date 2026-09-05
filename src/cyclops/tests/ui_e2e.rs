@@ -1,4 +1,4 @@
-//! Headless `cyclops ui` end to end: a canned daemon on a scratch socket
+//! Headless `cyclops watch` end to end: a canned daemon on a scratch socket
 //! feeds events through the real subscription and serves the daemon-owned
 //! backfill projection. The plain follow mode (stdout is a pipe, so the TUI
 //! never engages) proves classification, ordering, dedupe, the hanging
@@ -220,7 +220,7 @@ fn serve_canned(home: &Path) {
 fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
     let home = scratch_home("adm");
     serve_canned(&home);
-    let out = run_ui(&home, &["ui", "--plain"]);
+    let out = run_ui(&home, &["watch", "--plain"]);
     // The daemon hung up: the follow ends with the standard copy, exit 1.
     assert_eq!(
         out.status.code(),
@@ -238,7 +238,7 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "cyclops ui is deprecated; use cyclops watch\nlost the connection to cyclops: the connection closed; the live stream may have a gap. Check that cyclopsd is still running, then retry."
+        "lost the connection to cyclops: the connection closed; the live stream may have a gap. Check that cyclopsd is still running, then retry."
     );
     let _ = fs::remove_dir_all(&home);
 }
@@ -247,7 +247,7 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
 fn ui_plain_firehose_shows_everything_once() {
     let home = scratch_home("fh");
     serve_canned(&home);
-    let out = run_ui(&home, &["ui", "--plain", "--firehose"]);
+    let out = run_ui(&home, &["watch", "--plain", "--firehose"]);
     assert_eq!(out.status.code(), Some(1));
     // Backfill first (the admin msg AND the agent-to-agent msg), then the
     // live events in arrival order; the live duplicate of ledger seq 2
@@ -289,7 +289,10 @@ fn ui_plain_firehose_shows_everything_once() {
 fn ui_plain_filter_narrows_the_firehose() {
     let home = scratch_home("flt");
     serve_canned(&home);
-    let out = run_ui(&home, &["ui", "--plain", "--firehose", "--from", "codex"]);
+    let out = run_ui(
+        &home,
+        &["watch", "--plain", "--firehose", "--from", "codex"],
+    );
     assert_eq!(out.status.code(), Some(1));
     // Only codex-sent messages pass; the delivery, the admin msg from
     // reviewer, and the state line drop. The eye still reports, because
@@ -306,7 +309,7 @@ fn ui_plain_filter_narrows_the_firehose() {
 #[test]
 fn ui_daemon_down_reports_and_exits_one() {
     let home = scratch_home("down");
-    let out = run_ui(&home, &["ui", "--plain"]);
+    let out = run_ui(&home, &["watch", "--plain"]);
     assert_eq!(out.status.code(), Some(1));
     // The same sentence the CLI prints, from the same place. It used to
     // be a literal here and a literal there, so the stream would have
@@ -314,7 +317,7 @@ fn ui_daemon_down_reports_and_exits_one() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
         format!(
-            "cyclops ui is deprecated; use cyclops watch\nstream snapshot unavailable; state may be incomplete: {}\n{}",
+            "stream snapshot unavailable; state may be incomplete: {}\n{}",
             cyclops_proto::NOT_RUNNING,
             cyclops_proto::NOT_RUNNING
         )
@@ -370,7 +373,7 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
     });
 
     let grid = stdout_of(&run_ui(&home, &["status"]));
-    let stream = stdout_of(&run_ui(&home, &["ui", "--plain"]));
+    let stream = stdout_of(&run_ui(&home, &["watch", "--plain"]));
 
     // Both surfaces count the blocked pane and the durable delivery row.
     assert_eq!(
@@ -422,7 +425,7 @@ fn a_pane_that_closes_takes_its_attention_item_with_it() {
         Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
-    let stream = stdout_of(&run_ui(&home, &["ui", "--plain", "--firehose"]));
+    let stream = stdout_of(&run_ui(&home, &["watch", "--plain", "--firehose"]));
     // The event arrived and the firehose said so.
     assert!(stream.contains("%1 closed"), "{stream}");
     // The snapshot's blocked fact may be visible first, but the event must
@@ -431,18 +434,6 @@ fn a_pane_that_closes_takes_its_attention_item_with_it() {
         stream.lines().rfind(|line| line.starts_with("eye ")),
         Some("eye closed"),
         "the eye still reported a pane that is gone: {stream}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn ui_json_is_a_usage_error_pointing_at_watch() {
-    let home = scratch_home("uj");
-    let out = run_ui(&home, &["ui", "--json"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stderr).trim(),
-        "cyclops ui has no --json form. The machine stream is: cyclops watch --json"
     );
     let _ = fs::remove_dir_all(&home);
 }

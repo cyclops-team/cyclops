@@ -1,0 +1,54 @@
+# Cyclops detection manifest: aider
+# UNVERIFIED best effort from primary documentation. No aider binary was
+# available on the evidence host. Sources:
+#   https://aider.chat/docs/config/aider_conf.html  .aider.conf.yml, `read:` files
+#   https://aider.chat/docs/config/options.html
+#
+# NO HOOKS, NO SKILLS. aider has no lifecycle hook mechanism and no skills
+# directory; persistent instructions reach it through `read:` entries in
+# .aider.conf.yml (home, git root, or cwd), typically a CONVENTIONS.md. To
+# teach an aider session the cyclops verbs, add the installed skill file:
+#   read:
+#     - ~/.agents/skills/cyclops/SKILL.md
+# This manifest binds the pane so `cyclops send` from that pane resolves
+# its identity; nothing else is wired.
+#
+# Sensor summary for this CLI:
+#   process  aider is a Python console script, so #{pane_current_command}
+#            is expected to read "Python" or "python3.x" and argv[0] the
+#            interpreter (inferred from the gemini measurement of the same
+#            shebang mechanism). The interpreter is not listed: it would
+#            claim every Python process. Until the daemon reads the script
+#            path behind an interpreter, pin the pane:
+#            cyclops name %N <label> --manifest aider.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. aider is a plain readline REPL whose prompt varies
+#            by mode ("> ", "ask> ", "architect> "); no rule ships, so
+#            deliveries fail closed (not write-ready).
+
+[agent]
+id = "aider"
+display_name = "aider"
+version_tested = "unverified"
+process_names = ["aider"]
+argv_basenames = ["aider"]
+launch = "aider"
+
+[hooks]
+config_mechanism = "none: aider has no hook mechanism"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for aider."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

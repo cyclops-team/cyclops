@@ -1,0 +1,53 @@
+# Cyclops detection manifest: OpenCode
+# UNVERIFIED best effort from primary documentation. No OpenCode binary was
+# available on the evidence host. Sources:
+#   https://opencode.ai/docs/config/    ~/.config/opencode/opencode.json, no hooks key
+#   https://opencode.ai/docs/plugins/   JavaScript plugin API (the only hook surface)
+#   https://opencode.ai/docs/skills/    ~/.config/opencode/skills, ~/.agents/skills, ~/.claude/skills
+#   https://github.com/anomalyco/opencode/blob/dev/packages/opencode/bin/opencode
+#
+# NO HOOK CONFIG. OpenCode has no shell-command hook in opencode.json; its
+# lifecycle surface is a JavaScript plugin (`chat.message`, `session.idle`,
+# `tool.execute.before`, ...) loaded from ~/.config/opencode/plugins/. That
+# is code running inside the OpenCode process, and nothing here was run
+# against a live OpenCode, so Cyclops ships no plugin. This manifest binds
+# the pane so the agent's own `cyclops send` resolves its identity, and the
+# skill is seeded; hooks are a follow-up that needs a live OpenCode.
+#
+# Sensor summary for this CLI:
+#   process  The platform binary is named "opencode". The npm launcher
+#            (bin/opencode) spawns it as a child with inherited stdio rather
+#            than exec'ing it, so an npm install may leave "node" as the
+#            pane's foreground command; the curl and Homebrew installs put
+#            the binary itself on PATH. Inferred from the launcher source,
+#            not measured.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. No idle or working rule ships, so deliveries fail
+#            closed (not write-ready) until someone measures the composer.
+
+[agent]
+id = "opencode"
+display_name = "OpenCode"
+version_tested = "unverified"
+process_names = ["opencode"]
+argv_basenames = ["opencode"]
+launch = "opencode"
+
+[hooks]
+config_mechanism = "none: OpenCode exposes lifecycle events only to JavaScript plugins"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for OpenCode."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

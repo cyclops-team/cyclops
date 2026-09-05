@@ -51,6 +51,6 @@ env PATH=/usr/bin:/bin RUSTC="$rustc_bin" "$cargo_bin" test \
 
 cargo test -p cyclops --no-default-features --test health_cli \
     health_works_with_no_daemon_and_does_not_create_state -- --exact
-cargo test -p cyclopsd --test restart_eye
+cargo test -p cyclopsd --test boot_and_sessions restart_eye::
 
 echo "headless build boundary and retained command contracts passed"

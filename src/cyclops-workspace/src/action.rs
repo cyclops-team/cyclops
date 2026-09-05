@@ -87,7 +87,7 @@ use crossterm::event::MouseButton;
 use cyclops_tmux::PaneDirection;
 
 use crate::bindings::BindingAction;
-use crate::dialog::{Dialog, ForceSubmitRow, SettingsSection, ViewRow};
+use crate::dialog::{Dialog, SettingsSection, ViewRow};
 use crate::drag::DragTarget;
 use crate::focus::{Direction, Intent as FocusIntent};
 use crate::input::mouse::{HitTarget, MenuState};
@@ -344,11 +344,6 @@ pub enum Action {
     ApplySoundSettings {
         on: bool,
         cue: Option<String>,
-    },
-    /// Persist and apply the opt-in post-paste force-submit escape hatch.
-    ApplyForceSubmitSettings {
-        enabled: bool,
-        delay_seconds: u8,
     },
     Detach,
 }
@@ -709,18 +704,6 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         } => Some(Action::ApplySoundSettings {
             on: sound.on,
             cue: sound.checked_sound().map(String::from),
-        }),
-        Dialog::Settings {
-            section: SettingsSection::Delivery,
-            delivery,
-            ..
-        } => Some(Action::ApplyForceSubmitSettings {
-            enabled: if delivery.selected_row() == Some(ForceSubmitRow::Enabled) {
-                !delivery.enabled
-            } else {
-                delivery.enabled
-            },
-            delay_seconds: delivery.delay_seconds,
         }),
         // Read-only: nothing to confirm. Enter just dismisses the card.
         Dialog::Keybinds { .. } => None,
@@ -1112,7 +1095,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -1742,30 +1724,6 @@ mod tests {
     }
 
     #[test]
-    fn the_delivery_section_toggles_or_saves_the_exact_slider_value() {
-        let mut dialog = settings(SettingsSection::Delivery, Vec::new(), 0);
-        assert_eq!(
-            route_dialog_confirm(&dialog),
-            Some(Action::ApplyForceSubmitSettings {
-                enabled: true,
-                delay_seconds: 5,
-            })
-        );
-        if let Dialog::Settings { delivery, .. } = &mut dialog {
-            delivery.enabled = true;
-            delivery.selected = 1;
-            delivery.adjust_delay(7);
-        }
-        assert_eq!(
-            route_dialog_confirm(&dialog),
-            Some(Action::ApplyForceSubmitSettings {
-                enabled: true,
-                delay_seconds: 12,
-            })
-        );
-    }
-
-    #[test]
     fn show_settings_agrees_across_keyboard_and_app_menu() {
         let tabs = [tab("@1")];
         let workspaces = [workspace("$1", "main")];
@@ -1813,7 +1771,6 @@ mod tests {
                 active_sound: Some(0),
                 previewed: None,
             },
-            delivery: crate::dialog::ForceSubmitPicker::new(false, 5),
         }
     }
 

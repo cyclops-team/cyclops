@@ -3,10 +3,11 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cyclops_proto::{
-    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessageWakeBlock, MessagesChangedArea,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
-    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey,
+    LedgerLine, MailboxEntryState, MessageId, MessageMetadata, MessageWakeBlock,
+    MessagesChangedArea, NotificationAttemptId, NotificationAttentionCause, NotificationBinding,
+    NotificationManifestId, NotificationPreWriteCause, NotificationPreWriteObservation,
+    NotificationRecord, NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey,
+    VerifiedBy,
 };
 
 use crate::mailbox::{MessageChangePublisher, MessageStore, MessageStoreError};
@@ -39,24 +40,15 @@ pub(crate) enum NotificationAdapterError {
     MessageMissing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubmitReservation {
-    Reserved,
-    ClaimedBeforeSubmit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimedNotificationBarrier {
-    Staged,
-    AckTimeout,
-}
-
+/// A doorbell or raw write may still go out after the recipient claimed the
+/// message: the wake is for the operator's eyes and the claim is what the
+/// recipient did. Only the retired direct payload was withdrawn by a claim.
 fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationTransport) -> bool {
-    state.is_pending() || (state.is_claimed() && transport == NotificationTransport::Doorbell)
+    state.is_pending() || (state.is_claimed() && transport != NotificationTransport::DirectPayload)
 }
 
 impl NotificationContext {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(
         store: Arc<StdMutex<MessageStore>>,
         message_id: MessageId,
@@ -108,6 +100,16 @@ impl NotificationContext {
         self.run_epoch
     }
 
+    /// Did the sender ask for a raw write? Read from the message's own
+    /// metadata, so the choice travels with the message and not the attempt.
+    pub(crate) fn raw_transport(&self) -> bool {
+        self.message_line()
+            .ok()
+            .and_then(|line| line.data)
+            .and_then(|data| serde_json::from_value::<MessageMetadata>(data).ok())
+            .is_some_and(|metadata| metadata.raw)
+    }
+
     pub(crate) fn message_line(&self) -> Result<LedgerLine, NotificationAdapterError> {
         self.store
             .lock()
@@ -126,31 +128,6 @@ impl NotificationContext {
             .notification(self.recipient, &self.message_id)
             .cloned()
             .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)
-    }
-
-    pub(crate) fn claimed_notification_barrier(
-        &self,
-    ) -> Result<Option<ClaimedNotificationBarrier>, NotificationAdapterError> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let current = store
-            .projection()
-            .claimed_notification_barrier(self.recipient);
-        Ok(current.and_then(|record| {
-            if !self.owns(record) {
-                None
-            } else if record.state == NotificationState::Staged
-                && record.transport == NotificationTransport::Doorbell
-            {
-                Some(ClaimedNotificationBarrier::Staged)
-            } else if record.needs_claimed_ack_timeout_reconciliation() {
-                Some(ClaimedNotificationBarrier::AckTimeout)
-            } else {
-                None
-            }
-        }))
     }
 
     pub(crate) fn record_gating(&self) -> Result<NotificationRecord, NotificationAdapterError> {
@@ -259,15 +236,11 @@ impl NotificationContext {
         Ok(record)
     }
 
-    pub(crate) fn record_staged(&self) -> Result<NotificationRecord, NotificationAdapterError> {
-        self.advance(NotificationState::Staged, None, None)
-    }
-
-    /// Order an authenticated mailbox claim against terminal submit intent.
-    ///
-    /// The journal lock is released before terminal IO. `Submitting` is the
-    /// durable linearization point, not proof that a key was sent.
-    pub(crate) fn reserve_submit(&self) -> Result<SubmitReservation, NotificationAdapterError> {
+    /// The raw write boundary. No binding: nothing about the occupant was
+    /// proven, and the record must not pretend otherwise.
+    pub(crate) fn record_writing_raw(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
         let mut store = self
             .store
             .lock()
@@ -275,23 +248,25 @@ impl NotificationContext {
         let current = store
             .projection()
             .notification(self.recipient, &self.message_id)
-            .cloned()
-            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
-        if !self.owns(&current) || current.state != NotificationState::Staged {
-            return Err(NotificationAdapterError::TerminalConflict(current.state));
-        }
-        let entry = store
-            .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
-        if entry.state.is_claimed() && current.transport != NotificationTransport::Doorbell {
-            return Ok(SubmitReservation::ClaimedBeforeSubmit);
-        }
-        if !entry_allows_notification(&entry.state, current.transport) {
+            .filter(|record| self.owns(record) && record.state == NotificationState::Gating);
+        let entry_allows = current.is_some_and(|_record| {
+            store
+                .projection()
+                .get_entry(self.recipient, &self.message_id)
+                .is_some_and(|entry| {
+                    entry_allows_notification(&entry.state, NotificationTransport::Raw)
+                })
+        });
+        if !entry_allows {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
-        self.advance_locked(&mut store, NotificationState::Submitting, None, None)?;
-        Ok(SubmitReservation::Reserved)
+        let record = store.advance_notification_raw_writing(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
     }
 
     pub(crate) fn record_submitted(&self) -> Result<NotificationRecord, NotificationAdapterError> {
@@ -304,8 +279,39 @@ impl NotificationContext {
         self.advance(NotificationState::SubmittedUnverified, None, None)
     }
 
-    pub(crate) fn record_notified(&self) -> Result<NotificationRecord, NotificationAdapterError> {
-        self.record_terminal(NotificationState::Notified, None)
+    /// The receipt, or the honest absence of one: `verified_by` is what
+    /// proved the doorbell was consumed, and None says nothing did.
+    pub(crate) fn record_notified(
+        &self,
+        verified_by: Option<VerifiedBy>,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        if let Some(current) = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+        {
+            if !self.owns(&current) {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+            if current.state == NotificationState::Notified {
+                return Ok(current);
+            }
+            if current.state.is_terminal() {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+        }
+        let record = store.advance_notification_notified(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+            verified_by,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
     }
 
     /// Settle a successfully submitted doorbell when its exact mailbox entry
@@ -350,141 +356,11 @@ impl NotificationContext {
         Ok(true)
     }
 
-    /// Settle a claim after exact clear or positive clean crash recovery.
-    ///
-    /// One journal append moves the state and retires the composer barrier. An
-    /// append failure leaves both projections unchanged, so runtime release and
-    /// FIFO advancement remain unauthorized.
-    pub(crate) fn settle_claimed_staged_clear(
-        &self,
-    ) -> Result<NotificationRecord, NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let before_seq = store.projection().last_sequence();
-        let record = store.settle_claimed_staged_clear(
-            self.message_id.clone(),
-            self.recipient,
-            self.attempt_id,
-        )?;
-        if store.projection().last_sequence() != before_seq {
-            if let Some(publisher) = &self.changes {
-                let seq = store
-                    .projection()
-                    .last_sequence()
-                    .expect("claimed staged clear advances the workspace sequence");
-                publisher.publish(
-                    seq,
-                    &[
-                        MessagesChangedArea::Notifications,
-                        MessagesChangedArea::Attention,
-                    ],
-                );
-            }
-        }
-        Ok(record)
-    }
-
-    /// Settle an exact claimed attempt ACK timeout after composer reconciliation.
-    pub(crate) fn settle_claimed_ack_timeout_reconciliation(
-        &self,
-    ) -> Result<NotificationRecord, NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let before_seq = store.projection().last_sequence();
-        let record = store.settle_claimed_ack_timeout_reconciliation(
-            self.message_id.clone(),
-            self.recipient,
-            self.attempt_id,
-        )?;
-        if store.projection().last_sequence() != before_seq {
-            if let Some(publisher) = &self.changes {
-                let seq = store
-                    .projection()
-                    .last_sequence()
-                    .expect("ACK-timeout reconciliation advances the workspace sequence");
-                publisher.publish(
-                    seq,
-                    &[
-                        MessagesChangedArea::Notifications,
-                        MessagesChangedArea::Attention,
-                    ],
-                );
-            }
-        }
-        Ok(record)
-    }
-
-    pub(crate) fn record_delivered_direct(
-        &self,
-    ) -> Result<(MailboxEntry, u64), NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let entry = store.mark_delivered_direct(
-            self.message_id.clone(),
-            self.recipient,
-            self.attempt_id,
-        )?;
-        let seq = store
-            .projection()
-            .last_sequence()
-            .expect("direct disposition appended after its message");
-        if let Some(publisher) = &self.changes {
-            publisher.publish(
-                seq,
-                &[
-                    MessagesChangedArea::Messages,
-                    MessagesChangedArea::Mailboxes,
-                ],
-            );
-        }
-        Ok((entry, seq))
-    }
-
     pub(crate) fn record_attention(
         &self,
         cause: NotificationAttentionCause,
     ) -> Result<NotificationRecord, NotificationAdapterError> {
         self.record_terminal(NotificationState::AttentionRequired, Some(cause))
-    }
-
-    /// Record a verification alarm with the exact content-free evidence class.
-    pub(crate) fn record_verify_attention(
-        &self,
-        outcome: cyclops_proto::NotificationVerifyOutcome,
-    ) -> Result<NotificationRecord, NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        if let Some(current) = store
-            .projection()
-            .notification(self.recipient, &self.message_id)
-            .cloned()
-        {
-            if !self.owns(&current) {
-                return Err(NotificationAdapterError::TerminalConflict(current.state));
-            }
-            if current.state == NotificationState::AttentionRequired {
-                return Ok(current);
-            }
-            if current.state.is_terminal() {
-                return Err(NotificationAdapterError::TerminalConflict(current.state));
-            }
-        }
-        let record = store.advance_notification_with_verify_outcome(
-            self.message_id.clone(),
-            self.recipient,
-            self.attempt_id,
-            outcome,
-        )?;
-        self.publish_transition(&record);
-        Ok(record)
     }
 
     /// Stop this exact attempt after proving that no terminal write occurred.
@@ -570,28 +446,6 @@ impl NotificationContext {
         Ok(record)
     }
 
-    pub(crate) fn record_quota_held(&self) -> Result<NotificationRecord, NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let current = store
-            .projection()
-            .notification(self.recipient, &self.message_id)
-            .cloned()
-            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
-        if !self.owns(&current) {
-            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
-        }
-        if current.state == NotificationState::QuotaHeld {
-            return Ok(current);
-        }
-        if current.state != NotificationState::Gating {
-            return Err(NotificationAdapterError::TerminalConflict(current.state));
-        }
-        self.advance_locked(&mut store, NotificationState::QuotaHeld, None, None)
-    }
-
     fn record_terminal(
         &self,
         state: NotificationState,
@@ -666,10 +520,7 @@ impl NotificationContext {
         if let Some(publisher) = &self.changes {
             let changed = if matches!(
                 record.state,
-                NotificationState::AttentionRequired
-                    | NotificationState::BlockedPreWrite
-                    | NotificationState::QuotaHeld
-                    | NotificationState::QuotaResetObserved
+                NotificationState::AttentionRequired | NotificationState::BlockedPreWrite
             ) {
                 &[
                     MessagesChangedArea::Notifications,

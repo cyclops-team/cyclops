@@ -1,0 +1,44 @@
+# Cyclops hook config template: Gemini CLI settings fragment.
+# Rendered by `cyclops hooks install gemini --agent <label>`; '#' lines are
+# stripped and {cyclops_bin} is substituted. The label selects the artifact
+# path only: hook identity comes from the authenticated socket peer, the
+# same rule Claude and Kimi follow.
+#
+# UNVERIFIED: written from https://geminicli.com/docs/hooks/reference/ and
+# the hooks object measured in a working ~/.gemini/settings.json (same
+# matcher + hooks + type:command shape as Claude). No edge from a Gemini
+# turn has been observed by Cyclops yet.
+#
+# Wiring: merge the "hooks" object into ~/.gemini/settings.json (the user
+# layer; GEMINI_CLI_HOME relocates the directory). Gemini fingerprints
+# project-level hooks and asks again when a command changes; the user layer
+# carries no such prompt in the docs. `/hooks panel` lists what loaded.
+#
+# Events: BeforeAgent is the dispatch candidate (payload carries `prompt`).
+# AfterAgent is a candidate end: a retry re-fires it with stop_hook_active.
+# SessionStart is process-bound liveness. BeforeTool and AfterTool are tool
+# activity telemetry, registered without a matcher so every tool reports.
+# Notification is the attention edge (ToolPermission). Every entry names its
+# own event on the command line (finding F7).
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook SessionStart" } ] }
+    ],
+    "BeforeAgent": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook BeforeAgent" } ] }
+    ],
+    "BeforeTool": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook BeforeTool" } ] }
+    ],
+    "AfterTool": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook AfterTool" } ] }
+    ],
+    "AfterAgent": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook AfterAgent" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Notification" } ] }
+    ]
+  }
+}

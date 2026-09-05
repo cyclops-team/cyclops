@@ -1,0 +1,48 @@
+# Cyclops hook config template: Qwen Code settings fragment.
+# Rendered by `cyclops hooks install qwen --agent <label>`; '#' lines are
+# stripped and {cyclops_bin} is substituted. The label selects the artifact
+# path only: hook identity comes from the authenticated socket peer.
+#
+# UNVERIFIED: written from
+# https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md
+# (Claude-shaped: matcher + hooks + type:command). No edge from a Qwen turn
+# has been observed by Cyclops yet.
+#
+# Wiring: merge the "hooks" object into ~/.qwen/settings.json (QWEN_HOME
+# relocates the directory). Project-level .qwen/settings.json hooks need
+# trusted-folder status.
+#
+# Events: UserPromptSubmit is the dispatch candidate (payload carries
+# `prompt`, the model-bound text). Stop is a candidate end (stop_hook_active
+# can loop). SessionStart is process-bound liveness; PreToolUse and
+# PostToolUse are tool activity telemetry; StopFailure, Notification, and
+# PermissionRequest are attention edges. Every entry names its own event on
+# the command line (finding F7).
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook SessionStart" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit" } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PreToolUse" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PostToolUse" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Stop" } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook StopFailure" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Notification" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PermissionRequest" } ] }
+    ]
+  }
+}

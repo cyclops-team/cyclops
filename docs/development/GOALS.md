@@ -9,9 +9,9 @@ invisible, on a record that never lies.
 
 ## Messaging layer
 
-- Every message ends in a named state (delivered_verified, delivered_unverified,
-  queued, parked, attention_required). Limbo is a bug. Receipts never conflate
-  hook- vs screen-verified, and carry target state.
+- Every message ends in a named state (notified, queued, blocked before write,
+  attention_required). Limbo is a bug. Receipts never conflate a hook-verified
+  doorbell with a screen-verified or unverified one, and carry target state.
 - Idle-target timing: send to pasted under 1s, receipt under 2s. Queued
   deliveries land within 1s of turn end. Ordering holds per recipient.
   Broadcast is one ledger fact with N tracked deliveries.

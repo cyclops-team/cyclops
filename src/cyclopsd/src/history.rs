@@ -1,6 +1,6 @@
 //! Read-side queries over the authoritative workspace message journal.
 //!
-//! Pre-upgrade session ledgers remain readable as compatibility sources,
+//! Session journals remain readable as history sources,
 //! including runtime-named journals linked by a later session rename.
 //! Workspace records are read first and duplicate message identifiers are
 //! returned once. New messages are never copied into a session ledger.
@@ -27,9 +27,9 @@ use cyclops_proto::{
 };
 use serde_json::Value;
 
-use crate::compatibility;
 use crate::identity;
 use crate::server::sender_panes;
+use crate::session_history;
 use crate::Inner;
 
 /// Peer credentials as the connection captured them (uid, pid). None means
@@ -48,10 +48,10 @@ const STREAM_BACKFILL_ITEM_CAP: usize = 4096;
 const STREAM_BACKFILL_FRAME_RESERVE: usize = 4096;
 
 /// A bounded, body-free projection of retained session history for stream
-/// presentation startup. Journal discovery and compatibility traversal stay
+/// presentation startup. Journal discovery and rename-link traversal stay
 /// in the daemon; clients receive authorized facts rather than file paths.
 pub(crate) fn stream_backfill(inner: &Inner, params: StreamBackfillParams) -> StreamBackfillResult {
-    let report = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let report = session_history::SessionHistoryAdapter::capture(inner).read();
     let source_count = report.files.len();
     let mut rows = report
         .files
@@ -175,7 +175,7 @@ pub(crate) fn msg_history(
 ) -> Result<Value, WireError> {
     validate_history_params(&params)?;
     let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
-    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let compatibility = session_history::SessionHistoryAdapter::capture(inner).read();
     let result = match caller {
         Some((messaging, caller)) => messaging.history(caller, params, cursor2, compatibility)?,
         None => {
@@ -202,7 +202,7 @@ pub(crate) fn msg_thread(
         return Err(wire_err("bad_request", "msg.thread needs a message id"));
     }
     let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
-    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let compatibility = session_history::SessionHistoryAdapter::capture(inner).read();
     let result = match caller {
         Some((messaging, caller)) => messaging.thread(caller, id, reveal_body, compatibility)?,
         None => {
@@ -349,7 +349,7 @@ fn caller_name(inner: &Arc<Inner>, peer: Peer) -> Result<String, WireError> {
 // ---------------------------------------------------------------------------
 
 /// Immutable inputs to the history fold. WorkspaceMessaging constructs the
-/// optional current source; the named compatibility adapter constructs the
+/// optional current source; the named session-history adapter constructs the
 /// retained session sources. Empty current journals stay omitted so the
 /// historical single-source cursor contract does not change.
 pub(crate) struct HistoryRecord {
@@ -361,7 +361,7 @@ pub(crate) struct HistoryRecord {
 impl HistoryRecord {
     pub(crate) fn new(
         workspace: Option<(String, Vec<LedgerLine>)>,
-        compatibility: compatibility::CompatibilityHistorySources,
+        compatibility: session_history::SessionHistorySources,
     ) -> Self {
         let mut files = Vec::new();
         let mut names = Vec::new();
@@ -739,7 +739,7 @@ pub(crate) fn merge_files(
 /// depend on how much of the record a caller happens to be holding: a
 /// quota park from hours ago reads exactly like one from a second ago.
 pub(crate) fn open_deliveries(inner: &Arc<Inner>) -> Vec<OpenDelivery> {
-    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let compatibility = session_history::SessionHistoryAdapter::capture(inner).read();
     match inner.workspace_messaging() {
         Some(messaging) => messaging.retained_open_deliveries(compatibility),
         None => open_from_record(&HistoryRecord::new(None, compatibility)),
@@ -1167,7 +1167,7 @@ mod tests {
     };
 
     #[test]
-    fn socket_history_uses_the_messaging_module_and_named_compatibility_adapter() {
+    fn socket_history_uses_the_messaging_module_and_named_session_history_adapter() {
         let source = include_str!("history.rs");
         let production = source
             .rsplit_once("\n#[cfg(test)]\nmod tests {")
@@ -1182,7 +1182,7 @@ mod tests {
             .0;
 
         for required in [
-            "CompatibilityHistoryAdapter",
+            "SessionHistoryAdapter",
             "workspace_messaging_caller",
             "messaging.history(",
             "messaging.thread(",
@@ -1222,7 +1222,7 @@ mod tests {
             .expect("open-deliveries fold")
             .0;
 
-        assert!(entrypoint.contains("CompatibilityHistoryAdapter"));
+        assert!(entrypoint.contains("SessionHistoryAdapter"));
         assert!(entrypoint.contains("retained_open_deliveries"));
         for forbidden in ["inner.mailbox", "workspace_message_ids"] {
             assert!(
@@ -1564,6 +1564,7 @@ mod tests {
             )
             .unwrap(),
             supersedes: None,
+            raw: false,
         };
         let reader = |identity: &MailboxIdentity| {
             HistoryReader::workspace(identity.label.clone(), identity.key)
@@ -2042,6 +2043,7 @@ mod tests {
                     fyi: false,
                     client_key: None,
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap();

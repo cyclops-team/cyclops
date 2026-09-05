@@ -15,11 +15,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use cyclops_proto::{MessageId, NotificationAttemptId};
+use cyclops_proto::MessageId;
 use serde_json::{json, Value};
 
 use crate::action::{ActionOutcome, ActionRequest};
-use crate::detail::{Check, Loaded, ThreadEntry};
+use crate::detail::{Loaded, ThreadEntry};
 use cyclops_client::{AsyncClient, Certainty, ClientError};
 
 /// One request on one connection.
@@ -31,7 +31,6 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
         ActionRequest::OpenMessage { message_id, claim } => {
             open_message(sock, &message_id, claim).await
         }
-        ActionRequest::OpenAttention { attempt_id } => open_attention(sock, attempt_id).await,
         ActionRequest::Reply {
             message_id,
             body,
@@ -90,62 +89,6 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
                 Err(e) => e.into_outcome(),
             }
         }
-        ActionRequest::AttentionComplete { attempt_id } => {
-            resolve(
-                sock,
-                "attention.complete",
-                attempt_id,
-                "notification submitted",
-            )
-            .await
-        }
-        ActionRequest::AttentionDiscard { attempt_id } => {
-            resolve(
-                sock,
-                "attention.discard",
-                attempt_id,
-                "notification discarded",
-            )
-            .await
-        }
-    }
-}
-
-/// The two verbs that end an alarm's life.
-///
-/// A repeat after success is refused with conflict rather than replayed.
-/// An uncertain action is different: the same RPC enters the daemon's
-/// no-key reconciliation path only after a current snapshot exposes a
-/// matching terminal-accepted fact.
-async fn resolve(
-    sock: &Path,
-    method: &str,
-    attempt_id: NotificationAttemptId,
-    word: &str,
-) -> ActionOutcome {
-    let params = json!({ "id": attempt_id.to_string() });
-    match call(sock, method, params).await {
-        Ok(value) => ActionOutcome::Done(format!(
-            "{word} {}",
-            value["attempt_id"]
-                .as_str()
-                .unwrap_or(&attempt_id.to_string())
-        )),
-        Err(Failure::Refused { code, message }) if code == "conflict" => ActionOutcome::Refused {
-            code,
-            message: format!("already resolved: {message}"),
-        },
-        // The daemon persisted the intent and then could not finish, so
-        // the outcome is genuinely unknown on its side too. This is a
-        // refusal in wire shape and an ambiguity in meaning. A later
-        // snapshot may expose matching durable terminal acceptance for
-        // no-key recovery. Intent alone never authorizes it.
-        Err(Failure::Refused { code, message }) if code == "attention_action_uncertain" => {
-            ActionOutcome::Uncertain(format!(
-                "the daemon recorded the intent and could not finish: {message}"
-            ))
-        }
-        Err(e) => e.into_outcome(),
     }
 }
 
@@ -244,58 +187,6 @@ async fn open_message(sock: &Path, message_id: &MessageId, claim: bool) -> Actio
     }
 }
 
-async fn open_attention(sock: &Path, attempt_id: NotificationAttemptId) -> ActionOutcome {
-    // The diff belongs here. It is local evidence, which is why it does
-    // not belong in a LIST, but this is one attempt the operator opened
-    // deliberately and is about to complete or discard. Five booleans
-    // name which check failed and never what actually differs, and
-    // "notification exact: no" is not something a person can act on.
-    // One read per open, not one per row.
-    let params = json!({ "id": attempt_id.to_string(), "diff": true });
-    match call(sock, "attention.show", params).await {
-        Ok(value) => {
-            let mut loaded = Loaded::default();
-            match serde_json::from_value::<cyclops_proto::AttentionChecks>(value["checks"].clone())
-            {
-                Ok(checks) => loaded.checks = named_checks(&checks),
-                Err(e) => {
-                    return ActionOutcome::Uncertain(format!("unreadable attention checks: {e}"))
-                }
-            }
-            // Both are optional on the wire and stay optional here. A
-            // missing observed means exact extraction failed, which the
-            // renderer says out loud rather than hiding.
-            loaded.expected = value["expected"].as_str().map(crate::grid::safe_text);
-            loaded.observed = value["observed"].as_str().map(crate::grid::safe_text);
-            ActionOutcome::Opened(Box::new(loaded))
-        }
-        Err(e) => e.into_outcome(),
-    }
-}
-
-/// The five checks, in the daemon's order, under the daemon's own names.
-///
-/// Spelled out rather than reworded. A friendlier name here would be this
-/// crate asserting what a check means, and the wire carries only the
-/// field name and a boolean. If these read badly to an operator, the
-/// names belong in the protocol next to the values.
-fn named_checks(checks: &cyclops_proto::AttentionChecks) -> Vec<Check> {
-    [
-        ("notification exact", checks.notification_exact),
-        ("trailer anchored", checks.trailer_anchored),
-        ("process matches", checks.process_matches),
-        ("manifest matches", checks.manifest_matches),
-        ("terminal action safe", checks.terminal_action_safe),
-    ]
-    .into_iter()
-    .map(|(name, passed)| Check {
-        name: name.to_string(),
-        passed,
-        detail: None,
-    })
-    .collect()
-}
-
 /// A failed call, split by whether the daemon answered.
 #[derive(Debug, Clone)]
 enum Failure {
@@ -376,6 +267,7 @@ fn failure_from_client(error: ClientError, method: &str) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cyclops_proto::NotificationAttemptId;
     use std::str::FromStr;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -463,7 +355,7 @@ mod tests {
 
         let outcome = perform(
             &sock,
-            ActionRequest::AttentionComplete {
+            ActionRequest::ClearAlarm {
                 attempt_id: NotificationAttemptId::parse(
                     "att-00000000-0000-4000-8000-000000000019",
                 )
@@ -541,48 +433,6 @@ mod tests {
         assert!(loaded.body.is_none());
     }
 
-    /// The operator is about to complete or discard on this evidence, so
-    /// the request has to ask for it. Without diff:true the daemon returns
-    /// booleans only and the detail has nothing to show.
-    #[tokio::test]
-    async fn opening_an_alarm_asks_for_the_diff_and_keeps_both_sides() {
-        let attempt_id =
-            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000007").unwrap();
-        let (asked, outcome) = one_call(
-            "ui-action-io-attention-diff",
-            serde_json::json!({
-                "attempt_id": attempt_id.to_string(),
-                "checks": {
-                    "notification_exact": false,
-                    "trailer_anchored": true,
-                    "process_matches": true,
-                    "manifest_matches": true,
-                    "terminal_action_safe": true,
-                },
-                "expected": "STAGED",
-                "observed": "IN THE PANE",
-            }),
-            ActionRequest::OpenAttention { attempt_id },
-        )
-        .await;
-
-        assert_eq!(asked["method"], "attention.show");
-        assert_eq!(
-            asked["params"]["diff"], true,
-            "the detail asked for booleans only: {asked}"
-        );
-        match outcome {
-            ActionOutcome::Opened(loaded) => {
-                assert_eq!(loaded.expected.as_deref(), Some("STAGED"));
-                assert_eq!(loaded.observed.as_deref(), Some("IN THE PANE"));
-                assert_eq!(loaded.checks.len(), 5);
-                assert_eq!(loaded.checks[0].name, "notification exact");
-                assert!(!loaded.checks[0].passed);
-            }
-            other => panic!("the open did not land: {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn withdrawal_names_the_exact_attempt_and_recipient() {
         let attempt_id =
@@ -653,7 +503,7 @@ mod tests {
         });
         let outcome = perform(
             &sock,
-            ActionRequest::AttentionComplete {
+            ActionRequest::ClearAlarm {
                 attempt_id: NotificationAttemptId::parse(
                     "att-00000000-0000-4000-8000-000000000009",
                 )
@@ -745,42 +595,6 @@ mod tests {
         {
             assert!(!field.contains('\u{1b}'), "ESC stored in a thread entry");
             assert!(!field.contains('\r'), "CR stored in a thread entry");
-        }
-    }
-
-    /// The daemon omits observed when exact extraction failed. That must
-    /// survive as absence rather than becoming an empty string, because
-    /// the renderer says so out loud.
-    #[tokio::test]
-    async fn an_omitted_observed_stays_absent() {
-        let attempt_id =
-            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000008").unwrap();
-        let (_, outcome) = one_call(
-            "ui-action-io-attention-no-observed",
-            serde_json::json!({
-                "attempt_id": attempt_id.to_string(),
-                "checks": {
-                    "notification_exact": false,
-                    "trailer_anchored": true,
-                    "process_matches": true,
-                    "manifest_matches": true,
-                    "terminal_action_safe": true,
-                },
-                "expected": "STAGED",
-            }),
-            ActionRequest::OpenAttention { attempt_id },
-        )
-        .await;
-        match outcome {
-            ActionOutcome::Opened(loaded) => {
-                assert_eq!(loaded.expected.as_deref(), Some("STAGED"));
-                assert!(
-                    loaded.observed.is_none(),
-                    "a missing observed became {:?}",
-                    loaded.observed
-                );
-            }
-            other => panic!("the open did not land: {other:?}"),
         }
     }
 }

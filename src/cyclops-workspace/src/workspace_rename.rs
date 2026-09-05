@@ -128,7 +128,6 @@ mod tests {
                     active_pane: "%1".into(),
                     zoomed: false,
                     minimized: HashMap::new(),
-                    minimization_provenance: HashMap::new(),
                 }],
                 active_tab: 0,
             },

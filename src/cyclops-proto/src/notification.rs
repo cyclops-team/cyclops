@@ -130,10 +130,9 @@ impl<'de> Deserialize<'de> for NotificationManifestId {
 /// `Writing` is the durable boundary before the external composer write. A
 /// later `paste_command_unwritten` fact may correct it to `BlockedPreWrite`
 /// only when the command pipe proves that it accepted zero command bytes.
-/// Recovery may resume `Queued` or `Gating`. A claimed `Staged` doorbell may
-/// resume only to re-prove and clear that exact attempt. A claimed `Submitted`
-/// doorbell may settle as `Notified`. Other unresolved states from `Writing`
-/// onward require attention.
+/// Recovery may resume `Queued` or `Gating`. A claimed `Submitted` doorbell
+/// may settle as `Notified`. Every other unresolved state from `Writing`
+/// onward closes to attention at the next daemon boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationState {
@@ -143,30 +142,28 @@ pub enum NotificationState {
     /// No pane bytes were written. A relevant route change or explicit
     /// operator action may move this exact attempt again.
     BlockedPreWrite,
-    /// Quota was positively observed before any composer write.
+    /// Replay only: no longer written since 1.1.0. Quota is a gate hold now.
     QuotaHeld,
-    /// A later positive screen observation no longer showed quota.
-    /// Only an explicit administrator requeue may leave this state.
+    /// Replay only: no longer written since 1.1.0.
     QuotaResetObserved,
+    /// The paste command was issued. From here until `Submitted` the pane may
+    /// hold the doorbell.
     Writing,
+    /// Replay only: no longer written since 1.1.0. The paste was verified in
+    /// the composer before Enter was pressed as a separate durable step.
     Staged,
-    /// Terminal submit intent was durably reserved while the mailbox entry
-    /// was still pending. No submit key is proven until `Submitted` follows.
+    /// Replay only: no longer written since 1.1.0.
     Submitting,
+    /// Enter was pressed after the pasted row was read back exactly.
     Submitted,
-    /// Terminal submit key was pressed once without complete positive
-    /// post-paste staging proof. It is never submitted a second time.
+    /// Enter was pressed once without the pasted row reading back exactly.
+    /// It is never pressed a second time.
     SubmittedUnverified,
     Notified,
     AttentionRequired,
     /// An authenticated claim made this pre-write wake unnecessary.
     Withdrawn,
-    /// An authenticated claim won before submit. Cyclops either re-proved and
-    /// cleared its exact staged bytes, or recovered after a crash with the same
-    /// binding and positive visible-empty composer proof. The earlier `Staged`
-    /// fact is preserved.
-    /// Only `NotificationClaimedStagedCleared` may create this state because
-    /// the same fact must retire the exact composer barrier.
+    /// Replay only: no longer written since 1.1.0.
     WithdrawnAfterStaging,
     /// An administrator suppressed this exact pre-write wake attempt.
     /// The mailbox item remains pending and claimable.
@@ -176,7 +173,8 @@ pub enum NotificationState {
 }
 
 impl NotificationState {
-    /// Legal transitions for one attempt. Requeue is a separate fact.
+    /// Legal transitions for one attempt. Requeue is a separate fact. Edges
+    /// out of replay-only states stay so an old journal still replays.
     pub fn can_transition_to(self, next: NotificationState) -> bool {
         use NotificationState::*;
         match self {
@@ -190,7 +188,12 @@ impl NotificationState {
             QuotaResetObserved => false,
             // The zero-byte Writing correction is cause-gated by the
             // notification projection and cannot be expressed by states alone.
-            Writing => matches!(next, Staged | AttentionRequired),
+            // A raw write goes straight to Notified: nothing about it is
+            // verified, so there is no receipt to wait for.
+            Writing => matches!(
+                next,
+                Staged | Submitted | SubmittedUnverified | Notified | AttentionRequired
+            ),
             Staged => matches!(next, Submitting | AttentionRequired),
             Submitting => matches!(next, Submitted | SubmittedUnverified | AttentionRequired),
             Submitted => matches!(next, Notified | AttentionRequired),
@@ -233,7 +236,6 @@ impl NotificationState {
             self,
             Self::QuotaHeld
                 | Self::QuotaResetObserved
-                | Self::SubmittedUnverified
                 | Self::Notified
                 | Self::AttentionRequired
                 | Self::Withdrawn
@@ -485,9 +487,15 @@ impl NotificationAttentionCause {
         use NotificationState::*;
 
         match state {
+            // Writing now spans the paste and the Enter that follows it.
             Writing => matches!(
                 self,
-                PasteFailed | VerifyFailed | DaemonRestart | TransportOutcomeUnknown
+                PasteFailed
+                    | VerifyFailed
+                    | PaneReboundAfterPaste
+                    | SubmitFailed
+                    | DaemonRestart
+                    | TransportOutcomeUnknown
             ),
             Staged => matches!(
                 self,
@@ -531,17 +539,26 @@ pub enum NotificationTransport {
     /// Content-free wake notification that directs an agent to its mailbox.
     #[default]
     Doorbell,
-    /// Full message payload delivered through the verified terminal pipeline.
+    /// Replay only: no longer written since 1.1.0. The full message payload
+    /// an older daemon pasted through the verified terminal pipeline.
     DirectPayload,
+    /// The full rendered message pasted and submitted with no composer
+    /// check and no receipt. The sender asked for it (`--raw`); the journal
+    /// records it as an unverified write.
+    Raw,
 }
 
-/// Compact claim-command doorbell written by older versioned daemons.
+/// Replay only: no longer written since 1.1.0. Compact claim-command
+/// doorbell written by older daemons.
 pub const DOORBELL_FORMAT_COMPACT_CLAIM: u32 = 1;
-/// Claim-command doorbell carrying an injective token for the exact attempt.
+/// Replay only: no longer written since 1.1.0. Claim-command doorbell
+/// carrying an injective token for the exact attempt.
 pub const DOORBELL_FORMAT_ATTEMPT_CLAIM: u32 = 2;
-/// Single-row claim command carrying only the exact attempt token.
+/// Replay only: no longer written since 1.1.0. Single-row claim command
+/// carrying only the exact attempt token.
 pub const DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM: u32 = 3;
-/// Two-sentence preview beside the exact attempt claim command.
+/// One-line preview beside the exact attempt claim command. The only
+/// format the daemon writes.
 pub const DOORBELL_FORMAT_SUMMARY_CLAIM: u32 = 4;
 /// Minimum pane width that can carry doorbell format 3 as one exact row.
 pub const DOORBELL_V3_MIN_PANE_WIDTH: u32 = 60;
@@ -598,9 +615,13 @@ pub struct NotificationRecord {
     pub doorbell_format: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<NotificationAttentionCause>,
-    /// Closed, content-free detail for a `verify_failed` transition.
-    ///
-    /// Older journal rows omit this field and replay with `None`.
+    /// What proved the receipt behind a `Notified` record: the vendor hook,
+    /// screen evidence, or nothing (a claim, a receipt timeout, a raw write,
+    /// or a row written before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_by: Option<crate::ledger::VerifiedBy>,
+    /// Replay only: no longer written since 1.1.0. Content-free detail an
+    /// older daemon attached to a `verify_failed` transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_outcome: Option<NotificationVerifyOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -620,11 +641,9 @@ pub struct NotificationRecord {
     /// work, which prevents proof flapping from becoming a retry loop.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub pre_write_reopen_count: u8,
-    /// Durable unclaimed-doorbell reminders already queued for this attempt.
-    ///
-    /// The current contract permits at most one. Keeping the bound on the
-    /// attempt record makes it survive daemon restart and prevents duplicate
-    /// timers from producing duplicate terminal writes.
+    /// Replay only: no longer written since 1.1.0. Reminders an older
+    /// daemon queued for this attempt; still part of the execution epoch so
+    /// a replayed record keeps its generation.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub unclaimed_reminder_count: u8,
     pub started_seq: u64,
@@ -715,7 +734,10 @@ pub enum NotificationFact {
         doorbell_format: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cause: Option<NotificationAttentionCause>,
-        /// Present only when `cause` is `verify_failed`.
+        /// Present only on a `notified` transition that had a receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verified_by: Option<crate::ledger::VerifiedBy>,
+        /// Replay only: no longer written since 1.1.0.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verify_outcome: Option<NotificationVerifyOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -726,11 +748,10 @@ pub enum NotificationFact {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_observation: Option<Box<NotificationPreWriteObservation>>,
     },
-    /// Re-open one still-pending, already-notified doorbell for one reminder.
-    ///
-    /// This fact is content-free and names the exact attempt. Projection
-    /// validation refuses claims, replacements, non-doorbell transports, and
-    /// attempts that already spent their single reminder allowance.
+    /// Replay only: no longer written since 1.1.0. Re-opened one
+    /// still-pending, already-notified doorbell for one reminder. Projection
+    /// validation still refuses claims, replacements, non-doorbell
+    /// transports, and attempts that already spent their single allowance.
     NotificationUnclaimedReminderQueued {
         record_version: u32,
         attempt_id: NotificationAttemptId,
@@ -914,12 +935,12 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
-/// Rebuild compact doorbell format 1 for writing and recovery.
+/// Rebuild compact doorbell format 1 for replay and recovery.
 pub fn render_doorbell_v1(oldest_msg_id: &MessageId) -> String {
     format!("cyclops inbox claim {oldest_msg_id}")
 }
 
-/// Rebuild attempt-bound doorbell format 2 for writing and recovery.
+/// Rebuild attempt-bound doorbell format 2 for replay and recovery.
 ///
 /// The suffix is a shell comment, so the command remains directly runnable.
 /// Its 22 URL-safe characters encode every bit of the attempt UUID. Exact
@@ -931,7 +952,8 @@ pub fn render_doorbell_v2(oldest_msg_id: &MessageId, attempt_id: NotificationAtt
     )
 }
 
-/// Rebuild single-row attempt-locator doorbell format 3.
+/// Rebuild single-row attempt-locator doorbell format 3 for replay and
+/// recovery. Format 4 embeds it as the exact claim command.
 pub fn render_doorbell_v3(attempt_id: NotificationAttemptId) -> String {
     format!(
         "cyclops inbox claim {}",
@@ -1244,6 +1266,7 @@ mod tests {
             transport: NotificationTransport::DirectPayload,
             doorbell_format: None,
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
@@ -1279,6 +1302,9 @@ mod tests {
             (Gating, QuotaHeld),
             (QuotaHeld, QuotaResetObserved),
             (Writing, Staged),
+            (Writing, Submitted),
+            (Writing, SubmittedUnverified),
+            (Writing, Notified),
             (Writing, AttentionRequired),
             (Staged, Submitting),
             (Staged, AttentionRequired),
@@ -1321,6 +1347,8 @@ mod tests {
         use NotificationState::*;
 
         assert!(PasteFailed.valid_after(Writing));
+        assert!(SubmitFailed.valid_after(Writing));
+        assert!(PaneReboundAfterPaste.valid_after(Writing));
         assert!(VerifyFailed.valid_after(Staged));
         assert!(VerifyFailed.valid_after(Submitting));
         assert!(SubmitFailed.valid_after(Staged));
@@ -1413,6 +1441,7 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: Some(NotificationAttentionCause::AckTimeout),
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
@@ -1636,6 +1665,7 @@ mod tests {
             transport: Some(NotificationTransport::Doorbell),
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
@@ -1669,6 +1699,7 @@ mod tests {
             transport: None,
             doorbell_format: None,
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: Some(NotificationPreWriteCause::WriteReadinessChanged),
             wake_block: None,

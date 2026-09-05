@@ -24,6 +24,29 @@ Install the same nextest release CI uses before running the full gate:
 cargo install cargo-nextest --locked --version 0.9.100
 ```
 
+## Worktrees and build cache
+
+Each git worktree of this repo gets its own `target/` by default, so the
+same crate compiles from scratch in every worktree. Point them at one
+shared cache instead:
+
+```bash
+export CARGO_TARGET_DIR="$HOME/.cache/cyclops-cargo-target"
+```
+
+Set it in your shell profile so every worktree, and every `cargo`,
+`./scripts/check.sh`, and `./scripts/install.sh` invocation, shares it.
+Cargo keys artifacts by crate, feature set, and profile, so concurrent
+worktrees on different branches will not corrupt each other's output;
+they do serialize on Cargo's own build lock instead of compiling in
+parallel, which is the tradeoff for not rebuilding the same crate twice.
+
+A shared cache accumulates artifacts from abandoned branches. Install
+[`cargo-sweep`](https://github.com/holmgr/cargo-sweep) once
+(`cargo install cargo-sweep --locked`), then run
+`./scripts/sweep-target.sh` occasionally to remove anything untouched for
+more than 7 days.
+
 ## The loop
 
 The full local gate runs the same required correctness contracts as CI.
@@ -57,8 +80,11 @@ Run formatting and clippy while you work.
 
 One command runs the complete gate in that order, cheapest first, with per-gate
 timing: `./scripts/check.sh`. Its `--fast` flag stops after the test
-suite, which is the right pass while iterating; the full run is for the
-moment before a push. Neither changes any flag CI uses.
+suite, which is the right pass while iterating; its `--quick` flag stops
+even sooner, after formatting, clippy, and the pure unit tests only (no
+tmux-backed or daemon integration tests), a one-to-two-minute sanity pass
+for the middle of editing; the full run is for the moment before a push.
+None of the three changes any flag CI uses.
 
 While working inside one crate, the honest inner loop is smaller still:
 `cargo test -p <crate>` plus clippy on save. The full workspace suite
@@ -259,7 +285,7 @@ Local green plus red CI is not a flaky-CI story until the logs say so.
 - **Vendor behavior goes in a manifest, not in Rust**
   ([MANIFESTS.md](docs/reference/MANIFESTS.md)).
 - **No polling.** If you are reaching for an interval, you have not found
-  the event yet ([INVARIANTS.md](docs/development/INVARIANTS.md), rule 9).
+  the event yet ([INVARIANTS.md](docs/development/INVARIANTS.md), rule 8).
 - **Record what you measured.** If you learned something about tmux, a
   vendor CLI, or a platform that contradicts what the code assumed, it goes
   in `findings.md` with the probe that proved it. Those entries are worth

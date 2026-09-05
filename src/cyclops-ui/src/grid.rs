@@ -4,7 +4,7 @@
 //!
 //! The CLI (src/cyclops) renders the same voice on receipts, history,
 //! and the status grid. It already depends on this crate to run
-//! `cyclops ui`, so it calls these functions. It used to hold a
+//! `cyclops watch`, so it calls these functions. It used to hold a
 //! hand-written copy of them, justified by the CLI being a binary, with a
 //! suite of "badge drift" parity tests policing the copy; the parity tests
 //! themselves imported this module, which is what showed the justification

@@ -48,21 +48,6 @@ pub struct DecorationSnapshot {
     pub sessions: HashMap<String, cyclops_proto::SessionInstanceId>,
     /// Live display routes for durable mailboxes from the daemon.
     pub mailbox_routes: Vec<cyclops_proto::StatusMailboxRoute>,
-    /// The daemon's attention register.
-    ///
-    /// Nothing in the workspace reads it any more. Its per-pane half is
-    /// already folded into `panes[..].needs_attention` by `apply`, which is
-    /// what the tab strip and the agent rows mark from. Its delivery half
-    /// had exactly one surface, the sidebar header's rollup dot, and that
-    /// dot could not go out: a delivery in `attention_required` leaves only
-    /// through `queued`, and nothing in the product writes that transition.
-    ///
-    /// Kept on the struct because the register itself is correct and the
-    /// admin inbox is the surface that should read it. What is NOT kept is
-    /// asking the daemon to compute the delivery half every poll: see
-    /// `open_deliveries` at the fetch below.
-    #[allow(dead_code)]
-    pub attention: Attention,
     /// True when the daemon answered the last status query.
     pub online: bool,
 }
@@ -257,7 +242,6 @@ fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
         online: true,
         panes,
         sessions,
-        attention,
         mailbox_routes: status.mailbox_routes.clone(),
     }
 }

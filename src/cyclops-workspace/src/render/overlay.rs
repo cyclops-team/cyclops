@@ -15,10 +15,9 @@ use super::PANE_GRIP;
 use crate::bindings::BindingAction;
 use crate::copy;
 use crate::dialog::{
-    Dialog, ForceSubmitPicker, SettingsSection, SoundPicker, SoundRow, ThemePicker, ViewRow,
-    ViewSwitches,
+    Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker, ViewRow, ViewSwitches,
 };
-use crate::input::mouse::{HitMap, HitTarget, MenuState};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget, MenuState};
 use crate::theme::{self, Paint};
 
 /// Columns between a box's border and its content, on both sides. One
@@ -66,8 +65,8 @@ const FIELD_MAX_ROWS: u16 = 6;
 /// under it carries no control of its own (the hint on the keybinds
 /// sheet, the question on a plain one), so claiming it costs nothing and
 /// doubles the reach. The settings card's section chips are the one
-/// control on that row; they are pushed after the strip so each wins its
-/// own cells and the rest of the row still drags.
+/// control on that row; on the same layer and pushed after the strip,
+/// each wins its own cells and the rest of the row still drags.
 const DIALOG_GRAB_ROWS: u16 = 2;
 
 /// Move a centered box by however far the operator has dragged it, and keep
@@ -133,7 +132,7 @@ fn paint_title_bar(
     if grip_x > bar.x {
         super::overlay_text(buf, bar, grip_x, bar.y, PANE_GRIP, style);
     }
-    hits.push(grab, HitTarget::DialogTitleBar);
+    hits.push(grab, HitLayer::Overlay, HitTarget::DialogTitleBar);
 }
 
 /// `text` broken into the visual lines a field `width` columns wide shows,
@@ -316,10 +315,9 @@ pub fn dialog_rect(dialog: &Dialog, area: Rect) -> Option<Rect> {
             themes,
             view,
             sound,
-            delivery,
             ..
         } => {
-            let (rows, footer_lines) = settings_frame(themes, view, sound, delivery, area);
+            let (rows, footer_lines) = settings_frame(themes, view, sound, area);
             settings_dialog_geometry(rows, footer_lines, area).map(|(r, _)| r)
         }
         _ => {
@@ -380,11 +378,10 @@ pub fn paint_dialog(
         themes,
         view,
         sound,
-        delivery,
     } = dialog
     {
         paint_settings_dialog(
-            *section, themes, view, sound, delivery, area, buf, paint, hits, hover, offset,
+            *section, themes, view, sound, area, buf, paint, hits, hover, offset,
         );
         return;
     }
@@ -585,7 +582,7 @@ fn paint_dialog_buttons(
             theme::dialog_secondary(paint)
         };
         super::overlay_text(buf, inner, bx, button_y, &text, style);
-        hits.push(rect, target);
+        hits.push(rect, HitLayer::Overlay, target);
         bx = bx.saturating_add(bw + DIALOG_BUTTON_GAP);
     }
 }
@@ -654,7 +651,6 @@ fn paint_settings_dialog(
     themes: &ThemePicker,
     view: &ViewSwitches,
     sound: &SoundPicker,
-    delivery: &ForceSubmitPicker,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -662,8 +658,8 @@ fn paint_settings_dialog(
     hover: Option<(u16, u16)>,
     offset: (i16, i16),
 ) {
-    let footer = settings_footer(section, themes, delivery);
-    let (frame_rows, footer_lines) = settings_frame(themes, view, sound, delivery, area);
+    let footer = settings_footer(section, themes);
+    let (frame_rows, footer_lines) = settings_frame(themes, view, sound, area);
     let Some((dialog_area, list_h)) = settings_dialog_geometry(frame_rows, footer_lines, area)
     else {
         return;
@@ -678,12 +674,11 @@ fn paint_settings_dialog(
     let usable_w = inner.width.saturating_sub(2 * DIALOG_INSET);
     let list = Rect::new(left, inner.y + 2, usable_w, list_h);
 
-    let lines = settings_lines(section, themes, view, sound, delivery);
+    let lines = settings_lines(section, themes, view, sound);
     let selected = match section {
         SettingsSection::Theme => themes.selected,
         SettingsSection::View => view.selected,
         SettingsSection::Sound => sound.selected,
-        SettingsSection::Delivery => delivery.selected,
     };
     paint_settings_rows(buf, inner, list, &lines, selected, paint, hits);
 
@@ -705,17 +700,16 @@ fn paint_settings_dialog(
     match section {
         // Enter flips the row under the cursor and the card stays, so
         // there is nothing to apply and Esc is the one key that leaves.
-        SettingsSection::View | SettingsSection::Delivery => {
-            paint_close_row(buf, inner, paint, hits, hover, "Esc", None, 0)
-        }
+        SettingsSection::View => paint_close_row(buf, inner, paint, hits, hover, "Esc", None, 0),
         SettingsSection::Theme | SettingsSection::Sound => {
             paint_dialog_buttons(buf, inner, paint, hits, hover, copy::BUTTON_APPLY)
         }
     }
     paint_title_bar(buf, dialog_area, Some(copy::SETTINGS_TITLE), paint, hits);
-    // After the title bar on purpose: the chips share its second row, and
-    // `HitMap::hit` answers with the last region pushed over a cell, so a
-    // chip wins its own cells and the rest of the row still drags.
+    // After the title bar on purpose: the chips share its second row and
+    // its layer, and within a layer `HitMap::hit` answers with the last
+    // region pushed, so a chip wins its own cells and the rest of the row
+    // still drags.
     paint_section_chips(buf, inner, left, usable_w, section, paint, hits, hover);
 }
 
@@ -778,7 +772,7 @@ fn paint_settings_rows(
         buf.set_style(rect, style);
         let mark = if checked { copy::MENU_CHECK } else { " " };
         super::overlay_text(buf, inner, list.x, y, &format!("{mark} {label}"), style);
-        hits.push(rect, HitTarget::SettingsRow { index });
+        hits.push(rect, HitLayer::Overlay, HitTarget::SettingsRow { index });
     }
 }
 
@@ -862,7 +856,7 @@ fn paint_close_row(
         theme::dialog_primary(paint)
     };
     super::overlay_text(buf, inner, rect.x, rect.y, &close, style);
-    hits.push(rect, HitTarget::DialogCancel);
+    hits.push(rect, HitLayer::Overlay, HitTarget::DialogCancel);
 
     let Some((start, end)) = showing else {
         return;
@@ -908,7 +902,11 @@ fn paint_section_chips(
             theme::menu_hint(paint)
         };
         super::overlay_text(buf, inner, x, inner.y, &text, style);
-        hits.push(rect, HitTarget::SettingsSection { section });
+        hits.push(
+            rect,
+            HitLayer::Overlay,
+            HitTarget::SettingsSection { section },
+        );
         x = x.saturating_add(w + DIALOG_BUTTON_GAP);
     }
 }
@@ -943,35 +941,12 @@ fn settings_lines<'a>(
     themes: &'a ThemePicker,
     view: &'a ViewSwitches,
     sound: &'a SoundPicker,
-    delivery: &'a ForceSubmitPicker,
 ) -> Vec<SettingsLine<'a>> {
     match section {
         SettingsSection::Theme => theme_lines(themes),
         SettingsSection::View => view_lines(view),
         SettingsSection::Sound => sound_lines(sound),
-        SettingsSection::Delivery => force_submit_lines(delivery),
     }
-}
-
-fn force_submit_lines(delivery: &ForceSubmitPicker) -> Vec<SettingsLine<'_>> {
-    vec![
-        SettingsLine::Row {
-            index: 0,
-            label: if delivery.enabled {
-                copy::FORCE_SUBMIT_ON
-            } else {
-                copy::FORCE_SUBMIT_OFF
-            },
-            checked: delivery.enabled,
-        },
-        SettingsLine::Note(copy::FORCE_SUBMIT_NOTE),
-        SettingsLine::Gap,
-        SettingsLine::Row {
-            index: 1,
-            label: &delivery.delay_label,
-            checked: false,
-        },
-    ]
 }
 
 /// Each surface's row, checked while it shows, with one muted line
@@ -1052,20 +1027,12 @@ fn sound_lines(sound: &SoundPicker) -> Vec<SettingsLine<'_>> {
 /// section's says its rows flip at once, the one way it differs from
 /// the pickers. The sound section says its piece at the top
 /// ([`sound_lines`]) and has none.
-fn settings_footer<'a>(
-    section: SettingsSection,
-    themes: &'a ThemePicker,
-    delivery: &'a ForceSubmitPicker,
-) -> &'a str {
+fn settings_footer(section: SettingsSection, themes: &ThemePicker) -> &str {
     match section {
         SettingsSection::Theme if themes.names.is_empty() => copy::THEMES_EMPTY,
         SettingsSection::Theme => themes.notice.as_deref().unwrap_or(copy::THEMES_HINT),
         SettingsSection::View => copy::VIEW_HINT,
         SettingsSection::Sound => "",
-        SettingsSection::Delivery => delivery
-            .notice
-            .as_deref()
-            .unwrap_or(copy::FORCE_SUBMIT_HINT),
     }
 }
 
@@ -1077,7 +1044,6 @@ fn settings_frame(
     themes: &ThemePicker,
     view: &ViewSwitches,
     sound: &SoundPicker,
-    delivery: &ForceSubmitPicker,
     area: Rect,
 ) -> (usize, usize) {
     let text_width = settings_width(area).saturating_sub(DIALOG_CHROME_WIDTH);
@@ -1085,16 +1051,11 @@ fn settings_frame(
         .len()
         .max(view_lines(view).len())
         .max(sound_lines(sound).len());
-    let rows = rows.max(force_submit_lines(delivery).len());
     let footers = [
         copy::THEMES_HINT,
         copy::THEMES_EMPTY,
         copy::VIEW_HINT,
         themes.notice.as_deref().unwrap_or(""),
-        delivery
-            .notice
-            .as_deref()
-            .unwrap_or(copy::FORCE_SUBMIT_HINT),
     ];
     let footer_lines = footers
         .iter()
@@ -1396,7 +1357,11 @@ pub fn paint_menu(
             (_, _) => "  ".into(),
         };
         super::overlay_text(buf, inner, inner.x, y, &format!(" {mark}{label}"), style);
-        hits.push(rect, HitTarget::MenuItem { action: *action });
+        hits.push(
+            rect,
+            HitLayer::Overlay,
+            HitTarget::MenuItem { action: *action },
+        );
     }
 }
 
@@ -1694,7 +1659,6 @@ mod tests {
                 vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
                 "bow-ripple",
             ),
-            delivery: ForceSubmitPicker::new(false, 5),
         }
     }
 
@@ -2100,8 +2064,7 @@ mod tests {
         assert!(
             flat.contains(copy::SETTINGS_SECTION_THEME)
                 && flat.contains(copy::SETTINGS_SECTION_VIEW)
-                && flat.contains(copy::SETTINGS_SECTION_SOUND)
-                && flat.contains(copy::SETTINGS_SECTION_DELIVERY),
+                && flat.contains(copy::SETTINGS_SECTION_SOUND),
             "every section is named: {flat}"
         );
         let chip = |section: SettingsSection| {
@@ -2114,14 +2077,11 @@ mod tests {
         let theme_chip = chip(SettingsSection::Theme);
         let view_chip = chip(SettingsSection::View);
         let sound_chip = chip(SettingsSection::Sound);
-        let delivery_chip = chip(SettingsSection::Delivery);
         assert_eq!(theme_chip.y, view_chip.y, "one row of chips");
         assert_eq!(theme_chip.y, sound_chip.y, "one row of chips");
-        assert_eq!(theme_chip.y, delivery_chip.y, "one row of chips");
         assert!(
             view_chip.x > theme_chip.x + theme_chip.width
-                && sound_chip.x > view_chip.x + view_chip.width
-                && delivery_chip.x > sound_chip.x + sound_chip.width,
+                && sound_chip.x > view_chip.x + view_chip.width,
             "in Tab order"
         );
         assert_eq!(
@@ -2133,7 +2093,7 @@ mod tests {
         );
         assert!(
             matches!(
-                hits.hit(delivery_chip.x + delivery_chip.width + 4, delivery_chip.y),
+                hits.hit(sound_chip.x + sound_chip.width + 4, sound_chip.y),
                 Some(HitTarget::DialogTitleBar)
             ),
             "past the chips the row still drags"
@@ -2143,25 +2103,6 @@ mod tests {
             buf[(sound_chip.x + 1, sound_chip.y)].bg,
             "the showing section's chip is lit"
         );
-    }
-
-    #[test]
-    fn delivery_section_names_the_risk_and_shows_the_saved_delay() {
-        let mut dialog = theme_card(vec!["dark".into()], 0, Some(0), None);
-        if let Dialog::Settings {
-            section, delivery, ..
-        } = &mut dialog
-        {
-            *section = SettingsSection::Delivery;
-            *delivery = ForceSubmitPicker::new(true, 20);
-        }
-        let (buf, _) = draw_dialog(&dialog, (0, 0));
-        let flat = flatten(&buf);
-        assert!(flat.contains(copy::FORCE_SUBMIT_ON), "{flat}");
-        assert!(flat.contains("20s"), "{flat}");
-        assert!(flat.contains(copy::FORCE_SUBMIT_NOTE), "{flat}");
-        assert!(flat.contains("Default is off. Select Delay"), "{flat}");
-        assert!(flat.contains("seconds."), "{flat}");
     }
 
     /// Every listed row is a click target naming its index, the mouse's
@@ -2363,7 +2304,6 @@ mod tests {
                 vec!["bow-ripple".into(), crate::sound::SYSTEM.into()],
                 crate::sound::SYSTEM,
             ),
-            delivery: ForceSubmitPicker::new(false, 5),
         };
         let (buf, hits) = draw_dialog(&dialog, (0, 0));
         let flat = flatten(&buf);

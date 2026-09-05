@@ -1,0 +1,45 @@
+# Cyclops hook config template: goose hook-only plugin, hooks/hooks.json.
+# Rendered by `cyclops hooks install goose --agent <label>`; '#' lines are
+# stripped and {cyclops_bin} is substituted. The label selects the artifact
+# path only: hook identity comes from the authenticated socket peer.
+#
+# UNVERIFIED: written from
+# https://github.com/block/goose/blob/main/documentation/docs/guides/context-engineering/hooks.md
+# No edge from a goose turn has been observed by Cyclops yet.
+#
+# Wiring: goose discovers hooks from plugin directories, never from
+# config.yaml. Place this file at ~/.agents/plugins/cyclops/hooks/hooks.json.
+# A hook-only plugin needs no plugin.json: goose infers the plugin name
+# ("cyclops") from the directory. Disable it with "disabledPlugins":
+# ["cyclops"] in ~/.config/goose/settings.json.
+#
+# NO MATCHER on any rule. goose matchers are regexes and a bare "*" is an
+# invalid regex that makes goose skip the whole rule silently (documented).
+# Omitting the matcher runs the rule for every event of that type.
+#
+# Events: UserPromptSubmit is the dispatch candidate (payload carries the
+# prompt in `message`). Stop is a candidate end: a hook that prints a block
+# decision keeps the turn going, and `cyclops hook` prints nothing, which
+# goose reads as allow. SessionStart is process-bound liveness; PreToolUse
+# and PostToolUse are tool activity telemetry. Timeouts are seconds here;
+# `cyclops hook` finishes inside 3 s. Every entry names its own event on
+# the command line (finding F7).
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook SessionStart", "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook UserPromptSubmit", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PreToolUse", "timeout": 5 } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook PostToolUse", "timeout": 5 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "{cyclops_bin} hook Stop", "timeout": 5 } ] }
+    ]
+  }
+}

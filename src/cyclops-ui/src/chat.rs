@@ -268,12 +268,17 @@ impl ChatAction {
 const ACTION_GAP: &str = " ";
 
 /// The verbs the strip offers right now. `refresh_failed` adds the retry.
+///
+/// Every verb with a key on the Messages pane is here, [`ChatAction::Scope`]
+/// excepted: that one is the header's chip. A verb bound to a key but
+/// missing from the strip is a verb a pointer user cannot find.
 pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
     let mut actions = vec![
         ChatAction::Reply,
         ChatAction::Announce,
         ChatAction::Open,
         ChatAction::Clear,
+        ChatAction::Sessions,
     ];
     if refresh_failed {
         actions.insert(0, ChatAction::Retry);
@@ -1547,7 +1552,23 @@ mod strip_tests {
     #[test]
     fn every_reported_span_covers_exactly_its_own_verb() {
         let (row, spans) = chat_action_strip(80, false);
-        assert_eq!(spans.len(), chat_actions(false).len(), "{row}");
+        // Counted against the verbs the pane binds, not against the list
+        // the strip is built from: the two drifted once, and the strip
+        // lost its session toggle without any test noticing.
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(action, _, _)| *action)
+                .collect::<Vec<_>>(),
+            vec![
+                ChatAction::Reply,
+                ChatAction::Announce,
+                ChatAction::Open,
+                ChatAction::Clear,
+                ChatAction::Sessions,
+            ],
+            "{row}"
+        );
         for (action, start, end) in spans {
             assert_eq!(
                 &row[start..end],

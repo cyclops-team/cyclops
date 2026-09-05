@@ -1891,6 +1891,7 @@ mod tests {
                         operator_withdrawn: None,
                         attempt_id: Some(attempt),
                         cause: None,
+                        verified_by: None,
                         verify_outcome: None,
                         pre_write_cause: Some(
                             cyclops_proto::NotificationPreWriteCause::BindingUnprovable,

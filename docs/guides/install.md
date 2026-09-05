@@ -159,7 +159,7 @@ $ cyclops start --setup-only
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
   wrote 2 sounds to /Users/you/.cyclops/sounds
-  wrote 5 detection manifests to /Users/you/.cyclops/manifests
+  wrote 12 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
@@ -178,14 +178,26 @@ final Cyclops skill file at the canonical destination for each installed
 consumer:
 
 - Claude Code: `~/.claude/skills/cyclops/SKILL.md`
-- Codex and Cursor: `~/.agents/skills/cyclops/SKILL.md`
 - Antigravity CLI: `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md`
+- Kimi Code CLI: `~/.kimi-code/skills/cyclops/SKILL.md`
+- Qwen Code: `~/.qwen/skills/cyclops/SKILL.md`
+- Codex, Cursor, Gemini CLI, goose, OpenCode, Amp, and Crush:
+  `~/.agents/skills/cyclops/SKILL.md`
 
-Codex and Cursor share one copy. Codex is installed when `$CODEX_HOME`, or
-`~/.codex` when unset, exists; Cursor is installed when `~/.cursor` exists.
-The shared destination alone does not trigger either consumer. Claude Code
-requires `~/.claude`, and Antigravity CLI requires
-`~/.gemini/antigravity-cli`. Setup creates no home for an absent
+Every CLI that reads `~/.agents/skills` shares that one copy, because a
+vendor that reads two of its skill roots warns about the duplicate (Gemini
+CLI 0.45.2 prints "Skill conflict detected" when `~/.gemini/skills` and
+`~/.agents/skills` hold the same skill). A consumer counts as installed when
+its own config directory exists: `$CODEX_HOME` or `~/.codex`, `~/.cursor`,
+`~/.config/goose`, `~/.config/opencode`, `~/.config/amp`, `~/.config/crush`.
+Gemini CLI is the exception: Antigravity CLI lives under
+`~/.gemini/antigravity-cli`, so `~/.gemini` exists on every AGY machine, and
+Cyclops instead requires `~/.gemini/tmp` (under `$GEMINI_CLI_HOME` when set),
+which Gemini CLI creates the first time it starts and AGY never does. The
+shared destination alone does not trigger any of them. Claude Code requires
+`~/.claude`, Antigravity CLI `~/.gemini/antigravity-cli`, Kimi `~/.kimi-code`
+(or `$KIMI_CODE_HOME`), and Qwen `~/.qwen` (or `$QWEN_HOME`). Setup creates
+no home for an absent
 consumer and never seeds duplicate skill locations. Skill seeding never
 creates `.agents`, `skills`, or `cyclops` directories: it creates only a
 missing final `SKILL.md` below an existing private canonical parent. A missing
@@ -210,23 +222,14 @@ Inspect the setup without changing it:
 $ cyclops setup check
 ```
 
-The check reports all four shipped manifests plus each supported consumer's
-install state, hook wiring, required receipt tier, observed acknowledgment
-capability, and canonical skill destination. Claude, Codex, and Cursor require
-tier 1; AGY requires tier 2. An installed tier-1 consumer whose acknowledgment
-cannot match a payload is incomplete rather than silently relabeled tier 2.
-Its `mailbox` line predicts the terminal
-transport from the same exact-skill check the daemon uses: `doorbell` or
-`direct payload`. An operator-edited skill is preserved, but cannot prove the
-claim contract and therefore selects direct fallback. It exits 0 when setup is
+The check reports every shipped manifest plus each supported consumer's
+install state, hook wiring, receipt tier, observed acknowledgment capability,
+and canonical skill destination. An installed tier-1 consumer whose
+acknowledgment cannot match a payload is reported as incomplete rather than
+silently relabeled tier 2. It exits 0 when setup is
 complete for the installed consumers and 1 when setup needs repair. Add
 `--json` for a stable machine-readable report. The check reads setup state
 only. The standard setup workflow installs or repairs it.
-
-This can still leave `skill` at manual review and setup incomplete. It changes
-only the `mailbox` result: current exact bytes in a regular final `SKILL.md`
-can report `doorbell`, while setup still will not create or rewrite that
-directory.
 
 Review the managed setup seed decisions:
 
@@ -314,57 +317,35 @@ in `~/.cyclops/manifests` on the same paths (`start` and bare `cyclops`),
 because without them every pane reads unknown and nothing can be
 delivered. With no theme files at all, cyclops renders in built-in colors.
 
-Notification-worker and legacy direct-delivery tuning, with defaults shown:
+Doorbell tuning, with defaults shown:
 
 ```toml
-ack_timeout_ms = 1500        # hook ACK window after a notification or legacy test write
-delivery_retry_max = 1       # retries only when no notification or legacy payload bytes reached the pane
+ack_timeout_ms = 1500        # hook ACK window after the doorbell is submitted
+delivery_retry_max = 1       # retries only when no bytes reached the pane
 receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
-gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
-unclaimed_reminder_ms = 0    # disabled; positive arms one bounded reminder per unclaimed attempt
-force_notification_submit = "on"         # automatic one-key recovery after verify failure
-force_notification_submit_delay_ms = 0    # 0 through 20000; delay before that recovery
+gate_hold_notify_ms = 120000 # one admin ping when a doorbell is held this long
 ```
 
 Standard `cyclops send` acceptance is durable before notification scheduling.
 When the cached pane verdict says the FIFO head can be decided immediately,
 the response observes its first durable wake disposition for at most
-`receipt_block_ms`. Working and otherwise held panes return their current state
-without this wait. The deadline records no fact and never decides delivery
-state. Keep it under 5000 because the CLI gives a socket read five seconds
-before it calls the connection lost.
+`receipt_block_ms`. Held panes return their current state without this wait.
+The deadline records no fact and never decides delivery state. Keep it under
+5000 because the CLI gives a socket read five seconds before it calls the
+connection lost.
 
-`delivery_retry_max` applies only to failures proven before a notification or
-legacy payload write: detach or missing manifest, a pre-write occupant rebind,
-and a spool or load-buffer failure. Verification, submit, post-write rebind,
-or ACK failure may follow bytes that reached the pane, so the attempt ends in
-`attention_required` with an exact cause and is never written again
-automatically. Inspect before taking a recovery action. The durable mailbox
-message remains available for an exact claim throughout.
+`delivery_retry_max` applies only to failures proven before the paste: a
+detached session, a missing manifest, a pre-write occupant rebind, or a spool
+failure. A paste or submit command that failed, or a pane whose occupant
+changed after the paste, may follow bytes that reached the pane, so the
+attempt ends in `attention_required` with an exact cause and is never written
+again automatically. A line that could not be read back is still submitted
+once and recorded as `submitted_unverified`. The durable mailbox message
+remains available for an exact claim throughout.
 
-`unclaimed_reminder_ms` is disabled when absent or zero. A positive value arms
-one content-free reminder after a doorbell remains unclaimed for that long.
-The reminder reuses the exact attempt locator and the ordinary composer gate:
-positive human input still refuses, while an authenticated idle or working
-pane with an inconclusive composer may receive and submit the one reminder.
-Claim, withdrawal, or replacement
-makes the timer obsolete without terminal IO. One durable allowance prevents a
-restart or duplicate timer from writing more than one reminder.
-
-`force_notification_submit` is the default-on recovery for an exact
-notification that crossed the paste boundary and then reached `verify_failed`.
-It never pastes a second notification. After
-`force_notification_submit_delay_ms`, the daemon revalidates the exact pending
-attempt, bound process generation, manifest, pane, and tmux mode, checks the
-setting one final time, records durable intent, and reserves one key under the
-same lock as `inbox.claim`. It then presses the manifest submit key at most
-once. Claim, withdrawal, replacement, or settlement that occurs before the
-reservation makes the timer obsolete. A successful disable ordered before the
-reservation also stops the timer; a later claim remains a normal retrieval,
-and a later setting change does not retract the reserved key. This deliberately
-bypasses composer-content proof, so 0 milliseconds may submit human input that
-appeared after the paste. The workspace Settings card exposes the same choice
-as a 0 to 20 second slider.
+The 1.0 keys `ambiguous_composer_settle_ms`, `unclaimed_reminder_ms`,
+`force_notification_submit`, and `force_notification_submit_delay_ms` no
+longer exist. A file that still names one boots with a warning that says so.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 
@@ -444,9 +425,10 @@ watching it.
 
 ## Wire the hooks
 
-Hooks give the daemon authenticated turn edges for state detection and safe
-one-line notification. The self-test separately reports whether a legacy
-direct-delivery acknowledgement hook fired:
+Hooks give the daemon authenticated turn edges for state detection, and the
+acknowledgement hook is how a doorbell earns a verified receipt. The self-test
+sends one real doorbell through the mailbox path and reports whether that hook
+fired:
 
 ```bash
 cyclops hooks install claude --agent reviewer   # renders config + prints wiring
@@ -476,7 +458,7 @@ $ cyclops status
 
   %0  ? unknown  zsh
 
-  1 pane reads unknown: none of agy, claude, codex, cursor matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.
+  1 pane reads unknown: none of agy, aider, amp, claude, codex, crush, cursor, gemini, goose, kimi, opencode, qwen matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.
 ```
 
 With no manifests at all it says that instead, because the fix is the
@@ -486,11 +468,35 @@ whole install and not one pane:
   1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
 ```
 
-The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI,
-Cursor Agent CLI, and Kimi CLI. Cursor detection has fixture coverage, but the current-version
-terminal notification path has not completed live validation because no current
-Cursor binary was available on the evidence host. It fails closed when exact
-evidence is unavailable; socket claims remain usable. See
+Twelve manifests ship. Five are measured against a live CLI; seven are
+written from vendor documentation and say so (`version_tested =
+"unverified"`): they bind the pane and seed the skill, and a doorbell to one
+of them never detects a human draft, so it is effectively a raw write with a
+receipt until someone measures the composer.
+
+| CLI | manifest id | tier | binds the pane by | hooks Cyclops wires | skill file |
+|---|---|---|---|---|---|
+| Claude Code | `claude` | verified | process and argv | `~/.claude/settings.json` | `~/.claude/skills/cyclops/SKILL.md` |
+| Codex CLI | `codex` | verified | process | `$CODEX_HOME/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Antigravity CLI | `agy` | verified | process | `~/.agents/hooks.json` | `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` |
+| Cursor Agent CLI | `cursor` | verified (fixtures) | argv | `~/.cursor/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Kimi Code CLI | `kimi` | verified | process and argv | `~/.kimi-code/config.toml` | `~/.kimi-code/skills/cyclops/SKILL.md` |
+| Gemini CLI | `gemini` | unverified | argv, the script behind `node` | `~/.gemini/settings.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Qwen Code | `qwen` | unverified | argv, the script behind `node` | `~/.qwen/settings.json` | `~/.qwen/skills/cyclops/SKILL.md` |
+| goose | `goose` | unverified | process `goose` | `~/.agents/plugins/cyclops/hooks/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| OpenCode | `opencode` | unverified | process `opencode` | none (JavaScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
+| Amp | `amp` | unverified | argv, the script behind `node` | none (TypeScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
+| Crush | `crush` | unverified | process `crush` | none (`PreToolUse` only; see hooks.md) | `~/.agents/skills/cyclops/SKILL.md` |
+| aider | `aider` | unverified | argv, the script behind `python` | none | none (add the skill to `read:`) |
+
+A CLI that runs under an interpreter reports `node` or `python` as its
+command; Cyclops reads the script name behind the interpreter to bind it
+([MANIFESTS.md](../reference/MANIFESTS.md) explains the measurement). When
+that read fails, pin the manifest by hand:
+`cyclops name %N <label> --manifest <id>`. Cursor detection has fixture
+coverage, but the current-version terminal notification path has not
+completed live validation because no current Cursor binary was available on
+the evidence host; socket claims remain usable. See
 [Known limits](../../STATUS.md#known-limits).
 Teaching it another one is a single TOML file:
 [MANIFESTS.md](../reference/MANIFESTS.md). More symptoms and their next steps:
@@ -600,7 +606,7 @@ stops right there and exits 0:
 
 ```
 $ cyclops update
-cyclops 1.0.2 (1e16081)
+cyclops 1.1.0 (1e16081)
   source https://github.com/cyclops-team/cyclops.git at main
 ✔ already the latest main · nothing to update
 ```
@@ -630,7 +636,7 @@ journal replay performed by rollback.
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
 
-✔ updated · 1.0.1 (0876ed7) → 1.0.2 (1e16081)
+✔ updated · 1.0.1 (0876ed7) → 1.1.0 (1e16081)
 
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```

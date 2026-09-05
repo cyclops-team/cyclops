@@ -63,18 +63,3 @@ pub(crate) fn visible_clean_composer_proof(manifest: &Manifest, capture: &str) -
         ComposerContentProof::Visible(content) if content.is_empty()
     )
 }
-
-/// Parse quota reset hints from screen captures.
-pub(crate) fn parse_reset_hint(screen: &str) -> Option<String> {
-    let idx = screen.find("esets in ")?;
-    let tail = &screen[idx + "esets in ".len()..];
-    let token: String = tail
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric())
-        .collect();
-    if token.is_empty() {
-        None
-    } else {
-        Some(format!("resets in {token}"))
-    }
-}

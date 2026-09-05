@@ -939,6 +939,52 @@ fn parent_of(pid: i32) -> Option<i32> {
     bsd_info(pid).map(|(ppid, _, _)| ppid)
 }
 
+/// The foreground process group of a process's controlling terminal, read
+/// from the kernel. This is the pid of the job the terminal is talking to.
+/// None when the process is unreadable or has no controlling terminal
+/// (the kernel reports 0 or -1 there, which name no process).
+#[cfg(target_os = "macos")]
+pub fn foreground_group(pid: i32) -> Option<i32> {
+    (pid > 0).then_some(())?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    let tpgid = i32::try_from(info.e_tpgid).ok()?;
+    (tpgid > 0).then_some(tpgid)
+}
+
+#[cfg(target_os = "linux")]
+pub fn foreground_group(pid: i32) -> Option<i32> {
+    (pid > 0).then_some(())?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    tpgid_from_stat(&stat)
+}
+
+/// Field 8 of `/proc/<pid>/stat`, counted from after the comm field, which
+/// may itself contain spaces and parens.
+#[cfg(any(target_os = "linux", test))]
+fn tpgid_from_stat(stat: &str) -> Option<i32> {
+    let after = stat.rsplit_once(')')?.1;
+    let tpgid: i32 = after.split_whitespace().nth(5)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn foreground_group(_pid: i32) -> Option<i32> {
+    None
+}
+
 /// A process's identity and its owner, from ONE observation.
 ///
 /// The pair has to come from one snapshot. Credentials can change without
@@ -1750,5 +1796,17 @@ mod tests {
             resolve_sender(uid, me, &panes, no_vendors),
             Sender::Agent("claude".to_string())
         );
+    }
+
+    #[test]
+    fn tpgid_is_field_8_after_the_comm() {
+        // A comm with spaces and a paren, then state, ppid, pgrp, session,
+        // tty_nr, tpgid.
+        let stat = "4242 (my (odd) cmd) S 1 4242 4242 34816 19989 4194304 0";
+        assert_eq!(tpgid_from_stat(stat), Some(19989));
+        // No controlling terminal: tpgid is -1, which names no process.
+        let stat = "4242 (cat) S 1 4242 4242 0 -1 4194304 0";
+        assert_eq!(tpgid_from_stat(stat), None);
+        assert_eq!(tpgid_from_stat("garbage"), None);
     }
 }

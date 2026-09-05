@@ -1,12 +1,12 @@
 # Rules this system must never break
 
-Twelve of them. They are not style preferences: each one is here because
+Ten of them. They are not style preferences: each one is here because
 breaking it does something specific and bad to a person using Cyclops, and
 most of them are here because something already went wrong once.
 
 Each rule below says what breaks in the real world, where the code enforces
 it, and which test fails if you take the enforcement out. If you are about
-to change delivery, fusion, the ledger, or any rendering path, read the
+to change delivery, fusion, the journals, or any rendering path, read the
 rules that touch it first. If you find one of these rules stated in a
 second place, that is the bug: this page is where they live.
 
@@ -14,26 +14,24 @@ second place, that is the bug: this page is where they live.
 |---|---|---|
 | [1](#1-a-payload-never-reaches-a-pane-the-gate-did-not-admit) | A payload never reaches a pane the gate did not admit | A shell executes the message |
 | [2](#2-a-modal-is-never-cleared-generically) | A modal is never cleared generically | Escape exits the agent CLI |
-| [3](#3-cyclops-writes-only-with-fresh-positive-composer-and-occupant-evidence) | Ordinary delivery writes only with fresh positive composer and occupant evidence | The human's half-written sentence is sent as part of the message |
-| [4](#4-legacy-blocked_quota-parks-and-never-auto-retries) | Legacy `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
-| [5](#5-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
-| [6](#6-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
-| [7](#7-secrets-never-enter-the-ledger) | Secrets never enter the ledger | An API key on screen becomes a permanent plain-text record |
-| [8](#8-the-record-appends-it-does-not-retract) | The record appends, it does not retract | A corrected line and a forged line look the same |
-| [9](#9-zero-polling) | Zero polling | Idle battery burn, and a broken event path that looks fine |
-| [10](#10-vendor-quirks-are-data-not-code) | Vendor quirks are data, not code | A vendor ships a new dialog and you ship a release |
-| [11](#11-color-is-redundant-and-never-the-only-encoding) | Color is redundant and never the only encoding | The state is invisible under `NO_COLOR`, `--plain`, or a screen reader |
-| [12](#12-runtime-idleness-never-implies-terminal-write-readiness) | Runtime idleness never implies ordinary terminal-write readiness | A hook edge authorizes a paste over the human's staged text |
+| [3](#3-a-doorbell-is-one-line-and-enter-held-only-by-a-seen-draft-or-a-named-block) | A doorbell is one line and Enter, held only by a seen draft or a named block | A human draft is submitted with the doorbell, or a live agent never hears its doorbell |
+| [4](#4-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
+| [5](#5-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
+| [6](#6-secrets-never-enter-the-journals) | Secrets never enter the journals | An API key on screen becomes a permanent plain-text record |
+| [7](#7-the-record-appends-it-does-not-retract) | The record appends, it does not retract | A corrected line and a forged line look the same |
+| [8](#8-zero-polling) | Zero polling | Idle battery burn, and a broken event path that looks fine |
+| [9](#9-vendor-quirks-are-data-not-code) | Vendor quirks are data, not code | A vendor ships a new dialog and you ship a release |
+| [10](#10-color-is-redundant-and-never-the-only-encoding) | Color is redundant and never the only encoding | The state is invisible under `NO_COLOR`, `--plain`, or a screen reader |
 
 ## 1. A payload never reaches a pane the gate did not admit
 
-**Resolve, gate, verify, submit. In that order, every time.**
+**Gate, re-check, paste, re-check, Enter. In that order, every time.**
 
 What breaks: a pane whose agent exited is still a pane, and what is sitting
-in it is a shell. Paste a message body into a shell and press Enter, and
-the shell runs it. A body reading `review the auth change and drop the
-stale branch` is a command line. Every other delivery failure can be fixed
-by resending; this one cannot be taken back.
+in it is a shell. Paste text into a shell and press Enter, and the shell
+runs it. A doorbell line reads `[cyclops from reviewer] ... | cyclops inbox
+claim m-att_...`, which is a command line. Every other delivery failure can
+be fixed by sending again; this one cannot be taken back.
 
 The chain is longer than the gate, and that is the part people miss.
 Admitting a pane is a decision about a moment, and there are two
@@ -41,73 +39,36 @@ irreversible steps after it:
 
 ```mermaid
 flowchart TD
-    g["gate: 8 ordered checks<br/>(delivery.rs, gate)"] -->|"admits: manifest id + pane_pid"| r1{"occupant still the<br/>admitted pid?"}
-    r1 -->|"no before paste"| retry["retry_queued, cause pane_rebound<br/>back through the whole gate"]
+    g["gate: three checks<br/>(delivery/gate.rs, admit)"] -->|"admits: manifest id + agent process"| r1{"occupant still the<br/>admitted process?"}
+    r1 -->|"no, before the paste"| regate["back through the whole gate<br/>(nothing was written)"]
     r1 -->|yes| paste["paste the buffer"]
-    paste --> v{"composer shows this<br/>message id?"}
-    v -->|"no, after every re-read"| attention["attention_required, cause verify_failed<br/>paste may have landed; never re-paste"]
-    v -->|yes| r2{"occupant STILL the<br/>admitted pid?"}
-    r2 -->|"no after paste"| attention2["attention_required, cause pane_rebound_after_paste"]
-    r2 -->|yes| enter["submit key"]
+    paste --> cap["one capture"]
+    cap --> r2{"occupant STILL the<br/>admitted process?"}
+    r2 -->|"no, after the paste"| attention["attention_required, cause pane_rebound_after_paste<br/>the key is withheld"]
+    r2 -->|yes| enter["Enter, once"]
 ```
 
-The gate's own eight steps, in order and only in this order: session
-attached, pane still in the table, pane not dead, pane not in copy-mode,
-a manifest bound, fused state recomputed with the screen sensor forced,
-the verdict on that state, and otherwise hold on an event. The diagram for
-those eight is in [ARCHITECTURE.md](ARCHITECTURE.md); this page owns the
-two re-checks around them, because the gate alone is not the invariant.
+The gate's checks, in order: the pane is present, alive, and not in
+copy-mode; a manifest binds it and the pane's foreground process is that
+agent, or a tool it handed the terminal to while the screen still reads as
+the agent; and the composer is not held (rule 3). The capture that decides the composer is the last read before the
+paste, so the snapshot is fresher than any human keystroke round trip.
 
-The screen read in step 6 is deliberately the last one before the paste. A
-gate that reads the screen early and pastes later is admitting a pane as it
-was, not as it is, and a human keystroke round-trip fits in that gap.
+A raw send (`--raw`) is the one admission that checks only the first
+condition. It is admitted once the pane is present and alive, it re-checks
+only that before the paste, and it can therefore land in a shell. The sender
+asked for exactly that, and the journal records the write as raw and
+unverified so nobody mistakes it for a gated delivery.
 
-Verification is the second half of the same rule. For direct payload deliveries
-and `attention.complete`, Enter is sent only when the normalized visible composer
-bytes exactly match the payload selected at the durable write boundary. A
-visible target or terminal sentinel is structural evidence, not ownership by
-itself. A collapsed chip proves only a vendor representation because its hidden
-bytes cannot be compared. It never authorizes Enter for direct payloads.
-
-For pane doorbells (Format 4), which carry short wake signals and claim tokens
-rather than raw message bodies, Cyclops prioritizes multi-agent liveness. If
-terminal staging is unobservable (common in CLI agents that do not echo
-bracketed paste into visible composer rows), the doorbell proceeds to submit
-Enter once and transitions to `delivered_unverified` with cause
-`unverified_staging`. Direct payloads strictly refuse submission if exact bytes
-cannot be verified.
-
-`notification.force_submit` is the separately documented default-on,
-administrator-controlled recovery. It never pastes or replaces bytes. For one
-exact current `verify_failed` attempt, it rechecks the route and binding,
-records durable intent, and atomically reserves one forced key with
-`inbox.claim` before it may send without composer-content proof. It can
-therefore submit trailing human input. A successful disable ordered before
-reservation withholds the key; a later claim stays a normal retrieval. After
-the durable reservation, neither a setting change nor a claim revokes it. See
-[DELIVERY.md](DELIVERY.md) for the accepted-action and setting boundaries.
-
-The irreversible boundary changes retry policy. A detach, missing manifest,
-pre-paste occupant rebind, or spool failure is proven before the pane write
-and may use the configured bounded retry. A paste failure, failed readback,
-post-paste rebind, submit failure, or ACK timeout may have reached the pane;
-each goes directly to `attention_required` with its exact cause. That state
-means the terminal outcome can be unknown, not that Cyclops proved the
-recipient did not receive the message. Inspect the pane before resending.
-
-One transport result is narrower than a generic paste failure. If the command
-pipe fails its first write before accepting any command byte, Cyclops records
-`paste_command_unwritten` and returns that exact workspace notification to
-`blocked_pre_write`. The durable correction precedes runtime hold release. A
-partial write or flush failure never takes this path and remains an ambiguous
-post-write `paste_failed`.
-
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
-  `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
-  `inject`, `staged_representation`, and `exact_staging_proof` (verification).
-- Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
-  `pane_rebound_before_paste_never_pastes_into_the_new_occupant` and
-  `pane_rebound_before_submit_withholds_the_submit_key`.
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, `gate` and `admit`
+  (admission), `occupant_unchanged` (both re-checks), `attempt_delivery`
+  (the order), and `attempt_raw_delivery` (the raw lane).
+- Proven by: `src/cyclopsd/tests/delivery/gate.rs`,
+  `pane_rebound_before_paste_never_pastes_into_the_new_occupant`,
+  `pane_rebound_before_submit_withholds_the_submit_key`, and
+  `pane_mode_entered_after_admission_withholds_the_paste`;
+  `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
+  `a_raw_send_pastes_the_whole_message_and_records_an_unverified_write`.
 
 ## 2. A modal is never cleared generically
 
@@ -120,122 +81,138 @@ sent to a dialog nobody read, and vendor dialogs disagree about what every
 key means.
 
 A rule with `auto_dismiss = false` (trust prompts, permission prompts) is
-not Cyclops's to answer at all: the delivery holds and a human is pinged
-once. A multi-key decline re-captures the screen before the **final**
-confirming key and requires the same rule to still be the winning match, so
-a dialog the human answered between keystrokes never receives the confirm.
-Declines are bounded, never looped.
+not Cyclops's to answer at all: the delivery holds on the rule id and a
+human is pinged once. A multi-key decline re-captures the screen before the
+**final** confirming key and requires the same rule to still be the winning
+match, so a dialog the human answered between keystrokes never receives the
+confirm. Declines are bounded by `MAX_DECLINES`, never looped.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `send_decline_keys` and
-  `modal_still_matches`; the vocabulary is `decline_keys` / `auto_dismiss`
-  in `resources/manifests/*.toml`.
-- Proven by: `src/cyclopsd/tests/m1.rs`,
-  `modal_declined_with_manifest_keys` and
-  `modal_without_auto_dismiss_holds_and_notifies`;
-  `src/cyclopsd/tests/m1_fixes.rs`,
-  `decline_aborts_when_the_modal_changes_between_keys`.
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, step 4 of `admit`,
+  `send_decline_keys`, and `modal_still_matches`; `MAX_DECLINES` in
+  `src/cyclopsd/src/delivery/mod.rs`; the vocabulary is `decline_keys` and
+  `auto_dismiss` in `resources/manifests/*.toml`.
+- Proven by: `src/cyclopsd/tests/delivery/gate.rs`,
+  `decline_aborts_when_the_modal_changes_between_keys`;
+  `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
+  `a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleared`;
+  `src/cyclopsd/src/delivery/tests.rs`, `modal_match_is_rechecked_by_rule_id`.
 
-## 3. Cyclops writes only with fresh positive composer and occupant evidence
+## 3. A doorbell is one line and Enter, held only by a seen draft or a named block
 
-**On ordinary delivery and `attention.complete`, a composer with detected human
-input holds the notification.**
+**Ordinary doorbell delivery writes one line and presses Enter for a bound,
+live agent process unless a human draft is positively observed or a named
+block is present (modal, permission, quota, dead, copy-mode, durable
+composer hold). Ambiguous or absent composer evidence does not hold a
+doorbell. A raw send bypasses the composer check entirely and is recorded
+as an unverified write. Uncertainty is recorded, never retried
+automatically.**
 
-What breaks: the paste lands in a composer that already holds the human's
-half-written sentence, the two concatenate, and the submit key sends the
-mixture. The human's text is gone and the agent gets an instruction nobody
-wrote. Silent, and it looks like the agent misbehaved.
+What breaks, in both directions. Hold too little and the paste lands in a
+composer that already holds the human's half-written sentence, the two
+concatenate, and Enter sends the mixture: the human's text is gone and the
+agent gets an instruction nobody wrote. Hold too much and a live, idle agent
+sits for hours without hearing about a message that was accepted, because
+the daemon was waiting for composer evidence a vendor never paints. The
+second failure is what the rule now trades against the first.
 
-The hard part is seeing it. On codex, a pristine composer's ghost
-suggestion and real typed text are byte-identical in a plain capture; the
-only discriminator is that the ghost text is SGR-dim and typed text is bare
-(F19). So the manifest carries `line_regex_esc` rules matched against a
-`capture-pane -e` capture, and the daemon supplies escaped captures at gate
-time whenever the bound manifest has such rules. Take that away and the
-gate reads a typing human as an idle agent.
+The guard against concatenation is a strong guard, not a guarantee. It
+depends on the manifest recognizing typed text. On codex, a pristine
+composer's ghost suggestion and real typed text are byte-identical in a plain
+capture; the only discriminator is that the ghost text is SGR-dim and typed
+text is bare (F19), so the manifest carries `line_regex_esc` rules and the
+daemon supplies an escaped capture whenever the bound manifest has such
+rules. A manifest with no rule that classifies human input, which is every
+unverified manifest, never sees a draft. A person can also type between the
+final capture and the tmux write; there is no input lease across that gap.
+In both cases the concatenation can happen. What the rule guarantees is
+that it is never silent: the paste is read back once, and an attempt whose
+row did not read back exactly is recorded as `submitted_unverified` before
+its receipt, never as a clean delivery.
 
-This is a conservative guard, not an absolute exclusion guarantee. Direct
-payload deliveries require positive clean-composer evidence before write and
-exact byte verification before submit. For mailbox doorbells, an unproven or
-unreadable composer is eligible to receive the wake notification unless positive
-human input (`HumanInput`), an active modal, or an explicit composer hold is
-detected. A person can type after the final observation and before the tmux
-write: the current transport has no cooperative input lease across that interval.
-Cyclops relies on prompt heuristics and conservative hold rules to protect human
-drafts, but doorbells do not guarantee absolute protection if human typing is
-unclassified by the manifest. Do not describe these guards as proof that
-concurrent input is impossible.
+The rest of the contract, as the gate applies it:
 
-The default-on `notification.force_submit` recovery setting is deliberately
-outside this ordinary proof path. It does not add a paste or replace visible
-bytes, but it may send one submit key without composer-content proof for an
-exact `verify_failed` attempt and may therefore submit later human input. Its
-administrator setting, binding checks, forced reservation, and acceptance
-boundaries are described in [DELIVERY.md](DELIVERY.md).
+- A positively observed human draft holds. So does a hold a delivery owns:
+  a doorbell staged and not yet consumed, or the turn it started that has
+  not ended. The hold outlives the frame it was raised on; it releases when
+  the draft is seen erased or the turn ends, never on elapsed time.
+- A modal, permission prompt, exhausted quota, dead pane, or pane in
+  copy-mode holds on its name. Quota is a gate hold like the others: it
+  waits for the pane to change and never retries on a clock.
+- Anything else proceeds: an idle agent, a working agent, a composer no
+  rule can read, a manifest with no composer rule at all. A working agent
+  gets its doorbell during the turn; vendors queue the line.
+- Enter is pressed exactly once. A swallowed Enter, a missing receipt, or a
+  receipt that never arrives ends the attempt as `notified` with no
+  verifier, and the next doorbell for that recipient goes through the gate
+  again, where a line left in the composer reads as human input.
+- `--raw` skips the composer check and every occupant check beyond the
+  pane being present and alive, pastes the whole rendered message, and
+  presses Enter. The journal records `transport: raw` with no binding and no
+  verifier.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, the `AgentState::
-  IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies
-  the escaped capture; `resources/manifests/codex.toml` rules
-  `composer_typed_input` and `composer_ghost_suggestion`.
-- Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
-  `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`.
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, step 5 of `admit`
+  and `attempt_delivery` (one paste, one capture, one Enter, then
+  `record_submitted` or `record_submitted_unverified` in
+  `src/cyclopsd/src/notification_adapter.rs`), `settle_without_receipt`,
+  and `attempt_raw_delivery`; `src/cyclopsd/src/fusion.rs`,
+  `composer_is_held`, which is the whole hold predicate, fed by the
+  `composer_semantic = "human_input"` rules in `resources/manifests/*.toml`
+  (`composer_typed_input` in `codex.toml` is the measured one).
+- Proven by: `src/cyclopsd/tests/delivery/gate.rs`,
+  `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`;
+  `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
+  `a_human_draft_holds_one_notification_attempt_until_its_turn_finishes`,
+  `a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt`,
+  `an_indefinitely_ambiguous_idle_composer_submits_doorbell_once`,
+  `a_manifest_without_composer_ownership_delivers_to_known_route`,
+  `a_working_pane_with_a_proven_clean_composer_submits_one_doorbell`,
+  `a_swallowed_enter_records_notified_without_a_verifier`, and
+  `a_raw_send_pastes_the_whole_message_and_records_an_unverified_write`;
+  `src/cyclopsd/src/delivery/tests.rs`,
+  `a_raw_send_pastes_the_whole_message_and_records_transport_raw`;
+  `src/cyclops-proto/src/state.rs`,
+  `a_pane_that_was_holding_text_refuses_a_clean_frame` and
+  `the_hold_releases_only_on_a_completed_turn`.
 
-## 4. Legacy `blocked_quota` parks and never auto-retries
+## 4. Every delivery ends in a named state
 
-**A legacy direct-delivery quota park is terminal in the session record. Only
-an operator sending again moves it.**
-
-What breaks: a retry against an exhausted quota is a request that cannot
-succeed. It costs money on a metered plan, and on some plans it extends the
-lockout. Worse, it does not stop: a quota-blocked agent passes every
-liveness check there is (F11), so the retry loop looks healthy from the
-outside while delivering nothing for hours.
-
-Parking is per recipient, not per delivery: the in-flight delivery and
-everything queued behind it park together, because they are all aimed at
-the same exhausted agent. The admin is alerted once, with the reset hint
-parsed off the screen.
-
-Standard mailbox notifications use a separate notification state machine.
-They never retry automatically, but an administrator may start a fresh attempt
-with the guarded `cyclops requeue <message-id>` command after resolving the
-cause.
-
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `park_recipient`;
-  `ParkedBlockedQuota` has no outgoing transition in
-  `cyclops_proto::DeliveryState::can_transition_to` except a fresh queue;
-  `cyclops_proto::attention::delivery_needs_human` keeps it in front of a
-  human until then.
-- Proven by: `src/cyclopsd/tests/m1.rs`,
-  `quota_parks_everything_and_never_retries`.
-
-## 5. Every delivery ends in a named state
-
-**`delivered_verified`, `delivered_unverified`, `queued`, `parked`, or
-`attention_required`. Limbo is a bug.**
+**`notified`, `attention_required`, `blocked_pre_write`, `withdrawn`,
+`withdrawn_by_operator`, or `superseded`, or still moving through `queued`,
+`gating`, `writing`, `submitted`, and `submitted_unverified`. Limbo is a
+bug.**
 
 What breaks: a delivery in no state is one nobody chases. It does not
 appear in the backlog, it does not open the eye, and the sender believes it
 landed. The failure mode is not a wrong answer, it is silence.
 
 The case that produces limbo is a daemon that stops mid-flight, so the
-daemon closes them at boot: it replays each session ledger and writes a
-state line to `attention_required` (cause `daemon_restart`) for every chain
-still in flight, plus one aggregated ping listing them. A `msg` line's
-`hosted` list names which recipients' chains live in that file, so a
-broadcast recorded in another session's ledger is never falsely closed.
+daemon closes those at boot. Every attempt still at `writing`,
+`submitted`, or `submitted_unverified` closes to `attention_required` with
+cause `daemon_restart`, unless the recipient already claimed the message
+after Enter, in which case the claim is the receipt and the attempt
+becomes `notified`. No composer hold is restored: the next doorbell for
+that recipient goes through the ordinary gate. Attempts still at `queued`
+or `gating` are picked up again by a fresh worker; nothing was written.
 
 If you add a new failure path to the pipeline, this is the rule you are
 most likely to break: an early return that logs and drops is limbo.
 
-- Enforced at: `src/cyclopsd/src/compatibility.rs`,
-  `recover_direct_deliveries`, delegating to the retained settlement in
-  `src/cyclopsd/src/delivery.rs`; every
-  transition goes through `advance`, which appends a line.
-- Proven by: `src/cyclopsd/tests/m1_fixes.rs`,
-  `restart_closes_limbo_deliveries`; `src/cyclopsd/tests/m1_blockers.rs`,
-  `restart_closes_pre_hosted_field_ledger_chains`.
+- Enforced at: `src/cyclops-proto/src/notification.rs`,
+  `NotificationState::can_transition_to` (the table of legal moves);
+  `src/cyclopsd/src/mailbox/store.rs`,
+  `recover_notifications_after_restart`; `src/cyclopsd/src/delivery/gate.rs`,
+  `fail_attempt`, which turns every failure into a retry, a durable
+  pre-write block, a deferred durable attempt, or attention.
+- Proven by: `src/cyclopsd/src/mailbox/tests.rs`,
+  `restart_closes_every_unreceipted_write_to_daemon_restart_and_restores_nothing`
+  and `oldest_pending_notification_is_stable_and_resumes_after_restart`;
+  `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
+  `queued_notification_resumes_after_restart_without_a_second_attempt`;
+  `src/cyclopsd/src/delivery/tests.rs`,
+  `exhausted_prewrite_failures_have_exact_recoverable_causes` and
+  `notification_faults_map_to_the_closed_attention_taxonomy`.
 
-## 6. The sender is whoever connected, not whoever says so
+## 5. The sender is whoever connected, not whoever says so
 
 **The daemon builds the envelope from socket peer credentials. Nothing in
 the request body can name a sender.**
@@ -274,38 +251,45 @@ ends of a report speak about the same process.
   `vendor_between` and `admitted_vendor`.
 - Proven by: `src/cyclopsd/src/server.rs`,
   `msg_send_fails_closed_without_peer_credentials`;
-  `src/cyclopsd/tests/m2_hooks.rs`,
+  `src/cyclopsd/tests/delivery/m2_hooks.rs`,
   `forged_report_over_the_socket_is_denied_and_ingests_nothing`;
   `src/cyclopsd/src/identity.rs`,
   `a_helper_nobody_started_from_an_agent_is_not_admitted` and
   `a_helper_the_agent_started_is_admitted_as_that_agent`.
 
-## 7. Secrets never enter the ledger
+## 6. Secrets never enter the journals
 
 **What the daemon OBSERVES never lands in the record. Rule ids, states and
 causes do; screen captures do not.**
 
-What breaks: the ledger is plain text under `~/.cyclops/ledger/`, meant to
-be read with `jq`, copied into a bug report, and kept for months. An agent
+What breaks: the journals are plain text under `~/.cyclops/`, meant to be
+read with `jq`, copied into a bug report, and kept for months. An agent
 pane's screen holds whatever the agent just printed: an API key, a `.env`
 it opened, a customer's name. Append that once and it is there for good,
-because rule 8 means nothing rewrites it.
+because rule 7 means nothing rewrites it.
 
-So a gate line names the matched rule, not the text that matched it, and
-the quota hint is parsed down to `resets in 135h57m42s` before anything
-leaves the function that captured the screen.
+So a gate line names the matched rule, not the text that matched it, and a
+notification fact carries states, causes, and process identities, never the
+row that was read back from the composer.
 
-The line to keep straight: message subjects and bodies DO enter the ledger.
-Those are what a person deliberately sent, and recording them is the point.
-The rule is about what Cyclops reads off a screen on its own.
+The line to keep straight: message subjects and bodies DO enter the
+workspace journal. Those are what a person deliberately sent, and recording
+them is the point. The rule is about what Cyclops reads off a screen on its
+own. The body's own boundary is rule 1's cousin: a body reaches a pane only
+through `--raw`, and reaches a reader only through an authenticated claim.
 
 - Enforced at: `src/cyclops-proto/src/ledger.rs` (schema and the rule);
-  `src/cyclopsd/src/delivery.rs`, `gate_line` and `parse_reset_hint`.
-- Proven by: `src/cyclopsd/tests/m1.rs`, which asserts the raw modal
-  text and the raw quota banner are absent from the ledger;
-  `src/cyclopsd/tests/m1_blockers.rs`, same assertion on the park path.
+  `src/cyclops-proto/src/notification.rs`, whose facts have no field a
+  capture could go in; `src/cyclopsd/src/delivery/gate.rs`, `gate_line`.
+- Proven by: `src/cyclopsd/tests/delivery/gate.rs`,
+  `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`, which
+  asserts the typed draft is absent from the session ledger;
+  `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
+  `private_body_shapes_never_reach_the_notification_pane`;
+  `src/cyclopsd/tests/messaging/body_privacy.rs`,
+  `history_and_thread_release_bodies_only_after_the_exact_claim`.
 
-## 8. The record appends, it does not retract
+## 7. The record appends, it does not retract
 
 **Lines are never rewritten. A correction is a new line.**
 
@@ -336,10 +320,10 @@ pane closed on it (`PaneGone`).
   `torn_tail_is_sealed_and_skipped`,
   `lenient_replay_seals_and_retains_a_valid_unterminated_tail`, and
   `strict_replay_removes_only_an_unterminated_tail`; plus
-  `src/cyclopsd/tests/restart_eye.rs`,
+  `src/cyclopsd/tests/boot_and_sessions/restart_eye.rs`,
   `the_restart_ping_never_outlives_the_deliveries_it_names`.
 
-## 9. Zero polling
+## 8. Zero polling
 
 **No interval timer may re-ask a question nobody asked. Every timer in the
 product is one-shot and has a name.**
@@ -352,10 +336,9 @@ everything looks fine while the mechanism carrying the sub-second
 guarantees is dead, and you find out when a delivery is late by a second
 that used to be 30 milliseconds.
 
-The following are the long-lived coordination timers. This is not an inventory
-of every bounded deadline in an explicit command or recovery action. Each one
-is named, one-shot, armed by a specific state or request, and event-driven
-after it fires:
+The following are the long-lived coordination timers. Each one is named,
+one-shot, armed by a specific state or request, and event-driven after it
+fires:
 
 - **One debounce.** `RECONCILE_DEBOUNCE`, 30ms, in
   `src/cyclops-tmux/src/watcher.rs`. Change hints arrive in bursts (a
@@ -363,53 +346,38 @@ after it fires:
   hint, no timer: the deadline is armed by an event and disarmed by
   running, never rescheduled on its own.
 - **One-shot timers inside a delivery**, each bounded and each listed in
-  the header of `src/cyclopsd/src/delivery.rs`: the post-paste
-  verification re-reads, the tier-1 ACK window, the screen-evidence
-  checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
-  deadline, and the one-shot ping for a hold that has lasted too long. The
-  ambiguous-composer deadline is armed only by one continuous ambiguous idle
-  reading and is cancelled by any changed verdict, cancellation, or durable
-  outcome. Its 10-second default is a deliberately conservative, configurable
-  provisional grace for a redraw caught mid-paint; it never repeats. None of
-  these timers exists when no delivery is in flight.
-- **One notification reminder and optional force-submit deadlines per exact
-  attempt.** The unclaimed reminder wakes at its recorded due time, makes one
-  durable change, and ends. More than one caller may arm a force-submit
-  deadline for the same exact `verify_failed` attempt. Each is one-shot; a
-  scheduler waits for a matching resolution-release event only after another
-  resolver owns the attempt, then rechecks or exits. Durable intent limits
-  competing resolvers; its final forced key reservation elects at most one
-  terminal key. That reservation and `inbox.claim`
-  share the workspace journal lock: a claim ordered first prevents terminal
-  IO, while a later claim cannot revoke the already-reserved key. A reserved
-  but unaccepted key remains uncertain; a later claim becomes consumption only
-  after acceptance, and no scheduler repeats the key.
-- **Post-action evidence checkpoints.** `attention_resolution.rs` arms the
-  bounded checkpoints for one named resolution action. They collect the
-  evidence required to settle that action, then terminate; they do not keep
-  asking a pane whether anything changed.
-- **One candidate lifecycle settle timer per pane.** An authenticated
-  candidate edge arms its generation's deadline. One worker coalesces the
-  pane's candidates, evaluates each generation once per observation, and
-  parks after copy mode, capture failure, or non-terminal evidence. Only a
-  new watcher, request, or candidate event starts another pass.
+  the header of `src/cyclopsd/src/delivery/mod.rs`: the post-paste
+  readback re-reads, the tier-1 ACK window, the screen-evidence
+  checkpoints, the decline-key spacing, the two bounded re-observations of
+  a hold that announces no event (an unreadable process table, a refused
+  barrier claim), and the one-shot ping for a hold that has lasted too
+  long. None of these timers exists when no delivery is in flight.
+- **One dispatch settle per candidate hook edge.** A vendor that runs
+  every matching hook concurrently reports a prompt before it knows whether
+  a sibling hook blocked it, so `src/cyclopsd/src/hook_lifecycle.rs` holds
+  the edge until a later watcher event supplies visual evidence. The
+  deadline is armed by the edge and consumed by the next observation.
 - **The eye's animation tick**, one shot per state change
   (`src/cyclops-ui`).
 
-A hold waits on an event, not on a clock. If you are about to add a
+A hold waits on an event, not on a clock. If you are about to add an
 `interval` or a `loop { sleep }` to product code, the answer is an event
 you have not found yet.
 
 Sanctioned exceptions, none of them in the product: the Python probe
-harness under `tests/` polls because a measuring instrument must,
+harness under `tests/e2e/lib/` polls because a measuring instrument must,
 `cyclops-testrig` waits in bounded loops for things a test has no edge to
 await, and demo scripts pace their narration.
 
 - Enforced at: `src/cyclops-tmux/src/watcher.rs` (the debounce and the
   subscription-driven table); the contract is written out in
   [ARCHITECTURE.md](ARCHITECTURE.md) under "The zero-polling contract".
+- Proven by: `src/cyclopsd/tests/evidence/idle_observation_perf.rs`, which counts
+  watcher wakes, recompute starts, and screen captures over a quiet window
+  after proving each counter moves; `src/cyclopsd/tests/delivery/gate.rs`,
+  `long_gate_hold_notifies_the_admin_once`.
 
-## 10. Vendor quirks are data, not code
+## 9. Vendor quirks are data, not code
 
 **Everything Cyclops knows about a vendor TUI is a TOML file.**
 
@@ -429,16 +397,17 @@ The schema has grown exactly twice, and both times a measurement forced it:
   SGR attributes (F19, and rule 3 above).
 
 The same principle runs wider than manifests: hook config templates under
-`resources/hooks/`, workspace presets under `resources/layouts/`, and theme palettes under
-`resources/themes/` are all data files, and none of them is a code path.
+`resources/hooks/`, workspace presets under `resources/layouts/`, and theme
+palettes under `resources/themes/` are all data files, and none of them is
+a code path.
 
 - Enforced at: `src/cyclops-manifest` (parse, validate, evaluate, and
-  nothing vendor-specific);
-  `resources/manifests/{claude,codex,agy,cursor}.toml`.
+  nothing vendor-specific); the twelve files in `resources/manifests/`.
 - Proven by: `src/cyclops-manifest/tests/shipped_rules.rs`, which runs
-  the shipped rules against captures taken from real sessions.
+  the shipped rules against captures taken from real sessions and pins
+  which manifests claim to be measured and which say `unverified`.
 
-## 11. Color is redundant and never the only encoding
+## 10. Color is redundant and never the only encoding
 
 **Two encodings carry meaning: role color and state glyph. Color is never
 the only one. A compact workspace surface may carry the glyph alone;
@@ -463,14 +432,14 @@ borders, are the one narrow exception, and it is not a color standing in for a
 word: `○` idle, `●` working, `⚠` needs attention, and `✕` dead are a fixed,
 documented glyph vocabulary that a reader can learn once. `idle_with_input`
 shares the idle presentation because no turn is running, but it remains a
-distinct, unsafe state in diagnostics and delivery. The
-glyph is chosen by state, never by theme, so it renders identically under
-every theme and under `NO_COLOR`; only the `Style` painted under it changes. A
-detailed surface (the focused pane border, dialogs, the sidebar's event
-stream), plain-text output, and every diagnostic show the word whenever
-there is room for it. None of them may drop straight to hiding the state
-just because the word does not fit: the fallback is always the glyph, the
-same one the compact surfaces show on purpose.
+distinct state in diagnostics and delivery. The glyph is chosen by state,
+never by theme, so it renders identically under every theme and under
+`NO_COLOR`; only the `Style` painted under it changes. A detailed surface
+(the focused pane border, dialogs, the sidebar's event stream), plain-text
+output, and every diagnostic show the word whenever there is room for it.
+None of them may drop straight to hiding the state just because the word
+does not fit: the fallback is always the glyph, the same one the compact
+surfaces show on purpose.
 
 The check that matters is mechanical: turn color off and read the same
 line. If anything is missing beyond a compact surface's own documented
@@ -493,212 +462,6 @@ glyph, the glyph or the word is doing too little.
   `inactive_pane_border_glyph_is_stable_across_theme_and_no_color`, which
   feed the same state through two unrelated themes and `NO_COLOR` and
   assert the glyph never moves while its `Style` does.
-
-## 12. Runtime idleness never implies terminal write-readiness
-
-**On ordinary delivery and `attention.complete`, a composer write requires
-current positive clean-input evidence from the admitted pane, and no
-conflicting blocked, modal, pane-mode, unknown, or input-present evidence. A
-running turn may write only when the same fresh capture contains a live screen
-`Working` reading plus an independent clean or ghost composer proof.
-Hook-derived idle or Working without that proof never authorizes an ordinary
-write.**
-
-For an ordinary mailbox doorbell admitted in that exact Working-plus-proof
-shape, the same in-flight proof also permits its final Enter while the current
-frame remains Working. The paste itself now occupies the composer, so the
-final screen cannot repeat the clean proof; it must instead prove the exact
-attempt-owned doorbell bytes, the same binding, and no mode or blocked state.
-This is not a recovery or operator-resolution permission. A human or
-ambiguous composer never gains it, and any changed staged bytes still withhold
-Enter as `verify_failed`. Unknown or blocked reading, stale evidence, mode,
-or named non-composer refusal is a live conflict and also withholds Enter,
-even if the screen still paints `working`. A confirmed, exactly keyed terminal
-edge that arrives after this attempt was staged becomes a private final-submit
-conflict for that exact owner. A newer Screen `working` capture may correctly
-supersede the old Hook idle in public detection; the private conflict neither
-changes that public state nor authorizes a write. It only prevents this one
-Enter from racing the ended turn, and disappears when the owned barrier clears,
-changes owner or binding, or becomes a turn-start barrier. An unkeyed terminal
-event never acquires that conflict by arrival order.
-Only a screen `idle` or `idle_with_input` reading that describes the owned
-staged composer may coexist with the current Screen `working` reading. The
-same current `working` observation may mark that owned barrier
-`staged_during_turn`. While that frame is Working, the marker is eligible only
-for the already-admitted in-flight submit. If a later fresh quiet frame still
-shows the same exact attempt-owned doorbell, ordinary reconciliation may
-re-open only that owner. It must re-prove the recorded binding, manifest, no
-mode or stale conflict, and the exact visible bytes before reserving one
-existing key. It never makes the pane generally write-ready; human, changed,
-hidden, modal, or unprovable content still withholds Enter. The final proof may
-take its bounded capture rereads to pass a partial terminal
-repaint, but that re-observation never repeats the paste or Enter: only a
-current frame with the same exact bytes can authorize the one reserved key.
-
-What breaks: the same damage as rule 3, reached from the opposite
-direction. Rule 3 holds when the screen sensor SEES staged text. This rule
-covers the case where it sees nothing usable and something else says idle
-anyway. A turn-end hook (`Stop` on agy, and its siblings elsewhere) maps to
-`Idle`; fusion adopts a live hook reading when the screen rules resolve to
-`unknown`; and `unknown` is exactly what a long staged payload produces
-when its head scrolls past the fixed bottom region the rules read. So a
-pane holding an intact, unsubmitted payload can read `idle`, and a gate
-that trusts the fused verdict alone will paste a second message on top of
-the first and press Enter.
-
-Authenticated hook identity does not make hook-derived `Idle` sufficient
-for a write. A hook proves a turn edge, not composer contents, so current
-clean screen evidence remains mandatory.
-
-The distinction the rule forces is between two different questions. "Is a
-turn running?" is answered by any sensor. "May I write into the composer?"
-is answered only by the sensor that can see the composer, saying it is
-empty, right now, with nothing live contradicting it. Absence of evidence
-is not clean evidence; a contested verdict is not clean evidence.
-
-An authenticated, exactly keyed turn start owns runtime `Working` before the
-first visual output frame. Idle title and ordinary composer frames can lag that
-edge, so repeated captures cannot erase it and elapsed time cannot convert it
-to `Idle`. The matching keyed end clears it. A manifest-declared terminal
-screen rule may also clear it on one stable, current capture when that exact
-rule wins an idle-class frame; generic empty, ghost, and typed composer rules
-are never terminal evidence. Process-binding retirement also clears the start.
-
-An unkeyed confirmed vendor contract may use authenticated start and end
-events from the same process binding for runtime status. It still cannot bind
-a message to that turn, so composer settlement remains screen-driven.
-
-An unkeyed prompt hook cannot claim an exact lifecycle. Claude's
-`UserPromptSubmit` publishes provisional `Working` immediately, while a later
-lifecycle-capable visual Working frame confirms that the exact staged
-notification entered a turn. Fresh visual evidence owns the return to idle.
-Cyclops never assigns a later `Stop` to that prompt by arrival order or time.
-Permission, modal, and quota screens remain authoritative blocked states. A
-live Working reading with no complementary clean-composer proof remains held;
-the positive Working-plus-proof shape is the only runtime exception. None of
-these runtime rules weaken the clean-composer requirement above.
-
-One clean frame is not clean evidence either, once text has been seen in
-the composer. A screen rule reads one frame, and a pane holding somebody's
-half-typed message can render clean while it redraws. So an ordinary capture
-never clears `composer_hold`. An unowned human draft may clear only when the
-existing output-settle boundary observes a fresh, exact `clean` composer rule
-for the same live pane. This lets a person erase their draft without starting
-a turn. Partial text, ghost suggestions, ambiguous frames, stale captures,
-pane modes, blocked states, replacement occupants, and daemon-owned staged or
-recovered payloads do not use this release. A submitted draft still releases
-through its real turn. Nothing releases merely on elapsed time or on a hook
-that never arrived. A vendor feature that hides undiscarded input behind the
-same exact empty-composer chrome is outside the generic screen contract; a
-manifest that needs to distinguish that state must expose a non-clean rule.
-
-The release reads the EVIDENCE, not the fused winner. The winner is one
-state chosen by priority, so a pane can win `idle` off a composer rule
-while the title or a hook still reports the turn that is running;
-releasing on that is the same false-idle class from the other direction.
-Any live reading of `working` without the complementary live screen and
-independent clean-composer proof keeps the hold. A receipt carrying a
-manifest-declared TurnKey moves that hold onto the exact lifecycle. Only
-an end carrying the same key can release it, and release still waits for a
-current clean screen. Arrival order and retained hook state do not
-correlate turns. A hold without an exact receipt stays on the screen
-lifecycle, including a pane whose hooks were never installed, so it never
-waits forever for an end nobody can name.
-
-Cyclops latches its own paste the moment the payload is staged, rather
-than waiting for a sensor to notice: the pane is holding text exactly the
-way a person's draft holds it, and the next delivery for that recipient
-must not gate on a composer that reads clean only because nobody has
-looked since the paste.
-
-It promotes that hold on the RECEIPT, never on the submit key. `send-keys`
-returning Ok proves tmux accepted a keystroke and nothing else: an Enter
-swallowed by a modal or routed to a mode leaves the payload staged, which
-is the staged-never-sent class this unit exists for. A receipt is the
-first thing that proves the composer was consumed. A receipt with a
-TurnKey binds the exact lifecycle. A receipt without one keeps the screen
-lifecycle and records its submit or observed-turn timestamp for diagnosis,
-not as a substitute for structural correlation.
-
-A mailbox notification arms a durable composer barrier at `writing`, before
-the external paste. The binding records the exact recipient, agent process
-generation, and manifest. New rows also record the foreground leader; older
-rows without it still arm the restart barrier. A later bound `writing` fact
-compacts only an older barrier for the same exact `RecipientKey`. It never
-compacts another recipient or a pane that merely shares a label.
-
-Restart recovery is state-sensitive and fail-closed. `notified` is the only
-state carrying receipt proof, so that state may retire when the same bound
-agent and manifest have a fresh, current clean-composer observation. `writing`,
-`staged`, `submitted`, and `attention_required` always restore the hold first,
-even when the first screen is clean. Hook-derived idle is not authority for
-either path.
-
-Composer continuity is the agent process generation plus manifest. The
-foreground leader may change as the agent runs a tool and returns. Exact
-foreground leader equality remains mandatory for operator complete/discard,
-but a leader transition alone neither replaces nor wedges a recovered hold.
-A different agent generation or manifest is one authenticated replacement
-observation and durably retires the old occupant's barrier.
-
-A restored barrier starts without a pre-restart lifecycle key. An exact
-manifest-declared turn start observed after restoration may bind that recovered
-owner. Only the same exact turn end plus a later fresh clean screen permits
-automatic retirement. Cyclops appends the retirement fact before fusion clears
-the runtime hold or consumes the end. A failed append keeps both reusable; an
-unknown writer outcome requires reopening the journal and never retries into
-an uncertain tail.
-
-Session-local pane removal is not physical loss. Recovery follows the
-server-wide pane id across a session transfer while journal compaction remains
-scoped to the old exact recipient. `pane_gone` retirement requires a
-server-wide absence or a different pane-root generation. Either watcher attach
-order preserves the barrier, manifest pin, runtime hold, and exact end.
-
-A hold belongs to an occupant: a pane that changes hands starts clear,
-because the new agent never staged the old one's text.
-
-Because the two answers move independently, a hold lifting can leave the
-runtime state untouched, and a delivery sleeping on the refusal would
-sleep through its own release. Fusion broadcasts a `readiness` event for
-that, carrying the pane and the new answer. It is not a state line:
-nothing happened to the pane's runtime state, and writing one would be a
-transition that never occurred.
-
-- Enforced at: `cyclops_proto::Detection::stamped`, which combines the
-  sensor policy with the pane's own mode and writes the verdict onto the
-  detection; `src/cyclopsd/src/fusion.rs` stamps before caching, so the
-  cache every surface reads already carries it. `src/cyclopsd/src/delivery.rs`
-  requires that positive stamp at the gate and again immediately before
-  the paste, holding on `not_write_ready:<reason>`. Nothing re-derives the
-  answer: a caller that could only see the sensors would answer a
-  narrower question and could overwrite an authoritative refusal.
-- Proven by: `src/cyclops-proto/src/state.rs`,
-  `hook_idle_over_unknown_screen_is_not_write_ready`,
-  `hook_idle_alone_is_not_write_ready`,
-  `disagreement_is_never_write_ready`,
-  `a_pane_that_was_holding_text_refuses_a_clean_frame`,
-  `the_hold_releases_only_on_a_completed_turn`,
-  `a_sensor_still_reporting_the_turn_keeps_the_hold`, and
-  `a_hook_vendor_needs_an_edge_from_this_turn`;
-  `src/cyclopsd/src/composer_recovery.rs`,
-  `only_a_notified_attempt_may_retire_from_current_clean_evidence`,
-  `foreground_leader_changes_do_not_replace_the_composer_occupant`,
-  `a_manifest_change_replaces_the_occupant_even_when_the_agent_is_unchanged`,
-  `a_recovered_barrier_follows_its_physical_pane_across_a_session_route`;
-  `src/cyclopsd/src/fusion.rs`,
-  `a_recovered_exact_end_is_durable_before_runtime_clearance`;
-  `src/cyclopsd/src/mailbox.rs`,
-  `a_leaderless_write_binding_arms_restart_recovery_through_replay`;
-  `src/cyclops-tmux/tests/watcher_events.rs`,
-  `session_removal_does_not_report_a_server_wide_moved_pane_as_gone`;
-  `src/cyclopsd/tests/m1_fixes.rs`,
-  `a_readiness_change_with_no_state_change_is_still_broadcast` and
-  `a_second_message_waits_for_the_first_turn_and_then_lands`;
-  `src/cyclopsd/tests/m1_blockers.rs`,
-  `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`, which
-  proves the refusal and the release end to end.
-
 
 ## Where these came from
 

@@ -10,21 +10,27 @@ the same system to terminals and scripts.
 | --- | --- |
 | `cyclops start` | Create or restore the default workspace and start the daemon if needed. |
 | `cyclops workspace save\|restore` | Save or rebuild a tmux session's panes, sizes, names, and directories. |
+| `cyclops sizing release` | Hand a session's window sizing back to tmux, and clear the ownership mark; safe to run twice. |
 | `cyclops status` | Show every watched pane's runtime state plus live composer, readiness, notification, and mailbox facts when they differ. |
 | `cyclops health` | Inspect binaries, daemon identity, setup, and bounded state metadata without changing them. |
+| `cyclops stop` | Stop Cyclops now; tmux panes and durable messages stay intact. |
 | `cyclops cleanup build-cache\|update-scratch` | Inventory named rebuildable assets; add `--apply` to remove exact validated assets. |
+| `cyclops data inventory\|export\|forget` | Inventory retained durable records, export them to a new directory, or preview and confirm removing every retained journal. |
+| `cyclops remove --all --confirm <token>` | Preview removal of the complete Cyclops state home, then require its exact confirmation token. |
 | `cyclops list` | Show every named agent, its state, and current detail. |
 | `cyclops name <pane> <label>` | Give a pane a stable address; `--clear` releases it. |
+| `cyclops clear [<agent>] [--status]` | Quiet queued pane notifications for one agent, or cleanse status with `--status`. |
+| `cyclops reset` | Reset status by clearing old, terminated, and stale processes and sessions. |
+| `cyclops flush [--prune]` | Flush message ledgers, cleanse state, and reset sessions to start clean; `--prune` (default true) also drops dead panes and stale sessions. |
 | `cyclops read <agent>` | Read visible/recent pane output or the detection evidence. |
-| `cyclops send <agent> --subject ... --summary ...` | Accept a durable message and print its wake receipt. |
+| `cyclops send <agent> --subject ... [--summary ...] [--raw]` | Accept a durable message and print its wake receipt; `--raw` pastes the whole message with no composer check. |
 | `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact message. |
 | `cyclops inbox next --timeout 30s` | Wait over the socket and claim at most one pending message without touching a composer. |
 | `cyclops messages` | Read body-free mailbox and notification state. |
-| `cyclops reply <message-id> --summary ...` | Reply using the visible parent message. |
+| `cyclops reply [<message-id> \| <m-att_...>] [--last] [--raw]` | Reply using the visible parent message; `--last` answers the most recently claimed one. |
 | `cyclops requeue <message-id>` | Requeue eligible unresolved notification alarms for a message. |
 | `cyclops notification withdraw <attempt-id> --recipient <key>` | Withdraw one provably pre-write notification attempt. |
 | `cyclops alarm preview --older-than <age>`; `cyclops alarm clear` | Preview or clear exact durable alarm attempts. |
-| `cyclops attention show\|complete\|discard <attempt-id>` | Inspect or reconcile one exact staged notification attempt. |
 | `cyclops wait <agent> --until idle\|turn-ended\|blocked` | Wait for a pane state sequence without inferring task completion. |
 | `cyclops history` | Read messages from the append-only record. |
 | `cyclops thread <message-id>` | Read one message, its replies, and delivery state. |
@@ -38,26 +44,30 @@ the same system to terminals and scripts.
 | `cyclops update --rollback` | Reactivate a replay-proven retained pair without reverting state. |
 | `cyclops daemon status\|log\|stop\|restart` | Inspect, stop, or safely restart the exact daemon generation. |
 | `cyclops ping` | Measure a daemon round trip. |
+| `cyclops commands` | Show workspace, operations, and diagnostic commands. |
 
 ## Sending
 
 ```bash
 cyclops send reviewer --subject "Review the diff" \
-  --summary "The diff is ready for review. Focus on retry ordering." \
   --body "Focus on retry ordering."
 cyclops send --all --subject "Standup in 5" \
-  --summary "Standup begins in five minutes. Join when your current step is safe." --fyi
+  --summary "Standup begins in five minutes; join when your current step is safe." --fyi
+cyclops send reviewer --subject "Cyclops cannot read your composer" \
+  --body "Reply with cyclops reply when you see this." --raw
 ```
 
-`--summary` is required and must contain exactly two sentences on one line,
-with at most 240 characters. `--to` adds recipients, `--body-file -` reads the body from stdin,
-`--reply-to` links a reply, and `--all` broadcasts to every adopted agent.
-Name `admin` explicitly to send to the durable operator inbox. By default a
-durably accepted send exits 0 even when its optional terminal wake needs
-attention. Add `--require-wake` when every recipient must currently prove a
-mailbox wake at `submitted` or `notified`. A legacy direct-delivery receipt may
-instead prove `submitted`, `delivered_verified`, or `delivered_unverified`.
-Earlier, blocked, human-required, missing, and unknown states exit 1.
+`--summary` is optional: one line of at most 240 characters, derived from the
+subject when omitted. `--to` adds recipients, `--body-file -` reads the body
+from stdin, `--reply-to` links a reply, and `--all` broadcasts to every
+adopted agent. `--raw` pastes the whole message into the recipient pane and
+presses Enter with no composer check; the journal records it as an unverified
+raw write, so use it only when Cyclops itself is broken for that pane or the
+recipient is an unverified vendor. Name `admin` explicitly to send to the
+durable operator inbox. By default a durably accepted send exits 0 even when
+its terminal wake needs attention. Add `--require-wake` when every recipient
+must currently prove a mailbox wake at `submitted` or `notified`. Earlier,
+blocked, human-required, missing, and unknown states exit 1.
 
 The flag evaluates the daemon's one bounded current receipt. It does not poll
 or wait again. Exit 1 does not revoke durable acceptance, so inspect the
@@ -81,8 +91,8 @@ pane. It does not need a pane label or manifest. A process descended from an
 admitted agent resolves to that agent's durable mailbox identity instead.
 
 `admin` is the durable operator mailbox, not a pane name. Operator recovery
-commands such as alarm clearance, attention reconciliation, requeue, and
-pre-write notification withdrawal require the administrator identity. Agent
+commands such as alarm clearance, requeue, and pre-write notification
+withdrawal require the administrator identity. Agent
 mailbox commands remain scoped to the authenticated agent. Running a command
 with `sudo` does not elevate Cyclops authority: a root process is a different
 UID from a user-owned daemon and is refused.
@@ -102,9 +112,6 @@ cyclops read reviewer --source detection --raw
   the TUI. `update`, `daemon log`, and the interactive UI remain text.
 - `--plain` disables color and glyph animation while preserving the words.
 - `NO_COLOR` disables color on every surface.
-
-The deprecated `cyclops ui` alias still opens `cyclops watch`, but new scripts
-and documentation should use `watch`.
 
 ## Exit codes
 

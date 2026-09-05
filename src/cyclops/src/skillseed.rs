@@ -66,6 +66,8 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "4042d8569cf02694",
     "15c4ccb5851c02bb",
     "a6368bc6a8d3e602",
+    "711ab58a0d31f957",
+    "028b6c534c5f24a1",
 ];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
@@ -176,9 +178,16 @@ impl Installation {
 }
 
 fn combined_installation(roots: &[PathBuf]) -> Installation {
+    combine(roots.iter().map(|root| Installation::inspect(root)))
+}
+
+/// An unproven root anywhere on the path is manual review for the whole
+/// target: a shared skill must not be published on the strength of one
+/// consumer while another's directory cannot be inspected.
+fn combine(observations: impl IntoIterator<Item = Installation>) -> Installation {
     let mut present = false;
-    for root in roots {
-        match Installation::inspect(root) {
+    for observation in observations {
+        match observation {
             Installation::Present => present = true,
             Installation::Unproven => return Installation::Unproven,
             Installation::Absent => {}
@@ -191,74 +200,86 @@ fn combined_installation(roots: &[PathBuf]) -> Installation {
     }
 }
 
-/// The canonical consumer destinations for this user home. Codex and Cursor
-/// share a target when the consumer catalog says they do, so the writer and
-/// read-only plan cannot drift into two copies of one skill.
+/// Consumers that read the shared `~/.agents/skills` copy and take no hook
+/// wiring from Cyclops, so they have no `CliKind` and no catalog entry. Each
+/// counts as installed when its own config directory exists. Crush also
+/// reads ~/.config/agents/skills, ~/.config/crush/skills, and
+/// ~/.claude/skills, but the shared ~/.agents copy is the one it gets.
+const SKILL_ONLY_CONSUMERS: &[(&str, &str)] = &[
+    ("OpenCode", ".config/opencode"),
+    ("Amp", ".config/amp"),
+    ("Crush", ".config/crush"),
+];
+
+/// One consumer's claim on a skill path: its name, the directory that proves
+/// it is installed, and what one no-follow look at that directory found.
+struct Member {
+    name: &'static str,
+    root: PathBuf,
+    installation: Installation,
+}
+
+/// The canonical consumer destinations for this user home, one target per
+/// distinct skill path. Every consumer that reads `~/.agents/skills` shares
+/// one target, so the writer and the read-only plan cannot drift into two
+/// copies of one skill.
 fn targets(home: &Path) -> Vec<SkillTarget> {
-    let claude = crate::consumer::spec(crate::hookset::CliKind::Claude);
-    let claude_locations = claude.locations(home);
-    let codex = crate::consumer::spec(crate::hookset::CliKind::Codex);
-    let codex_locations = codex.locations(home);
-    let cursor = crate::consumer::spec(crate::hookset::CliKind::Cursor);
-    let cursor_locations = cursor.locations(home);
-    let agy = crate::consumer::spec(crate::hookset::CliKind::Agy);
-    let agy_locations = agy.locations(home);
-    let codex_installation = Installation::inspect(&codex_locations.install_root);
-    let cursor_installation = Installation::inspect(&cursor_locations.install_root);
-    let (shared_consumer, shared_installation) = match (codex_installation, cursor_installation) {
-        (Installation::Present, Installation::Present) => {
-            ("Codex and Cursor", Installation::Present)
-        }
-        (Installation::Present, Installation::Absent) => (codex.skill_name, Installation::Present),
-        (Installation::Absent, Installation::Present) => (cursor.skill_name, Installation::Present),
-        (Installation::Absent, Installation::Absent) => ("Codex and Cursor", Installation::Absent),
-        _ => ("Codex and Cursor", Installation::Unproven),
-    };
-    let mut targets = vec![SkillTarget {
-        consumer: claude.skill_name,
-        installation: Installation::inspect(&claude_locations.install_root),
-        installation_roots: vec![claude_locations.install_root.clone()],
-        location: claude_locations.skill,
-    }];
-    if codex_locations.skill == cursor_locations.skill {
-        targets.push(SkillTarget {
-            consumer: shared_consumer,
-            installation: shared_installation,
-            installation_roots: vec![
-                codex_locations.install_root.clone(),
-                cursor_locations.install_root.clone(),
-            ],
-            location: codex_locations.skill,
-        });
-    } else {
-        targets.push(SkillTarget {
-            consumer: codex.skill_name,
-            installation: codex_installation,
-            installation_roots: vec![codex_locations.install_root.clone()],
-            location: codex_locations.skill,
-        });
-        targets.push(SkillTarget {
-            consumer: cursor.skill_name,
-            installation: cursor_installation,
-            installation_roots: vec![cursor_locations.install_root.clone()],
-            location: cursor_locations.skill,
-        });
+    let mut groups: Vec<(crate::consumer::AssetLocation, Vec<Member>)> = Vec::new();
+    let mut claim =
+        |location: crate::consumer::AssetLocation, name: &'static str, root: PathBuf| {
+            let member = Member {
+                name,
+                installation: Installation::inspect(&root),
+                root,
+            };
+            match groups.iter_mut().find(|(known, _)| *known == location) {
+                Some((_, members)) => members.push(member),
+                None => groups.push((location, vec![member])),
+            }
+        };
+    for spec in crate::consumer::SHIPPED {
+        let locations = spec.locations(home);
+        claim(locations.skill, spec.skill_name, locations.install_root);
     }
-    targets.push(SkillTarget {
-        consumer: agy.skill_name,
-        installation: Installation::inspect(&agy_locations.install_root),
-        installation_roots: vec![agy_locations.install_root.clone()],
-        location: agy_locations.skill,
-    });
-    let kimi = crate::consumer::spec(crate::hookset::CliKind::Kimi);
-    let kimi_locations = kimi.locations(home);
-    targets.push(SkillTarget {
-        consumer: kimi.skill_name,
-        installation: Installation::inspect(&kimi_locations.install_root),
-        installation_roots: vec![kimi_locations.install_root.clone()],
-        location: kimi_locations.skill,
-    });
-    targets
+    for (name, root) in SKILL_ONLY_CONSUMERS {
+        claim(
+            crate::consumer::shared_agents_skill(home),
+            name,
+            home.join(root),
+        );
+    }
+    groups
+        .into_iter()
+        .map(|(location, members)| SkillTarget {
+            consumer: label(&members),
+            installation: combine(members.iter().map(|member| member.installation)),
+            installation_roots: members.into_iter().map(|member| member.root).collect(),
+            location,
+        })
+        .collect()
+}
+
+/// Who a shared target is seeded for, as the setup line names it.
+///
+/// A path with one consumer is that consumer. A shared path names the one
+/// installed consumer, or Codex and Cursor when exactly those two are (the
+/// wording the setup output has always used); any other mix is reported as
+/// the shared agents copy, and the path on the same line says the rest.
+/// The label is `'static` because setup holds it that way.
+fn label(members: &[Member]) -> &'static str {
+    if let [only] = members {
+        return only.name;
+    }
+    let present: Vec<&'static str> = members
+        .iter()
+        .filter(|member| member.installation == Installation::Present)
+        .map(|member| member.name)
+        .collect();
+    match present.as_slice() {
+        [one] => one,
+        ["Codex", "Cursor"] => "Codex and Cursor",
+        _ => "shared agents",
+    }
 }
 
 /// Preview installed consumers and name an unproven consumer root for manual

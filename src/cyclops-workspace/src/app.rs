@@ -52,7 +52,7 @@ use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::{self, Dialog, DialogKeyAction};
 use crate::drag::{DragState, DragTarget};
 use crate::input::encode_send_keys;
-use crate::input::mouse::{HitMap, HitTarget, MenuState};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
 use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
@@ -337,13 +337,10 @@ struct MessageDetailTask {
 impl MessageDetailTask {
     fn request(&self) -> cyclops_ui::ActionRequest {
         debug_assert_eq!(&self.row.target, &self.target.target);
-        match self.target.attempt {
-            Some(attempt_id) => cyclops_ui::ActionRequest::OpenAttention { attempt_id },
-            None => cyclops_ui::ActionRequest::OpenMessage {
-                message_id: self.row.message_id.clone(),
-                claim: self.row.direction == cyclops_ui::Direction::Inbound
-                    && self.row.mailbox == cyclops_ui::MailboxWord::Pending,
-            },
+        cyclops_ui::ActionRequest::OpenMessage {
+            message_id: self.row.message_id.clone(),
+            claim: self.row.direction == cyclops_ui::Direction::Inbound
+                && self.row.mailbox == cyclops_ui::MailboxWord::Pending,
         }
     }
 }
@@ -2630,13 +2627,13 @@ impl App {
     fn open_menu(&mut self, menu: MenuState) {
         self.menu = menu;
         self.hover = None;
-        self.hit_map.clear_menu_items();
+        self.hit_map.clear_overlay();
     }
 
     fn close_menu(&mut self) {
         self.menu.close();
         self.hover = None;
-        self.hit_map.clear_menu_items();
+        self.hit_map.clear_overlay();
     }
 }
 
@@ -3082,7 +3079,7 @@ fn finish_message_detail(
             why
         }
         cyclops_ui::ActionOutcome::Refused { code, message } => {
-            detail.refused(None, &code, message.clone());
+            detail.refused(None, message.clone());
             format!("Detail refused ({code}): {message}")
         }
         cyclops_ui::ActionOutcome::NotSent(why) => {
@@ -3895,8 +3892,7 @@ async fn handle_mouse(
                         if matches!(
                             app.dialog,
                             Some(Dialog::Settings {
-                                section: dialog::SettingsSection::View
-                                    | dialog::SettingsSection::Delivery,
+                                section: dialog::SettingsSection::View,
                                 ..
                             })
                         ) {
@@ -4041,7 +4037,7 @@ async fn handle_mouse(
                     let action = *action;
                     let menu = std::mem::replace(&mut app.menu, MenuState::None);
                     app.hover = None;
-                    app.hit_map.clear_menu_items();
+                    app.hit_map.clear_overlay();
                     let resolved = {
                         let ctx = route_context(app);
                         crate::action::route_menu_item(&menu, action, &ctx)
@@ -5949,32 +5945,6 @@ async fn handle_dialog_key(
                 dialog::switch_settings_section(open, delta);
             }
         }
-        DialogKeyAction::Adjust(delta) => {
-            let changed = app
-                .dialog
-                .as_mut()
-                .is_some_and(|open| dialog::adjust_force_submit_delay(open, delta));
-            if changed {
-                let setting = app.dialog.as_ref().and_then(|open| match open {
-                    Dialog::Settings { delivery, .. } => {
-                        Some((delivery.enabled, delivery.delay_seconds))
-                    }
-                    _ => None,
-                });
-                if let Some((enabled, delay_seconds)) = setting {
-                    let outcome = exec::execute(
-                        app,
-                        client,
-                        action::Action::ApplyForceSubmitSettings {
-                            enabled,
-                            delay_seconds,
-                        },
-                    )
-                    .await?;
-                    apply_outcome(app, outcome);
-                }
-            }
-        }
         DialogKeyAction::ScrollStart | DialogKeyAction::ScrollEnd => {
             let to_end = action == DialogKeyAction::ScrollEnd;
             match app.dialog.as_mut() {
@@ -6355,18 +6325,20 @@ fn draw<B: Backend>(
             let cursor = ctx.cursor;
             // The pane canvas's own left border is the resize handle now
             // (`render::sidebar`'s `SIDEBAR_GRAB_WIDTH` doc has the
-            // history). Pushed here, after `paint_window`'s own
-            // `PaneFrame` hits, this wins the column from the pane frame
-            // beneath it, so grabbing the border the operator can actually
+            // history). A seam, so it wins the column from the pane frame
+            // beneath it and grabbing the border the operator can actually
             // see resizes the sidebar instead of focusing whatever pane
-            // sits behind it. Known and accepted: the leftmost cell of any
-            // pane frame or divider that lands on this column answers as
-            // the sidebar's resize handle instead of pane focus/resize for
-            // its own row — one column, traded on purpose so there is a
-            // visible line to grab instead of a hidden one to hunt for.
+            // sits behind it; and only a seam, so a pane's clear button on
+            // that column still clears the composer instead of starting a
+            // resize. Known and accepted: the leftmost cell of any pane
+            // frame or divider that lands on this column answers as the
+            // sidebar's resize handle instead of pane focus/resize for its
+            // own row — one column, traded on purpose so there is a visible
+            // line to grab instead of a hidden one to hunt for.
             if areas.sidebar.is_some() && areas.canvas.width > 0 && areas.canvas.height > 0 {
                 let divider = Rect::new(areas.canvas.x, areas.canvas.y, 1, areas.canvas.height);
-                app.hit_map.push(divider, HitTarget::SidebarDivider);
+                app.hit_map
+                    .push(divider, HitLayer::Seam, HitTarget::SidebarDivider);
                 paint_sidebar_resize_feedback(
                     f.buffer_mut(),
                     divider,
@@ -6374,10 +6346,6 @@ fn draw<B: Backend>(
                     app.hover,
                     app.drag.as_ref(),
                 );
-                // Re-assert pane clear hits over the sidebar divider so clicking
-                // the 'X' button on any left-aligned pane clears the composer rather
-                // than starting a sidebar resize drag.
-                crate::render::reassert_pane_clear_hits(tab, areas.canvas, &mut app.hit_map);
             }
             if let Some(messages) = areas.messages {
                 if areas.canvas.width > 0 && areas.canvas.height > 0 {
@@ -6719,6 +6687,7 @@ mod tests {
         // map that was never populated.
         app.hit_map.push(
             Rect::new(0, 0, 4, 1),
+            HitLayer::Canvas,
             HitTarget::PaneBody {
                 pane_id: "%0".to_string(),
             },
@@ -7899,7 +7868,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -7969,8 +7937,11 @@ mod tests {
         ]);
         let mut app = test_app(model, home.clone());
         app.reconcile_session_id = Some("$b".into());
-        app.hit_map
-            .push(Rect::new(0, 0, 1, 1), HitTarget::SidebarToggle);
+        app.hit_map.push(
+            Rect::new(0, 0, 1, 1),
+            HitLayer::SidebarChrome,
+            HitTarget::SidebarToggle,
+        );
 
         apply_session_switched(&mut app, "$c".into(), "chosen".into());
 
@@ -8015,7 +7986,6 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -9718,7 +9688,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let tabs = vec![tab("@0"), tab("@1")];
         let mut pinned = BTreeSet::new();
@@ -11041,7 +11010,6 @@ mod tests {
             },
             view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
-            delivery: dialog::ForceSubmitPicker::new(false, 5),
         });
         exec::preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
@@ -11099,7 +11067,6 @@ mod tests {
             },
             view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
-            delivery: dialog::ForceSubmitPicker::new(false, 5),
         });
         exec::preview_selected_theme(&mut app);
         assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));
@@ -11541,7 +11508,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11610,7 +11576,6 @@ mod tests {
             active_pane: pane.into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut current = WorkspaceModel {
             workspaces: vec![],
@@ -11657,7 +11622,6 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let row = |id: &str, name: &str| crate::model::WorkspaceRow {
             session_id: id.into(),
@@ -11721,6 +11685,7 @@ mod tests {
         for (session_id, session, y) in rows {
             hits.push(
                 Rect::new(2, *y, 18, 1),
+                HitLayer::SidebarChrome,
                 HitTarget::SidebarRow {
                     session_id: session_id.to_string(),
                     session: session.to_string(),
@@ -11829,7 +11794,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11853,6 +11817,7 @@ mod tests {
             .expect("sidebar visible");
         app.hit_map.push(
             Rect::new(sidebar.x + 2, 3, 10, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: "$a".into(),
                 session: "a".into(),
@@ -11860,6 +11825,7 @@ mod tests {
         );
         app.hit_map.push(
             Rect::new(sidebar.x + 2, 4, 10, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: "$b".into(),
                 session: "b".into(),
@@ -11867,6 +11833,7 @@ mod tests {
         );
         app.hit_map.push(
             Rect::new(sidebar.x + 2, 5, 10, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: "$c".into(),
                 session: "c".into(),
@@ -11970,7 +11937,6 @@ mod tests {
                     active_pane: dragged.clone(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
-                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
@@ -11986,12 +11952,14 @@ mod tests {
         // pane on the left, the drop target's body on the right.
         app.hit_map.push(
             Rect::new(0, 2, 10, 5),
+            HitLayer::Canvas,
             HitTarget::PaneBody {
                 pane_id: dragged.clone(),
             },
         );
         app.hit_map.push(
             Rect::new(12, 2, 10, 5),
+            HitLayer::Canvas,
             HitTarget::PaneBody {
                 pane_id: target.clone(),
             },
@@ -12071,7 +12039,6 @@ mod tests {
                     active_pane: bottom.into(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
-                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },

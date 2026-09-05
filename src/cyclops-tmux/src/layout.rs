@@ -1014,7 +1014,7 @@ mod tests {
     #[test]
     fn a_pane_carries_its_own_launch_decision() {
         let stored = Pane {
-            command: Some("cyclops ui".to_string()),
+            command: Some("cyclops watch".to_string()),
             ..pane(None, 1.0)
         };
         let filled = Pane {
@@ -1029,7 +1029,7 @@ mod tests {
         assert!(args_for(&stored, false).is_empty());
 
         // --launch is still the whole layout, flagged pane or not.
-        assert_eq!(args_for(&stored, true), ["cyclops ui"]);
+        assert_eq!(args_for(&stored, true), ["cyclops watch"]);
         assert_eq!(args_for(&filled, true), ["claude"]);
 
         // A flag with nothing to run is nothing to run.

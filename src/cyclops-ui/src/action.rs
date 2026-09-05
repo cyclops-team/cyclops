@@ -86,12 +86,6 @@ pub enum ActionRequest {
         message_id: MessageId,
         claim: bool,
     },
-    /// Open an alarm. Always by attempt id: a message id resolves only
-    /// when exactly one recipient is stuck, and a broadcast with two
-    /// answers ambiguous_attention.
-    OpenAttention {
-        attempt_id: NotificationAttemptId,
-    },
     Reply {
         message_id: MessageId,
         body: String,
@@ -102,12 +96,6 @@ pub enum ActionRequest {
         recipient: cyclops_proto::RecipientKey,
     },
     ClearAlarm {
-        attempt_id: NotificationAttemptId,
-    },
-    AttentionComplete {
-        attempt_id: NotificationAttemptId,
-    },
-    AttentionDiscard {
         attempt_id: NotificationAttemptId,
     },
 }

@@ -76,10 +76,9 @@ pub enum HitTarget {
     /// place, where a click on the rest of the row walks into it.
     ///
     /// Two targets on one row, the same shape as [`Self::SidebarRow`] and
-    /// [`Self::SidebarDisclosure`] on a workspace row. The narrow one is
-    /// pushed second so it wins its own cells: [`HitMap::hit`] scans in
-    /// reverse, so the last region pushed over a cell is the one that
-    /// answers there.
+    /// [`Self::SidebarDisclosure`] on a workspace row. Both sit on the
+    /// same [`HitLayer`], where the last region pushed over a cell is the
+    /// one that answers there, so the narrow one is pushed second.
     FileDisclosure {
         path: String,
     },
@@ -152,11 +151,56 @@ pub struct PaneGeometry {
     pub inner: Rect,
 }
 
+/// Which stratum of the frame a hit region belongs to, lowest first.
+///
+/// A click lands on the highest layer painted over its cell, whatever
+/// order the painters ran in. Before this the map answered with the
+/// last region pushed, and every painter had to know what every other
+/// painter had already pushed: the sidebar divider re-pushed itself over
+/// the pane frames, the clear button re-pushed itself over the sidebar
+/// divider, and each of those was a comment away from breaking.
+///
+/// The order encodes what a pointer expects. A resize seam beats the
+/// passive border and body it is drawn across, because a border nobody
+/// can grab is a pane that only resizes from its far edge. A pane's
+/// visible buttons beat the seam, because a control that shows an `X`
+/// and then starts a resize is worse than no control at all. Panels
+/// and their chrome sit above the canvas they border, and a menu or
+/// dialog floats over everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HitLayer {
+    /// Pane bodies and their passive frame edges: focus clicks and text
+    /// selection.
+    Canvas,
+    /// Resize handles: the bands between sibling panes, the sidebar's
+    /// and the Messages pane's outer columns, the seam between the
+    /// sidebar's two panels.
+    Seam,
+    /// The controls painted over a pane's frame: title strip, minimize,
+    /// clear, grip, rename and split buttons.
+    PaneChrome,
+    /// The sidebar, tab strip and Messages pane: rows, chips, toggles,
+    /// footer buttons.
+    SidebarChrome,
+    /// Menus and dialogs.
+    Overlay,
+}
+
 /// One recorded hit region from the last render pass.
 #[derive(Debug, Clone)]
 pub struct HitRegion {
     pub rect: Rect,
     pub target: HitTarget,
+    pub layer: HitLayer,
+}
+
+impl HitRegion {
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.rect.x
+            && col < self.rect.x + self.rect.width
+            && row >= self.rect.y
+            && row < self.rect.y + self.rect.height
+    }
 }
 
 /// Regions painted during the last frame, tested on mouse events.
@@ -172,12 +216,12 @@ impl HitMap {
         self.pane_geometries.clear();
     }
 
-    /// Remove menu rows as soon as a menu closes. The next frame restores
-    /// the complete map; until then a fast second click must not replay a
-    /// command through stale overlay geometry.
-    pub fn clear_menu_items(&mut self) {
+    /// Drop the overlay's regions as soon as a menu closes. The next
+    /// frame restores the complete map; until then a fast second click
+    /// must not replay a command through stale overlay geometry.
+    pub fn clear_overlay(&mut self) {
         self.regions
-            .retain(|region| !matches!(region.target, HitTarget::MenuItem { .. }));
+            .retain(|region| region.layer < HitLayer::Overlay);
     }
 
     pub fn push_geometry(&mut self, geometry: PaneGeometry) {
@@ -188,9 +232,13 @@ impl HitMap {
         self.pane_geometries.iter().find(|g| g.pane_id == pane_id)
     }
 
-    pub fn push(&mut self, rect: Rect, target: HitTarget) {
+    pub fn push(&mut self, rect: Rect, layer: HitLayer, target: HitTarget) {
         if rect.width > 0 && rect.height > 0 {
-            self.regions.push(HitRegion { rect, target });
+            self.regions.push(HitRegion {
+                rect,
+                target,
+                layer,
+            });
         }
     }
 
@@ -226,44 +274,39 @@ impl HitMap {
 
     /// The resize seam under `col`/`row`, whatever is painted over it.
     ///
-    /// [`HitMap::hit`] answers with the topmost region, and on a pane's top
-    /// border that is the pane's own title strip or a split button. Those
-    /// are real controls and keep their clicks, but the row they sit on is
-    /// also the seam between two stacked panes, and a seam nobody can grab
-    /// is a pane that can only be resized from its far edge. Measured: of
-    /// the 40 cells on a two-pane seam's lower row, one was grabbable.
+    /// Kept beside [`HitMap::hit`] for one overlay: a pane's title strip.
+    /// It sits on [`HitLayer::PaneChrome`] because it is a real control (a
+    /// focus click, or the attention eye), so `hit` rightly answers with
+    /// it. But the row it sits on is also the seam between two stacked
+    /// panes, and a seam nobody can grab is a pane that can only be
+    /// resized from its far edge. Measured: of the 40 cells on a two-pane
+    /// seam's lower row, one was grabbable. `app` asks here after a press
+    /// on the strip, and moves the seam if the pointer moves.
     ///
-    /// Last pushed wins, the same rule `hit` uses, so the two can never
-    /// disagree about which of two overlapping bands a cell belongs to.
-    /// Bands from different levels of a split tree do not overlap today
-    /// (an outer divider sits outside every child's rect), so the rule is
-    /// only load-bearing if that ever stops being true.
+    /// Seams never overlap each other today (an outer divider sits outside
+    /// every child's rect), so which of two is answered is only
+    /// load-bearing if that ever stops being true; the last pushed wins,
+    /// the same rule `hit` applies within a layer.
     pub fn divider_at(&self, col: u16, row: u16) -> Option<(&str, SplitDir)> {
         self.regions
             .iter()
             .rev()
-            .filter(|r| {
-                col >= r.rect.x
-                    && col < r.rect.x + r.rect.width
-                    && row >= r.rect.y
-                    && row < r.rect.y + r.rect.height
-            })
+            .filter(|r| r.contains(col, row))
             .find_map(|r| match &r.target {
                 HitTarget::Divider { pane_id, dir } => Some((pane_id.as_str(), *dir)),
                 _ => None,
             })
     }
 
+    /// The region that answers a pointer at `col`/`row`: the highest
+    /// [`HitLayer`] painted there, and within a layer the last pushed.
     pub fn hit(&self, col: u16, row: u16) -> Option<&HitTarget> {
         self.regions
             .iter()
-            .rev()
-            .find(|r| {
-                col >= r.rect.x
-                    && col < r.rect.x + r.rect.width
-                    && row >= r.rect.y
-                    && row < r.rect.y + r.rect.height
-            })
+            .filter(|r| r.contains(col, row))
+            // `max_by_key` keeps the last of equal maxima, which is the
+            // within-layer rule.
+            .max_by_key(|r| r.layer)
             .map(|r| &r.target)
     }
 
@@ -384,26 +427,112 @@ impl MenuState {
 mod tests {
     use super::*;
 
+    fn tab(window_id: &str) -> HitTarget {
+        HitTarget::Tab {
+            window_id: window_id.into(),
+        }
+    }
+
+    fn body(pane_id: &str) -> HitTarget {
+        HitTarget::PaneBody {
+            pane_id: pane_id.into(),
+        }
+    }
+
     #[test]
-    fn hit_test_returns_topmost_region() {
+    fn hit_test_returns_the_last_pushed_within_one_layer() {
         let mut map = HitMap::default();
-        map.push(
-            Rect::new(0, 0, 10, 10),
-            HitTarget::Tab {
-                window_id: "@0".into(),
-            },
-        );
-        map.push(
-            Rect::new(2, 2, 4, 4),
-            HitTarget::PaneBody {
-                pane_id: "%0".into(),
-            },
-        );
+        map.push(Rect::new(0, 0, 10, 10), HitLayer::Canvas, tab("@0"));
+        map.push(Rect::new(2, 2, 4, 4), HitLayer::Canvas, body("%0"));
         assert!(matches!(map.hit(3, 3), Some(HitTarget::PaneBody { .. })));
         assert!(matches!(
             map.hit(9, 9),
             Some(HitTarget::Tab { window_id }) if window_id == "@0"
         ));
+    }
+
+    /// The layer decides, not the push order. The sidebar divider used to
+    /// be pushed after the pane frames so it could win its column, and
+    /// the clear button pushed again after that so it could win its two
+    /// cells back; each was a comment away from breaking.
+    #[test]
+    fn hit_test_returns_the_highest_layer_whatever_the_push_order() {
+        let mut map = HitMap::default();
+        // The clear button, then the sidebar divider over its column,
+        // then the pane frame under both: the order every painter would
+        // have had to agree on, reversed.
+        map.push(
+            Rect::new(0, 4, 2, 3),
+            HitLayer::PaneChrome,
+            HitTarget::PaneClear {
+                pane_id: "%0".into(),
+            },
+        );
+        map.push(
+            Rect::new(0, 0, 1, 12),
+            HitLayer::Seam,
+            HitTarget::SidebarDivider,
+        );
+        map.push(
+            Rect::new(0, 0, 1, 12),
+            HitLayer::Canvas,
+            HitTarget::PaneFrame {
+                pane_id: "%0".into(),
+            },
+        );
+
+        assert!(
+            matches!(map.hit(0, 5), Some(HitTarget::PaneClear { .. })),
+            "the button answers its own cells"
+        );
+        assert!(
+            matches!(map.hit(0, 1), Some(HitTarget::SidebarDivider)),
+            "the divider answers the rest of the column"
+        );
+        // A menu over all of it answers first however early it was pushed.
+        map.regions.insert(
+            0,
+            HitRegion {
+                rect: Rect::new(0, 0, 4, 12),
+                target: HitTarget::MenuItem {
+                    action: BindingAction::ClosePane,
+                },
+                layer: HitLayer::Overlay,
+            },
+        );
+        assert!(matches!(map.hit(0, 5), Some(HitTarget::MenuItem { .. })));
+    }
+
+    /// The title strip is a control and answers `hit`, but the seam it is
+    /// painted over must still be found under it for a press to move.
+    #[test]
+    fn divider_at_finds_the_seam_under_pane_chrome() {
+        let mut map = HitMap::default();
+        map.push(
+            Rect::new(1, 5, 38, 2),
+            HitLayer::Seam,
+            HitTarget::Divider {
+                pane_id: "%0".into(),
+                dir: SplitDir::Vertical,
+            },
+        );
+        map.push(
+            Rect::new(5, 6, 20, 1),
+            HitLayer::PaneChrome,
+            HitTarget::PaneFrame {
+                pane_id: "%1".into(),
+            },
+        );
+        assert!(matches!(
+            map.hit(10, 6),
+            Some(HitTarget::PaneFrame { pane_id }) if pane_id == "%1"
+        ));
+        assert_eq!(
+            map.divider_at(10, 6),
+            Some(("%0", SplitDir::Vertical)),
+            "the seam is still there under the strip"
+        );
+        assert_eq!(map.divider_at(10, 8), None);
     }
 
     #[test]
@@ -412,6 +541,7 @@ mod tests {
         // $a is collapsed: one row, one block.
         map.push(
             Rect::new(0, 3, 20, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: "$a".into(),
                 session: "a".into(),
@@ -421,6 +551,7 @@ mod tests {
         // block spanning rows 4..7.
         map.push(
             Rect::new(0, 4, 20, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarRow {
                 session_id: "$b".into(),
                 session: "b".into(),
@@ -428,6 +559,7 @@ mod tests {
         );
         map.push(
             Rect::new(0, 5, 20, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarAgent {
                 workspace_id: "$b".into(),
                 pane_id: "%1".into(),
@@ -436,6 +568,7 @@ mod tests {
         );
         map.push(
             Rect::new(0, 6, 20, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarAgent {
                 workspace_id: "$b".into(),
                 pane_id: "%2".into(),
@@ -446,6 +579,7 @@ mod tests {
         // create a block of its own.
         map.push(
             Rect::new(0, 3, 1, 1),
+            HitLayer::SidebarChrome,
             HitTarget::SidebarDisclosure {
                 session_id: "$a".into(),
             },
@@ -473,12 +607,7 @@ mod tests {
     #[test]
     fn workspace_blocks_is_empty_without_any_sidebar_rows() {
         let mut map = HitMap::default();
-        map.push(
-            Rect::new(0, 0, 10, 1),
-            HitTarget::Tab {
-                window_id: "@0".into(),
-            },
-        );
+        map.push(Rect::new(0, 0, 10, 1), HitLayer::SidebarChrome, tab("@0"));
         assert!(map.workspace_blocks().is_empty());
     }
 
@@ -492,15 +621,22 @@ mod tests {
     #[test]
     fn motion_reaches_the_renderer_for_every_button_that_lights() {
         let mut map = HitMap::default();
-        map.push(Rect::new(0, 7, 1, 1), HitTarget::SidebarToggle);
-        map.push(Rect::new(15, 7, 3, 1), HitTarget::NewWorkspaceButton);
-        map.push(Rect::new(25, 0, 3, 1), HitTarget::NewTabButton);
         map.push(
-            Rect::new(0, 0, 20, 5),
-            HitTarget::PaneBody {
-                pane_id: "%0".into(),
-            },
+            Rect::new(0, 7, 1, 1),
+            HitLayer::SidebarChrome,
+            HitTarget::SidebarToggle,
         );
+        map.push(
+            Rect::new(15, 7, 3, 1),
+            HitLayer::SidebarChrome,
+            HitTarget::NewWorkspaceButton,
+        );
+        map.push(
+            Rect::new(25, 0, 3, 1),
+            HitLayer::SidebarChrome,
+            HitTarget::NewTabButton,
+        );
+        map.push(Rect::new(0, 0, 20, 5), HitLayer::Canvas, body("%0"));
 
         assert!(motion_touches_hover_button(&map, None, 0, 7), "the chevron");
         assert!(
@@ -523,20 +659,16 @@ mod tests {
     #[test]
     fn closing_a_menu_removes_only_its_stale_rows() {
         let mut map = HitMap::default();
-        map.push(
-            Rect::new(0, 0, 10, 5),
-            HitTarget::PaneBody {
-                pane_id: "%0".into(),
-            },
-        );
+        map.push(Rect::new(0, 0, 10, 5), HitLayer::Canvas, body("%0"));
         map.push(
             Rect::new(1, 1, 8, 1),
+            HitLayer::Overlay,
             HitTarget::MenuItem {
                 action: BindingAction::ClosePane,
             },
         );
 
-        map.clear_menu_items();
+        map.clear_overlay();
 
         assert!(matches!(map.hit(2, 1), Some(HitTarget::PaneBody { .. })));
     }

@@ -224,9 +224,6 @@ process_names = ["cycagent"]
 argv_basenames = ["cycagent"]
 launch = "cat"
 
-[messaging]
-mailbox_capability_file = {json.dumps(str(skill))}
-
 [[rule]]
 id = "fixture_idle"
 state = "idle"

@@ -8,8 +8,7 @@ use std::str::FromStr;
 
 use cyclops_proto::{
     MessageId, MessageRecipientRoute, NotificationAttemptId, NotificationAttentionCause,
-    NotificationPreWriteCause, NotificationResolution, RecipientKey, SessionInstanceId, TmuxPaneId,
-    WorkspaceId,
+    NotificationPreWriteCause, RecipientKey, SessionInstanceId, TmuxPaneId, WorkspaceId,
 };
 use cyclops_ui::detail::render;
 use cyclops_ui::{
@@ -206,45 +205,23 @@ fn a_detail_offers_only_the_actions_its_target_allows() {
     );
     assert!(!d.allows(Action::Reply));
 
-    // An alarm offers acknowledgement. Complete and discard appear only
-    // when every check passed.
-    let d = opened(
-        &alarmed(),
-        Loaded {
-            checks: checks(false),
-            ..Loaded::default()
-        },
-    );
+    // An alarm offers acknowledgement and nothing that touches the pane.
+    let d = opened(&alarmed(), Loaded::default());
     assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
-    assert!(!d.allows(Action::AttentionComplete));
-    assert!(!d.allows(Action::AttentionDiscard));
-
-    let d = opened(
-        &alarmed(),
-        Loaded {
-            checks: checks(true),
-            ..Loaded::default()
-        },
-    );
-    assert!(d.allows(Action::AttentionComplete) && d.allows(Action::AttentionDiscard));
 
     // A message target never offers an attention action, whatever else
     // is true of it.
     let d = opened(
         &inbound_pending(),
         Loaded {
-            checks: checks(true),
             body: Some("b".into()),
             ..Loaded::default()
         },
     );
-    for forbidden in [
-        Action::AttentionComplete,
-        Action::AttentionDiscard,
-        Action::ClearAlarm,
-    ] {
-        assert!(!d.allows(forbidden), "{forbidden:?} offered on a message");
-    }
+    assert!(
+        !d.allows(Action::ClearAlarm),
+        "clear alarm offered on a message"
+    );
 }
 
 #[test]
@@ -339,19 +316,30 @@ fn every_daemon_authorized_unwritten_wake_offers_withdrawal() {
     }
 }
 
+/// Both quota words replay from a 1.0 journal only. They still read, they
+/// say which daemon wrote them, and neither offers an action: a held
+/// attempt points at the claim, a reset-observed one at the admin verb.
 #[test]
-fn quota_detail_explains_wait_and_the_message_wide_admin_command() {
+fn quota_detail_names_the_older_daemon_and_offers_no_action() {
     let mut held_row = outbound();
     held_row.wake = WakeWord::QuotaHeld;
     held_row.attention = Some(attempt(9));
     let held = opened(&held_row, Loaded::default());
     assert!(held.allowed().is_empty());
     let held_text = render(&held, 160, 40).join("\n");
-    assert!(held_text.contains("wait for a quota reset"), "{held_text}");
+    assert!(
+        held_text.contains("recorded by an older daemon"),
+        "{held_text}"
+    );
     assert!(
         held_text.contains("will not resume automatically"),
         "{held_text}"
     );
+    assert!(
+        held_text.contains("`cyclops inbox claim m-001`"),
+        "{held_text}"
+    );
+    assert!(!held_text.contains("wait for a quota reset"), "{held_text}");
 
     let mut reset_row = held_row;
     reset_row.wake = WakeWord::QuotaResetObserved;
@@ -366,6 +354,91 @@ fn quota_detail_explains_wait_and_the_message_wide_admin_command() {
         reset_text.contains("every eligible recipient on the message"),
         "{reset_text}"
     );
+    assert!(
+        reset_text.contains("recorded by an older daemon"),
+        "{reset_text}"
+    );
+}
+
+/// A 1.0 journal replays the operator complete/discard facts a 1.1
+/// daemon never writes. The detail names the record once, whatever
+/// combination of the three facts it carries, and never the retired
+/// verbs, their reconciliation, or an action for them.
+#[test]
+fn a_replayed_resolution_record_reads_once_and_offers_nothing() {
+    let neutral = "resolution record from an older daemon; no action is available for it";
+    let mut row = outbound();
+    row.wake = WakeWord::ResolutionIncomplete;
+    row.attention = Some(attempt(9));
+    row.can_manage_attention = true;
+    let plain = render(&opened(&row, Loaded::default()), 160, 40).join("\n");
+    assert!(!plain.contains(neutral), "no record, no line: {plain}");
+
+    let combinations = [
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            None,
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            true,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Discard),
+            Some(cyclops_proto::NotificationResolution::Discard),
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Discard),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            false,
+        ),
+        (
+            None,
+            Some(cyclops_proto::NotificationResolution::Discard),
+            false,
+        ),
+        (None, None, true),
+    ];
+    for (intent, accepted, consumed) in combinations {
+        let mut row = row.clone();
+        row.resolution_intent = intent;
+        row.resolution_action_accepted = accepted;
+        row.resolution_consumption_observed = consumed.then_some(
+            cyclops_proto::NotificationResolutionConsumptionObservation {
+                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
+                observed_at_ms: 4,
+            },
+        );
+        let detail = opened(&row, Loaded::default());
+        let text = render(&detail, 160, 40).join("\n");
+        assert_eq!(
+            text.matches(neutral).count(),
+            1,
+            "{intent:?}/{accepted:?}/{consumed}: {text}"
+        );
+        for retired in [
+            "terminal accepted",
+            "intent recorded",
+            "reconciliation",
+            "submit",
+            "discard",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{intent:?}/{accepted:?}/{consumed}: {retired:?} in {text}"
+            );
+        }
+        // The alarm the daemon still authorizes is the only verb left.
+        assert_eq!(detail.allowed(), vec![Action::ClearAlarm]);
+    }
 }
 
 /// Anything that changes what an agent sees is confirmed by name first,
@@ -380,10 +453,10 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
         },
     );
 
-    let request = d.request(Action::AttentionDiscard);
+    let request = d.request(Action::ClearAlarm);
     let sentence = match request {
         Request::Confirm(s) => s,
-        other => panic!("discard did not ask: {other:?}"),
+        other => panic!("clear did not ask: {other:?}"),
     };
     assert!(
         sentence.contains(&attempt(7).to_string()),
@@ -393,8 +466,8 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
         sentence.contains("reviewer") && sentence.contains(&agent("%1").to_string()),
         "the confirmation does not name the frozen broadcast recipient: {sentence}"
     );
-    assert!(sentence.contains("discard"), "{sentence}");
-    assert_eq!(*d.stage(), Stage::Confirming(Action::AttentionDiscard));
+    assert!(sentence.contains("clear alarm"), "{sentence}");
+    assert_eq!(*d.stage(), Stage::Confirming(Action::ClearAlarm));
 
     // Escape drops it and nothing was performed.
     assert_eq!(d.escape(), Back::Cancelled);
@@ -402,9 +475,9 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
     assert_eq!(d.confirm(), None, "a cancelled confirmation still fired");
 
     // Saying yes hands back exactly the action that was confirmed.
-    d.request(Action::AttentionComplete);
-    assert_eq!(d.confirm(), Some(Action::AttentionComplete));
-    assert_eq!(*d.stage(), Stage::Acting(Action::AttentionComplete));
+    d.request(Action::ClearAlarm);
+    assert_eq!(d.confirm(), Some(Action::ClearAlarm));
+    assert_eq!(*d.stage(), Stage::Acting(Action::ClearAlarm));
 
     // Reply is the operator's own writing and is not confirmed.
     let mut d = opened(
@@ -436,7 +509,7 @@ fn a_broadcast_action_names_the_frozen_recipient() {
         },
     );
 
-    let Request::Confirm(sentence) = detail.request(Action::AttentionDiscard) else {
+    let Request::Confirm(sentence) = detail.request(Action::ClearAlarm) else {
         panic!("broadcast recipient action did not ask for confirmation");
     };
     assert!(sentence.contains("codex-reviewer"), "{sentence}");
@@ -456,8 +529,8 @@ fn a_vanished_target_stops_actions_and_never_retargets() {
         },
     );
     let frozen = d.target().clone();
-    d.request(Action::AttentionDiscard);
-    assert_eq!(*d.stage(), Stage::Confirming(Action::AttentionDiscard));
+    d.request(Action::ClearAlarm);
+    assert_eq!(*d.stage(), Stage::Confirming(Action::ClearAlarm));
 
     // The snapshot no longer lists it. The confirmation on screen still
     // names what the operator read.
@@ -466,7 +539,7 @@ fn a_vanished_target_stops_actions_and_never_retargets() {
     assert_eq!(d.target(), &frozen, "the frozen target moved");
     assert_eq!(
         *d.stage(),
-        Stage::Confirming(Action::AttentionDiscard),
+        Stage::Confirming(Action::ClearAlarm),
         "a snapshot cancelled a confirmation the operator opened"
     );
     assert!(
@@ -580,93 +653,11 @@ fn an_open_confirmation_names_its_target_on_screen() {
             ..Loaded::default()
         },
     );
-    d.request(Action::AttentionComplete);
+    d.request(Action::ClearAlarm);
     let text = render(&d, 160, 40).join("\n");
     assert!(text.contains(&attempt(7).to_string()), "{text}");
-    assert!(text.contains("submit staged notification"), "{text}");
+    assert!(text.contains("clear alarm"), "{text}");
     assert!(text.contains("esc"), "no way out on screen");
-}
-
-/// Ambiguity withholds exactly what it must and nothing else.
-///
-/// The two terminal verbs are not idempotent, so an ambiguous outcome
-/// from one of them must not offer either again. Reply carries an
-/// idempotency key and clearing an alarm is idempotent by design, so
-/// blocking those would strand an operator over somebody else's doubt.
-#[test]
-fn ambiguity_withholds_only_the_verbs_that_cannot_repeat() {
-    let loaded = || Loaded {
-        checks: checks(true),
-        ..Loaded::default()
-    };
-
-    // A terminal verb whose outcome is unknown retires the pair, and
-    // leaves the idempotent action standing.
-    let mut d = opened(&alarmed(), loaded());
-    d.request(Action::AttentionDiscard);
-    d.confirm();
-    d.uncertain(
-        Some(Action::AttentionDiscard),
-        "socket closed after the send",
-    );
-    assert!(matches!(d.stage(), Stage::Uncertain { .. }));
-    assert_eq!(
-        d.allowed(),
-        vec![Action::ClearAlarm],
-        "ambiguity took away more than the terminal pair"
-    );
-
-    // A request that never left changes nothing at all.
-    let mut d = opened(&alarmed(), loaded());
-    d.not_sent(Some(Action::AttentionComplete), "connect: no such file");
-    assert!(matches!(d.stage(), Stage::NotSent { .. }));
-    assert_eq!(
-        d.allowed(),
-        vec![
-            Action::AttentionComplete,
-            Action::AttentionDiscard,
-            Action::ClearAlarm
-        ],
-        "a request the daemon never saw withheld something"
-    );
-
-    // A conflict says the attempt is already resolved. The terminal pair
-    // never comes back, and no later reload revives it.
-    let mut d = opened(&alarmed(), loaded());
-    d.refused(
-        Some(Action::AttentionComplete),
-        "conflict",
-        "already resolved",
-    );
-    assert!(d.is_resolved());
-    assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
-    d.loaded_ok(loaded());
-    assert_eq!(
-        d.allowed(),
-        vec![Action::ClearAlarm],
-        "a reload revived a resolved attempt"
-    );
-
-    // A success does the same: what landed cannot land again.
-    let mut d = opened(&alarmed(), loaded());
-    d.done(Action::AttentionComplete, "notification submitted");
-    assert!(d.is_resolved());
-    assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
-
-    // Ambiguity about a reply says nothing about the alarm.
-    let mut d = opened(&alarmed(), loaded());
-    d.uncertain(Some(Action::ClearAlarm), "no answer");
-    assert!(
-        d.allows(Action::AttentionComplete),
-        "a clear that went unanswered blocked the terminal verbs"
-    );
-
-    // The screen explains an ambiguous outcome rather than inviting one.
-    let mut d = opened(&alarmed(), loaded());
-    d.uncertain(Some(Action::AttentionDiscard), "no answer");
-    let text = render(&d, 160, 40).join("\n");
-    assert!(text.contains("may have landed"), "{text}");
-    assert!(text.contains("reopen"), "{text}");
 }
 
 /// Requeue is not offered here.
@@ -688,14 +679,7 @@ fn requeue_is_absent_from_a_per_attempt_detail() {
         !words.iter().any(|w| w.contains("requeue")),
         "requeue offered against one attempt: {words:?}"
     );
-    assert_eq!(
-        words,
-        vec![
-            "submit staged notification",
-            "discard staged notification",
-            "clear alarm"
-        ]
-    );
+    assert_eq!(words, vec!["clear alarm"]);
 }
 
 /// A long body scrolls and keeps every byte, and its shape survives.
@@ -870,6 +854,7 @@ mod through_the_app {
             operator_withdrawn: None,
             attempt_id: alarmed.then(|| attempt(n)),
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             pre_write_block: None,
@@ -931,27 +916,6 @@ mod through_the_app {
             active: true,
             needs_action: true,
         }
-    }
-
-    /// An alarm whose terminal accepted its action but has no final outcome.
-    /// `wake_word` reads it as `ResolutionIncomplete`, while fresh-action authority
-    /// remains false and only matching no-key reconciliation is available.
-    pub fn wire_row_uncertain(id: &str) -> MessageSnapshotRow {
-        let mut row = wire_row_n(id, true, 7);
-        row.recipients[0].notification.resolution_intent =
-            Some(cyclops_proto::NotificationResolution::Complete);
-        row.recipients[0].notification.resolution_action_accepted =
-            Some(cyclops_proto::NotificationResolution::Complete);
-        row.recipients[0]
-            .notification
-            .resolution_consumption_observed = Some(
-            cyclops_proto::NotificationResolutionConsumptionObservation {
-                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
-                observed_at_ms: 5_001,
-            },
-        );
-        row.recipients[0].can_manage_attention = false;
-        row
     }
 
     /// The same row after its own claim landed: identical target, moved
@@ -1039,15 +1003,18 @@ mod through_the_app {
         assert!(app.detail.as_ref().unwrap().allowed().is_empty());
     }
 
-    /// An inbound pending row claims on open. An alarm opens by attempt
-    /// id, never by message id.
+    /// An inbound pending row claims on open. An alarm the operator only
+    /// observes opens as a read that claims nothing.
     #[test]
     fn opening_picks_the_request_the_row_authorizes() {
         let mut app = app_with(vec![wire_row("m-001", true)], 9);
         app.open_detail().expect("opens");
         let (token, request) = app.take_detail_read().expect("a read is owed");
         match request {
-            ActionRequest::OpenAttention { attempt_id } => assert_eq!(attempt_id, attempt(7)),
+            ActionRequest::OpenMessage { message_id, claim } => {
+                assert_eq!(message_id, MessageId::new("m-001").unwrap());
+                assert!(!claim, "observing an alarm claimed its message");
+            }
             other => panic!("an alarm opened as {other:?}"),
         }
         // Reading an alarm mutates nothing.
@@ -1062,11 +1029,8 @@ mod through_the_app {
         let mut app = app_with(vec![wire_row("m-001", true)], 9);
         app.open_detail();
         let detail = app.detail.as_mut().unwrap();
-        detail.loaded_ok(Loaded {
-            checks: checks(true),
-            ..Loaded::default()
-        });
-        detail.request(Action::AttentionDiscard);
+        detail.loaded_ok(Loaded::default());
+        detail.request(Action::ClearAlarm);
         let frozen = detail.target().clone();
 
         // The row is gone, and a different row takes its place.
@@ -1080,7 +1044,7 @@ mod through_the_app {
         );
         assert_eq!(
             *detail.stage(),
-            Stage::Confirming(Action::AttentionDiscard),
+            Stage::Confirming(Action::ClearAlarm),
             "a snapshot cancelled the operator's confirmation"
         );
         assert!(detail.is_stale());
@@ -1102,11 +1066,8 @@ mod through_the_app {
         let mut app = app_with(vec![wire_row("m-001", true)], 9);
         app.open_detail();
         let detail = app.detail.as_mut().unwrap();
-        detail.loaded_ok(Loaded {
-            checks: checks(true),
-            ..Loaded::default()
-        });
-        detail.request(Action::AttentionComplete);
+        detail.loaded_ok(Loaded::default());
+        detail.request(Action::ClearAlarm);
 
         app.handle_key(Key::Esc);
         assert!(
@@ -1201,15 +1162,12 @@ mod loop_journey {
 
         let opened = pump(&mut app, |request| {
             assert!(
-                matches!(request, ActionRequest::OpenAttention { .. }),
+                matches!(request, ActionRequest::OpenMessage { .. }),
                 "an alarm opened as {request:?}"
             );
-            ActionOutcome::Opened(Box::new(Loaded {
-                checks: checks(true),
-                ..Loaded::default()
-            }))
+            ActionOutcome::Opened(Box::default())
         });
-        assert!(matches!(opened, ActionRequest::OpenAttention { .. }));
+        assert!(matches!(opened, ActionRequest::OpenMessage { .. }));
         assert!(!app.detail_read_owed(), "the read was not marked done");
 
         // Choose the first action, confirm it, and the loop sends it.
@@ -1219,16 +1177,10 @@ mod loop_journey {
         assert!(app.has_pending());
 
         let sent = pump(&mut app, |request| {
-            assert!(matches!(request, ActionRequest::AttentionComplete { .. }));
-            ActionOutcome::Done("notification submitted".into())
+            assert!(matches!(request, ActionRequest::ClearAlarm { .. }));
+            ActionOutcome::Done("alarm cleared".into())
         });
-        assert!(matches!(sent, ActionRequest::AttentionComplete { .. }));
-
-        // The attempt is resolved, so the terminal pair is gone, and the
-        // list is owed a fresh read because the daemon moved.
-        let detail = app.detail.as_ref().unwrap();
-        assert!(detail.is_resolved());
-        assert_eq!(detail.allowed(), vec![Action::ClearAlarm]);
+        assert!(matches!(sent, ActionRequest::ClearAlarm { .. }));
     }
 
     /// A reply is typed, sent, fails, and is sent again under the same
@@ -1318,24 +1270,13 @@ mod loop_journey {
     fn the_footer_numbers_the_actions_the_keys_take() {
         let mut app = app_with(vec![wire_row("m-001", true)], 9);
         app.handle_key(Key::Enter);
-        pump(&mut app, |_| {
-            ActionOutcome::Opened(Box::new(Loaded {
-                checks: checks(true),
-                ..Loaded::default()
-            }))
-        });
+        pump(&mut app, |_| ActionOutcome::Opened(Box::default()));
 
         let text = build(&mut app, 160, 40).join("\n");
-        for (n, word) in [
-            (1, "submit staged notification"),
-            (2, "discard staged notification"),
-            (3, "clear alarm"),
-        ] {
-            assert!(
-                text.contains(&format!("{n} {word}")),
-                "action {n} is not numbered on screen: {text}"
-            );
-        }
+        assert!(
+            text.contains("1 clear alarm"),
+            "action 1 is not numbered on screen: {text}"
+        );
     }
 
     /// Scrolling is bound to the keys a reader will try.
@@ -1477,10 +1418,10 @@ mod token_matching {
         let a_target = app.detail.as_ref().unwrap().target().target.clone();
         app.apply_action(token, alarm_checks());
 
-        app.handle_key(Key::Char('2'));
+        app.handle_key(Key::Char('1'));
         assert_eq!(
             *app.detail.as_ref().unwrap().stage(),
-            Stage::Confirming(Action::AttentionDiscard)
+            Stage::Confirming(Action::ClearAlarm)
         );
         app.handle_key(Key::Char('y'));
         assert!(app.has_pending(), "the yes resolved nothing");
@@ -1489,10 +1430,10 @@ mod token_matching {
         let (sent, request) = app.take_pending().expect("a request is waiting");
         assert_eq!(*sent.row(), a_target, "the request left A's target");
         match request {
-            ActionRequest::AttentionDiscard { attempt_id } => {
+            ActionRequest::ClearAlarm { attempt_id } => {
                 assert_eq!(attempt_id, attempt(7), "the verb named the wrong attempt")
             }
-            other => panic!("discard was built as {other:?}"),
+            other => panic!("clear was built as {other:?}"),
         }
     }
 
@@ -1505,7 +1446,7 @@ mod token_matching {
         let (token, _) = app.take_detail_read().expect("owes a read");
         app.apply_action(token, alarm_checks());
 
-        app.handle_key(Key::Char('3'));
+        app.handle_key(Key::Char('1'));
         app.handle_key(Key::Char('y'));
         let (in_flight, _) = app.take_pending().expect("a request is waiting");
         assert!(app.in_flight().is_some());
@@ -1554,7 +1495,6 @@ mod token_matching {
             },
         );
         let d = app.detail.as_ref().unwrap();
-        assert!(d.is_resolved());
         assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
 
         let mut app = armed();
@@ -1563,7 +1503,7 @@ mod token_matching {
         let d = app.detail.as_ref().unwrap();
         assert!(matches!(d.stage(), Stage::NotSent { .. }));
         assert!(
-            d.allows(Action::AttentionComplete),
+            d.allows(Action::ClearAlarm),
             "not-sent withheld a verb the daemon never saw"
         );
 
@@ -1625,403 +1565,6 @@ fn a_live_token_whose_detail_changed_underneath_is_still_dropped() {
         Stage::Opening,
         "the wrong target moved the stage"
     );
-}
-
-/// Disposition comes from the snapshot, never from `attention.show`.
-///
-/// The daemon's `AttentionShowResult` carries evidence and not outcome, so a
-/// detail that asked only the daemon would offer both terminal verbs on an
-/// attempt somebody else already finished. The daemon refuses, but offering
-/// an action that cannot succeed is the defect being tested.
-mod seeded_disposition {
-    use super::*;
-
-    #[test]
-    fn an_attempt_another_operator_submitted_offers_no_terminal_verb() {
-        let d = Detail::open(
-            &alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::ResolvedSubmitted,
-            ),
-            9,
-        );
-        assert!(d.is_resolved(), "the wake word said it was resolved");
-    }
-
-    #[test]
-    fn an_attempt_another_operator_discarded_offers_no_terminal_verb() {
-        let d = Detail::open(
-            &alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::ResolvedDiscarded,
-            ),
-            9,
-        );
-        assert!(d.is_resolved(), "discard is terminal too");
-    }
-
-    /// Every check passing is what makes this worth testing: the gate on
-    /// the terminal verbs is checks-pass AND not-resolved, so a resolved
-    /// attempt with clean evidence is exactly where a missing seed shows.
-    #[test]
-    fn a_resolved_attempt_with_passing_checks_still_offers_only_clear() {
-        let mut d = Detail::open(
-            &alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::ResolvedSubmitted,
-            ),
-            9,
-        );
-        d.loaded_ok(Loaded {
-            checks: vec![Check {
-                name: "notification exact".into(),
-                passed: true,
-                detail: None,
-            }],
-            ..Loaded::default()
-        });
-        let allowed = d.allowed();
-        assert!(
-            !allowed.contains(&Action::AttentionComplete)
-                && !allowed.contains(&Action::AttentionDiscard),
-            "a resolved attempt re-offered a terminal verb: {allowed:?}"
-        );
-        assert!(
-            allowed.contains(&Action::ClearAlarm),
-            "clearing the alarm is still safe: {allowed:?}"
-        );
-    }
-
-    /// A matching durable terminal acceptance exposes only no-key reconciliation.
-    #[test]
-    fn an_accepted_uncertain_attempt_offers_only_its_matching_reconciliation() {
-        for (intent, matching, opposite, phrase) in [
-            (
-                NotificationResolution::Complete,
-                Action::AttentionComplete,
-                Action::AttentionDiscard,
-                "reconcile prior uncertain submit",
-            ),
-            (
-                NotificationResolution::Discard,
-                Action::AttentionDiscard,
-                Action::AttentionComplete,
-                "reconcile prior uncertain discard",
-            ),
-        ] {
-            let mut row = alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::ResolutionIncomplete,
-            );
-            row.can_manage_attention = false;
-            row.resolution_intent = Some(intent);
-            row.resolution_action_accepted = Some(intent);
-            if intent == NotificationResolution::Complete {
-                row.resolution_consumption_observed = Some(
-                    cyclops_proto::NotificationResolutionConsumptionObservation {
-                        evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
-                        observed_at_ms: 2_000,
-                    },
-                );
-            }
-            let mut d = Detail::open(&row, 9);
-            d.loaded_ok(Loaded::default());
-            assert_eq!(d.allowed(), vec![matching]);
-            assert!(!d.allows(opposite));
-            let Request::Confirm(copy) = d.request(matching) else {
-                panic!("matching reconciliation did not ask for confirmation")
-            };
-            assert!(copy.contains(phrase), "{copy}");
-            assert!(copy.contains("no second key will be sent"), "{copy}");
-        }
-    }
-
-    /// A Complete pre-key intent is a durable uncertainty marker, not proof
-    /// that a key reached the terminal. It cannot expose another key or
-    /// no-key settlement.
-    #[test]
-    fn intent_without_terminal_acceptance_offers_no_terminal_action() {
-        let mut row = alarm_row(
-            attempt(7),
-            Direction::Outbound,
-            MailboxWord::Claimed,
-            WakeWord::ResolutionIncomplete,
-        );
-        row.can_manage_attention = false;
-        row.resolution_intent = Some(NotificationResolution::Complete);
-        let mut d = Detail::open(&row, 9);
-        d.loaded_ok(Loaded::default());
-
-        assert!(d.allowed().is_empty());
-        assert!(!d.allows(Action::AttentionComplete));
-        assert!(!d.allows(Action::AttentionDiscard));
-
-        let frame = render(&d, 96, 24).join("\n");
-        assert!(frame.contains("terminal acceptance is unproven"), "{frame}");
-        assert!(
-            frame.contains("no submit, discard, or reconciliation action is available"),
-            "{frame}"
-        );
-
-        let frozen = d.target().clone();
-        row.resolution_action_accepted = Some(NotificationResolution::Complete);
-        d.observe_snapshot(Some(&row));
-        assert_eq!(d.target(), &frozen, "snapshot change retargeted the detail");
-        d.loaded_ok(Loaded::default());
-        assert!(d.allowed().is_empty());
-        let frame = render(&d, 96, 24).join("\n");
-        assert!(
-            frame.contains("terminal accepted, task start unproven"),
-            "{frame}"
-        );
-
-        row.resolution_consumption_observed = Some(
-            cyclops_proto::NotificationResolutionConsumptionObservation {
-                evidence:
-                    cyclops_proto::NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
-                observed_at_ms: 2_000,
-            },
-        );
-        d.observe_snapshot(Some(&row));
-        assert_eq!(
-            d.target(),
-            &frozen,
-            "consumption proof retargeted the detail"
-        );
-        d.loaded_ok(Loaded::default());
-        assert_eq!(d.allowed(), vec![Action::AttentionComplete]);
-
-        row.resolution_action_accepted = Some(NotificationResolution::Discard);
-        d.observe_snapshot(Some(&row));
-        d.loaded_ok(Loaded::default());
-        assert!(d.allowed().is_empty());
-        let frame = render(&d, 96, 24).join("\n");
-        assert!(
-            frame.contains("terminal intent and accepted action records disagree"),
-            "{frame}"
-        );
-    }
-
-    #[test]
-    fn intent_only_discard_offers_exact_empty_no_key_reconciliation() {
-        let mut row = alarm_row(
-            attempt(8),
-            Direction::Outbound,
-            MailboxWord::Claimed,
-            WakeWord::ResolutionIncomplete,
-        );
-        row.can_manage_attention = false;
-        row.resolution_intent = Some(NotificationResolution::Discard);
-        let mut detail = Detail::open(&row, 11);
-        detail.loaded_ok(Loaded::default());
-
-        assert_eq!(detail.allowed(), vec![Action::AttentionDiscard]);
-        assert_eq!(
-            detail.action_word(Action::AttentionDiscard),
-            "reconcile exact-empty discard without a key"
-        );
-        let Request::Confirm(copy) = detail.request(Action::AttentionDiscard) else {
-            panic!("intent-only Discard did not expose its no-key recovery")
-        };
-        assert!(copy.contains("no second key will be sent"), "{copy}");
-
-        assert_eq!(detail.escape(), cyclops_ui::Back::Cancelled);
-        let frame = render(&detail, 96, 24).join("\n");
-        assert!(
-            frame.contains("exact-empty no-key discard reconciliation is available"),
-            "{frame}"
-        );
-        assert!(frame.contains("no terminal key is sent"), "{frame}");
-    }
-
-    /// Tightening only. A snapshot that predates this operator's own
-    /// terminal action must not hand the verbs back.
-    #[test]
-    fn an_older_snapshot_cannot_reopen_a_resolved_attempt() {
-        let mut d = Detail::open(
-            &alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::NeedsAttention,
-            ),
-            9,
-        );
-        d.done(Action::AttentionComplete, "notification submitted");
-        assert!(d.is_resolved(), "this operator just resolved it");
-        d.observe_snapshot(Some(&alarm_row(
-            attempt(7),
-            Direction::Outbound,
-            MailboxWord::Claimed,
-            WakeWord::NeedsAttention,
-        )));
-        assert!(
-            d.is_resolved(),
-            "a stale snapshot un-resolved a finished attempt"
-        );
-    }
-}
-
-/// The whole path: matching intent, terminal acceptance, and consumption
-/// evidence open the exact attempt and send only its reconciliation RPC.
-#[test]
-fn an_uncertain_wire_row_sends_only_its_matching_reconciliation_rpc() {
-    use through_the_app::*;
-
-    let mut app = app_with(vec![wire_row_uncertain("m-001")], 9);
-    let row = app.queue.selected().expect("a row");
-    assert_eq!(
-        row.wake,
-        WakeWord::ResolutionIncomplete,
-        "the wire fixture did not produce an uncertain wake"
-    );
-    assert!(
-        row.attention.is_some(),
-        "an uncertain alarm is still an attention target: {:?}",
-        row.target
-    );
-    assert!(!row.can_manage_attention);
-    assert_eq!(
-        row.resolution_intent,
-        Some(NotificationResolution::Complete)
-    );
-    assert_eq!(
-        row.resolution_action_accepted,
-        Some(NotificationResolution::Complete)
-    );
-    assert!(row.resolution_consumption_observed.is_some());
-
-    app.open_detail().expect("it opens");
-    let (token, request) = app.take_detail_read().expect("it owes a read");
-    assert!(matches!(
-        request,
-        cyclops_ui::ActionRequest::OpenAttention { attempt_id }
-            if attempt_id == attempt(7)
-    ));
-    app.apply_action(token, cyclops_ui::ActionOutcome::Opened(Box::default()));
-
-    let allowed = app.detail.as_ref().expect("still open").allowed();
-    assert_eq!(allowed, vec![Action::AttentionComplete]);
-    app.handle_key(cyclops_ui::Key::Char('1'));
-    let frame = cyclops_ui::build(&mut app, 96, 24).join("\n");
-    assert!(
-        frame.contains("terminal accepted the submit action"),
-        "{frame}"
-    );
-    assert!(
-        frame.contains("reconcile prior uncertain submit"),
-        "{frame}"
-    );
-    let words = frame.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(words.contains("no second key will be sent"), "{frame}");
-    app.handle_key(cyclops_ui::Key::Char('y'));
-    let (_, request) = app.take_pending().expect("reconciliation request");
-    assert!(matches!(
-        request,
-        cyclops_ui::ActionRequest::AttentionComplete { attempt_id }
-            if attempt_id == attempt(7)
-    ));
-}
-
-/// The diff is what an operator acts on. Five booleans name which rule
-/// broke and never what actually differs.
-mod attention_diff {
-    use super::*;
-
-    fn shown(expected: Option<&str>, observed: Option<&str>) -> String {
-        let mut d = Detail::open(
-            &alarm_row(
-                attempt(7),
-                Direction::Outbound,
-                MailboxWord::Claimed,
-                WakeWord::NeedsAttention,
-            ),
-            9,
-        );
-        d.loaded_ok(Loaded {
-            checks: vec![Check {
-                name: "notification exact".into(),
-                passed: false,
-                detail: None,
-            }],
-            expected: expected.map(str::to_string),
-            observed: observed.map(str::to_string),
-            ..Loaded::default()
-        });
-        render(&d, 80, 24).join("\n")
-    }
-
-    #[test]
-    fn both_sides_are_shown_when_the_daemon_returned_them() {
-        let text = shown(Some("STAGED PAYLOAD"), Some("WHAT THE PANE HELD"));
-        assert!(text.contains("STAGED PAYLOAD"), "{text}");
-        assert!(text.contains("WHAT THE PANE HELD"), "{text}");
-    }
-
-    /// Extraction failing is a finding, not a blank line. It is often the
-    /// reason a check did not pass.
-    #[test]
-    fn a_pane_that_could_not_be_read_says_so() {
-        let text = shown(Some("STAGED PAYLOAD"), None);
-        assert!(
-            text.contains("could not be read exactly"),
-            "a failed extraction rendered as nothing: {text}"
-        );
-    }
-
-    /// A message detail has no attention evidence, and asking for a diff
-    /// on one would be asking the wrong question.
-    #[test]
-    fn a_message_detail_shows_no_diff_section() {
-        let d = opened(
-            &inbound_pending(),
-            Loaded {
-                body: Some("the payload".into()),
-                ..Loaded::default()
-            },
-        );
-        let text = render(&d, 80, 24).join("\n");
-        assert!(!text.contains("in the pane"), "{text}");
-    }
-
-    /// Every width, because the diff is the longest thing on the surface
-    /// and a narrow frame is where an overflow would show.
-    #[test]
-    fn the_diff_never_overflows_its_frame() {
-        for (w, h) in SIZES {
-            let mut d = Detail::open(
-                &alarm_row(
-                    attempt(7),
-                    Direction::Outbound,
-                    MailboxWord::Claimed,
-                    WakeWord::NeedsAttention,
-                ),
-                9,
-            );
-            d.loaded_ok(Loaded {
-                expected: Some(
-                    "a staged line that is deliberately far wider than any of these frames".into(),
-                ),
-                observed: Some("and an observed line that is also much too wide to fit".into()),
-                ..Loaded::default()
-            });
-            for line in render(&d, w, h) {
-                assert!(
-                    line.chars().count() == w,
-                    "at {w}x{h} a line was {} wide: {line:?}",
-                    line.chars().count()
-                );
-            }
-        }
-    }
 }
 
 /// Pasted bytes are text, never commands.
@@ -2247,7 +1790,7 @@ mod audit {
         let allowed = app.detail.as_ref().unwrap().allowed();
         let index = allowed
             .iter()
-            .position(|a| *a == Action::AttentionComplete)
+            .position(|a| *a == Action::ClearAlarm)
             .expect("complete is offered");
         app.handle_key(Key::Char((b'1' + index as u8) as char));
         app.handle_key(Key::Char('y'));
@@ -2260,11 +1803,14 @@ mod audit {
         );
 
         // The answer still lands, so the detail records that it happened.
-        app.apply_action(token, ActionOutcome::Done("notification submitted".into()));
-        assert!(
-            app.detail.as_ref().unwrap().is_resolved(),
-            "the answer was discarded and the attempt looks unresolved"
+        app.apply_action(token, ActionOutcome::Done("alarm cleared".into()));
+        let detail = app.detail.as_ref().unwrap();
+        assert_eq!(
+            detail.loaded().claim_note.as_deref(),
+            Some("alarm cleared"),
+            "the answer was discarded"
         );
+        assert_eq!(*detail.stage(), Stage::Open);
     }
 
     /// Both guards used to sit above the composer, and both can arm with
@@ -2495,7 +2041,7 @@ mod too_small_to_confirm {
                 ..Loaded::default()
             },
         );
-        d.request(Action::AttentionDiscard);
+        d.request(Action::ClearAlarm);
         for (w, h) in [(48, 12), (80, 24), (160, 40)] {
             assert!(cyclops_ui::detail::can_show_actions(w, h));
             let text = render(&d, w, h).join("\n");
@@ -2528,7 +2074,7 @@ mod too_small_to_confirm {
                 ..Loaded::default()
             },
         );
-        detail.request(Action::AttentionDiscard);
+        detail.request(Action::ClearAlarm);
 
         let frame = render(&detail, 48, 12);
         assert_eq!(frame.len(), 12);
@@ -2586,7 +2132,7 @@ mod too_small_to_confirm {
         app.notice = Some("a concurrent notice".into());
         let frame = cyclops_ui::build(&mut app, 48, 12).join("\n");
         assert!(frame.contains("a concurrent notice"), "{frame}");
-        assert!(!frame.contains("1 submit staged notification"), "{frame}");
+        assert!(!frame.contains("1 clear alarm"), "{frame}");
 
         app.handle_key(Key::Char('1'));
         assert_eq!(*app.detail.as_ref().unwrap().stage(), Stage::Open);
@@ -2765,7 +2311,7 @@ mod lifecycle {
         let allowed = app.detail.as_ref().unwrap().allowed();
         let index = allowed
             .iter()
-            .position(|a| *a == Action::AttentionComplete)
+            .position(|a| *a == Action::ClearAlarm)
             .expect("complete is offered");
         app.handle_key(Key::Char((b'1' + index as u8) as char));
 
@@ -2775,7 +2321,7 @@ mod lifecycle {
 
         let (_, request) = app.take_pending().expect("the verb was sent");
         match request {
-            cyclops_ui::ActionRequest::AttentionComplete { attempt_id } => assert_eq!(
+            cyclops_ui::ActionRequest::ClearAlarm { attempt_id } => assert_eq!(
                 attempt_id,
                 attempt(7),
                 "the verb followed the row instead of the evidence"
@@ -2847,7 +2393,7 @@ mod connection {
         let allowed = app.detail.as_ref().unwrap().allowed();
         let index = allowed
             .iter()
-            .position(|a| *a == Action::AttentionComplete)
+            .position(|a| *a == Action::ClearAlarm)
             .expect("complete is offered");
 
         app.refresh.disconnected();
@@ -2913,7 +2459,7 @@ mod connection {
     fn reconnect_waits_for_a_current_snapshot_before_actions_resume() {
         let mut app = alarmed_app();
         let frozen = app.detail.as_ref().unwrap().target().clone();
-        let action = Action::AttentionComplete;
+        let action = Action::ClearAlarm;
         let index = app
             .detail
             .as_ref()
@@ -2954,7 +2500,7 @@ mod connection {
         app.handle_key(Key::Char('y'));
         let (_, request) = app.take_pending().expect("current evidence can act");
         match request {
-            cyclops_ui::ActionRequest::AttentionComplete { attempt_id } => {
+            cyclops_ui::ActionRequest::ClearAlarm { attempt_id } => {
                 assert_eq!(attempt_id, attempt(7))
             }
             other => panic!("wrong request after refresh: {other:?}"),
@@ -2968,7 +2514,7 @@ mod connection {
     fn snapshot_failure_recovers_only_through_r_and_a_current_snapshot() {
         let mut app = alarmed_app();
         let frozen = app.detail.as_ref().unwrap().target().clone();
-        let action = Action::AttentionComplete;
+        let action = Action::ClearAlarm;
         let index = app
             .detail
             .as_ref()
@@ -3015,7 +2561,7 @@ mod connection {
         app.handle_key(Key::Char('y'));
         let (_, request) = app.take_pending().expect("current evidence can act");
         match request {
-            cyclops_ui::ActionRequest::AttentionComplete { attempt_id } => {
+            cyclops_ui::ActionRequest::ClearAlarm { attempt_id } => {
                 assert_eq!(attempt_id, attempt(7))
             }
             other => panic!("wrong request after failure recovery: {other:?}"),
@@ -3054,7 +2600,7 @@ mod connection {
     #[test]
     fn a_notice_never_replaces_an_actionable_confirmation() {
         let mut app = alarmed_app();
-        let action = Action::AttentionComplete;
+        let action = Action::ClearAlarm;
         let index = app
             .detail
             .as_ref()
@@ -3135,23 +2681,16 @@ mod connection {
     /// on, and a FAILED reload must not quietly declare it current
     /// again.
     #[test]
-    fn stale_evidence_blocks_the_terminal_verbs_until_a_reload_lands() {
+    fn stale_evidence_blocks_the_alarm_verb_until_a_reload_lands() {
         let mut app = alarmed_app();
-        assert!(app
-            .detail
-            .as_ref()
-            .unwrap()
-            .allows(Action::AttentionComplete));
+        assert!(app.detail.as_ref().unwrap().allows(Action::ClearAlarm));
 
         // The row's facts move under the open detail.
         app.apply_messages(&snapshot(10, vec![wire_lifecycle("m-001", Some(8), false)]));
         assert!(app.detail.as_ref().unwrap().evidence_stale());
         assert!(
-            !app.detail
-                .as_ref()
-                .unwrap()
-                .allows(Action::AttentionComplete),
-            "stale checks still offered a terminal verb"
+            !app.detail.as_ref().unwrap().allows(Action::ClearAlarm),
+            "stale evidence still offered the alarm verb"
         );
 
         // The reload fails. Evidence is still stale.
@@ -3161,11 +2700,7 @@ mod connection {
             app.detail.as_ref().unwrap().evidence_stale(),
             "a failed reload declared stale evidence current"
         );
-        assert!(!app
-            .detail
-            .as_ref()
-            .unwrap()
-            .allows(Action::AttentionComplete));
+        assert!(!app.detail.as_ref().unwrap().allows(Action::ClearAlarm));
         // And it does not spin.
         assert!(app.take_detail_read().is_none());
 
@@ -3184,11 +2719,7 @@ mod connection {
             })),
         );
         assert!(!app.detail.as_ref().unwrap().evidence_stale());
-        assert!(app
-            .detail
-            .as_ref()
-            .unwrap()
-            .allows(Action::AttentionComplete));
+        assert!(app.detail.as_ref().unwrap().allows(Action::ClearAlarm));
     }
 }
 
@@ -3243,7 +2774,7 @@ mod messages_keyboard_and_frame {
                 ..Loaded::default()
             })),
         );
-        let action = Action::AttentionComplete;
+        let action = Action::ClearAlarm;
         let index = app
             .detail
             .as_ref()
@@ -3257,7 +2788,7 @@ mod messages_keyboard_and_frame {
         assert!(!app.overlay);
         let notice = build(&mut app, 80, 24).join("\n");
         assert!(notice.contains("detail keys are shown below"), "{notice}");
-        assert!(notice.contains("1 submit staged notification"), "{notice}");
+        assert!(notice.contains("1 clear alarm"), "{notice}");
 
         app.handle_key(Key::Char((b'1' + index as u8) as char));
         let confirming = build(&mut app, 80, 24).join("\n");

@@ -6,15 +6,13 @@ use std::path::Path;
 
 use cyclops_ledger::{now_ms, LedgerError, LedgerWriter};
 use cyclops_proto::{
-    doorbell_format_names_exact_attempt, Kind, LedgerLine, MailboxEntry, MailboxEntryState,
-    MailboxFact, MessageId, MessageMetadata, MessagePresentation, MessageWakeBlock,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBarrierRetirementCause,
+    Kind, LedgerLine, MailboxEntryState, MailboxFact, MessageId, MessageMetadata,
+    MessagePresentation, MessageWakeBlock, NotificationAttemptId, NotificationAttentionCause,
     NotificationBinding, NotificationFact, NotificationPreWriteCause,
-    NotificationPreWriteObservation, NotificationRecord, NotificationRequeue,
-    NotificationResolution, NotificationResolutionConsumptionObservation, NotificationState,
-    NotificationTransport, NotificationVerifyOutcome, RecipientKey, WorkspaceId,
+    NotificationPreWriteObservation, NotificationRecord, NotificationRequeue, NotificationState,
+    NotificationTransport, NotificationVerifyOutcome, RecipientKey, VerifiedBy, WorkspaceId,
     CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
-    DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    DOORBELL_FORMAT_COMPACT_CLAIM,
 };
 use cyclops_state::StateRoot;
 
@@ -27,10 +25,6 @@ pub struct MessageStore {
     pub(crate) fail_notification_recovery_append: Option<NotificationAttemptId>,
     #[cfg(test)]
     pub(crate) fail_batch_append: bool,
-    #[cfg(test)]
-    pub(crate) fail_claimed_staged_clear_appends: usize,
-    #[cfg(test)]
-    pub(crate) fail_claimed_ack_timeout_reconciliation_appends: usize,
     #[cfg(test)]
     pub(crate) fail_pre_write_block_appends: usize,
 }
@@ -71,10 +65,6 @@ impl MessageStore {
             #[cfg(test)]
             fail_batch_append: false,
             #[cfg(test)]
-            fail_claimed_staged_clear_appends: 0,
-            #[cfg(test)]
-            fail_claimed_ack_timeout_reconciliation_appends: 0,
-            #[cfg(test)]
             fail_pre_write_block_appends: 0,
         })
     }
@@ -98,21 +88,6 @@ impl MessageStore {
         attempt_id: NotificationAttemptId,
     ) {
         self.fail_notification_recovery_append = Some(attempt_id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_next_claimed_staged_clear_append_failure(&mut self) {
-        self.fail_claimed_staged_clear_appends = 1;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_claimed_staged_clear_append_failures(&mut self, count: usize) {
-        self.fail_claimed_staged_clear_appends = count;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_next_claimed_ack_timeout_reconciliation_append_failure(&mut self) {
-        self.fail_claimed_ack_timeout_reconciliation_appends = 1;
     }
 
     #[cfg(test)]
@@ -146,6 +121,7 @@ impl MessageStore {
             client_key: draft.client_key,
             supersedes: draft.supersedes,
             presentation: draft.presentation,
+            raw: draft.raw,
         };
         self.accept_canonical_at(message_id, draft, ts)
     }
@@ -185,6 +161,7 @@ impl MessageStore {
                     label: draft.recipient_label,
                 }],
             },
+            raw: draft.raw,
         };
         self.accept_canonical_at(message_id, canonical, ts)
     }
@@ -237,6 +214,7 @@ impl MessageStore {
             client_key: draft.client_key.clone(),
             request_digest,
             supersedes: draft.supersedes.clone(),
+            raw: draft.raw,
         };
         let (_, recipient_labels) = presentation_labels(&draft.recipients, &draft.presentation)?;
         let recipient_keys = metadata.recipients.clone();
@@ -361,12 +339,6 @@ impl MessageStore {
                             && prior_claim_seq == Some(record.updated_seq)))
             })
             .map(|record| record.attempt_id);
-        let claimed_ack_timeout_attempt = self
-            .projection
-            .notification(entry.recipient, &message_id)
-            .filter(|record| record.needs_claimed_ack_timeout_reconciliation())
-            .map(|record| record.attempt_id);
-
         match &entry.state {
             MailboxEntryState::Pending => {}
             MailboxEntryState::Claimed {
@@ -378,7 +350,6 @@ impl MessageStore {
                         message,
                         withdrawn_attempt: None,
                         consumed_doorbell_attempt,
-                        claimed_ack_timeout_attempt: None,
                     });
                 }
                 return Err(MailboxError::AlreadyClaimed {
@@ -438,7 +409,6 @@ impl MessageStore {
             skipped_oldest,
             withdrawn_attempt,
             consumed_doorbell_attempt,
-            claimed_ack_timeout_attempt,
         })
     }
 
@@ -460,22 +430,16 @@ impl MessageStore {
         )
     }
 
-    pub fn mark_delivered_direct(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<MailboxEntry, MessageStoreError> {
-        self.mark_delivered_direct_at(message_id, recipient, attempt_id, now_ms())
-    }
-
+    /// Replay only: no longer written since 1.1.0. Tests seed the fact an
+    /// older daemon wrote for a direct payload delivery.
+    #[cfg(test)]
     pub(crate) fn mark_delivered_direct_at(
         &mut self,
         message_id: MessageId,
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
         ts: u64,
-    ) -> Result<MailboxEntry, MessageStoreError> {
+    ) -> Result<cyclops_proto::MailboxEntry, MessageStoreError> {
         if let Some(entry) = self.projection.get_entry(recipient, &message_id) {
             if matches!(
                 entry.state,
@@ -538,31 +502,6 @@ impl MessageStore {
         )
     }
 
-    /// Record one post-write verification failure with its content-free evidence.
-    pub fn advance_notification_with_verify_outcome(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        outcome: NotificationVerifyOutcome,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        self.append_notification_transition_full_at(
-            message_id,
-            recipient,
-            attempt_id,
-            NotificationState::AttentionRequired,
-            None,
-            None,
-            None,
-            Some(NotificationAttentionCause::VerifyFailed),
-            Some(outcome),
-            None,
-            None,
-            None,
-            now_ms(),
-        )
-    }
-
     /// Stop one exact attempt before any terminal write.
     pub fn block_notification_before_write(
         &mut self,
@@ -611,6 +550,7 @@ impl MessageStore {
             None,
             None,
             None,
+            None,
             Some(cause),
             wake_block,
             observation,
@@ -649,6 +589,55 @@ impl MessageStore {
             Some(binding),
             Some(transport),
             doorbell_format,
+            None,
+            now_ms(),
+        )
+    }
+
+    /// The raw write boundary. The transport is fixed at Writing like a
+    /// doorbell's, but nothing about the occupant was proven, so the record
+    /// carries no binding and no format.
+    pub(crate) fn advance_notification_raw_writing(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        self.append_notification_transition_with_transport_at(
+            message_id,
+            recipient,
+            attempt_id,
+            NotificationState::Writing,
+            None,
+            Some(NotificationTransport::Raw),
+            None,
+            None,
+            now_ms(),
+        )
+    }
+
+    /// The receipt, or the honest absence of one: `verified_by` names what
+    /// proved the doorbell was consumed, and None says nothing did.
+    pub(crate) fn advance_notification_notified(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        verified_by: Option<VerifiedBy>,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        self.append_notification_transition_full_at(
+            message_id,
+            recipient,
+            attempt_id,
+            NotificationState::Notified,
+            None,
+            None,
+            None,
+            None,
+            verified_by,
+            None,
+            None,
+            None,
             None,
             now_ms(),
         )
@@ -695,6 +684,7 @@ impl MessageStore {
             transport,
             doorbell_format,
             cause,
+            None,
             verify_outcome,
             None,
             None,
@@ -714,6 +704,7 @@ impl MessageStore {
         transport: Option<NotificationTransport>,
         doorbell_format: Option<u32>,
         cause: Option<NotificationAttentionCause>,
+        verified_by: Option<VerifiedBy>,
         verify_outcome: Option<NotificationVerifyOutcome>,
         pre_write_cause: Option<NotificationPreWriteCause>,
         wake_block: Option<MessageWakeBlock>,
@@ -730,56 +721,13 @@ impl MessageStore {
             transport,
             doorbell_format,
             cause,
+            verified_by,
             verify_outcome,
             pre_write_cause,
             wake_block,
             pre_write_observation: pre_write_observation.map(Box::new),
         };
         self.append_notification_fact_at(message_id, recipient, fact, ts)
-    }
-
-    /// Spend the single reminder allowance for one exact pending doorbell.
-    ///
-    /// Obsolete timers are normal: a claim, withdrawal, or replacement may
-    /// win before the deadline. Those cases return `None` without appending.
-    pub(crate) fn queue_unclaimed_reminder(
-        &mut self,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<Option<NotificationRecord>, MessageStoreError> {
-        self.queue_unclaimed_reminder_at(attempt_id, now_ms())
-    }
-
-    pub(crate) fn queue_unclaimed_reminder_at(
-        &mut self,
-        attempt_id: NotificationAttemptId,
-        ts: u64,
-    ) -> Result<Option<NotificationRecord>, MessageStoreError> {
-        let Some(current) = self.projection.notification_by_attempt(attempt_id).cloned() else {
-            return Ok(None);
-        };
-        let pending = self
-            .projection
-            .get_entry(current.recipient, &current.message_id)
-            .is_some_and(|entry| entry.state.is_pending());
-        if !pending
-            || current.state != NotificationState::Notified
-            || current.transport != NotificationTransport::Doorbell
-            || current.unclaimed_reminder_count != 0
-            || self
-                .projection
-                .active_notification_barriers
-                .contains_key(&attempt_id)
-        {
-            return Ok(None);
-        }
-        let fact = NotificationFact::NotificationUnclaimedReminderQueued {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: current.message_id.clone(),
-            recipient: current.recipient,
-        };
-        self.append_notification_fact_at(current.message_id, current.recipient, fact, ts)
-            .map(Some)
     }
 
     /// Start a new queued attempt after an operator explicitly requeues attention.
@@ -1061,204 +1009,6 @@ impl MessageStore {
             .expect("prepared withdrawal retains its notification"))
     }
 
-    pub(crate) fn resolve_notification(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let fact = NotificationFact::NotificationResolved {
-            record_version: CANONICAL_RECORD_VERSION,
-            proof_version: NOTIFICATION_RESOLUTION_PROOF_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn resolve_notification_without_terminal_action(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let fact = NotificationFact::NotificationResolvedWithoutTerminalAction {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution: NotificationResolution::Discard,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn record_notification_resolution_intent(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        self.record_notification_resolution_intent_kind(
-            message_id, recipient, attempt_id, resolution, false,
-        )
-    }
-
-    pub(crate) fn record_forced_notification_resolution_intent(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        self.record_notification_resolution_intent_kind(
-            message_id, recipient, attempt_id, resolution, true,
-        )
-    }
-
-    /// Append the forced Complete key reservation after validating its claim
-    /// ordering boundary in this same store instance.
-    pub(crate) fn reserve_forced_notification_resolution_action(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let already_reserved = self
-            .projection
-            .validate_forced_notification_resolution_action_reservation(
-                &message_id,
-                recipient,
-                attempt_id,
-                NotificationResolution::Complete,
-            )?;
-        if already_reserved {
-            return Ok(self
-                .projection
-                .notification(recipient, &message_id)
-                .expect("validated forced reservation retains its notification")
-                .clone());
-        }
-        let fact = NotificationFact::NotificationResolutionActionReserved {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution: NotificationResolution::Complete,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn record_notification_resolution_intent_kind(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-        forced: bool,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let fact = NotificationFact::NotificationResolutionIntent {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution,
-            forced,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn record_notification_resolution_action_accepted(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let already_recorded = self
-            .projection
-            .validate_notification_resolution_action_accepted(
-                &message_id,
-                recipient,
-                attempt_id,
-                resolution,
-            )?;
-        if already_recorded {
-            return Ok(self
-                .projection
-                .notification(recipient, &message_id)
-                .expect("validated action acceptance retains its notification")
-                .clone());
-        }
-        let fact = NotificationFact::NotificationResolutionActionAccepted {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn record_notification_resolution_consumption_observed(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        observation: NotificationResolutionConsumptionObservation,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        if !observation.evidence.proves_exact_consumption() {
-            return Err(MailboxError::InvalidNotificationFact(
-                "new resolution consumption facts require exact causal evidence".into(),
-            )
-            .into());
-        }
-        let already_recorded = self
-            .projection
-            .validate_notification_resolution_consumption_observed(
-                &message_id,
-                recipient,
-                attempt_id,
-                observation,
-            )?;
-        if already_recorded {
-            return Ok(self
-                .projection
-                .notification(recipient, &message_id)
-                .expect("validated consumption observation retains its notification")
-                .clone());
-        }
-        let fact = NotificationFact::NotificationResolutionConsumptionObserved {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            evidence: observation.evidence,
-            observed_at_ms: observation.observed_at_ms,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
-    pub(crate) fn withdraw_notification_resolution_intent(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        resolution: NotificationResolution,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        let fact = NotificationFact::NotificationResolutionIntentWithdrawn {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            resolution,
-        };
-        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
-    }
-
     pub(crate) fn append_notification_fact_at(
         &mut self,
         message_id: MessageId,
@@ -1309,207 +1059,6 @@ impl MessageStore {
             .expect("prepared notification retains its record"))
     }
 
-    /// Settle a claimed staged doorbell and retire its barrier in one fact.
-    ///
-    /// The caller owns either the external exact-clear proof or the crash
-    /// recovery proof of the same binding plus a visible empty composer. This
-    /// append changes both projections or neither, so an IO failure leaves the
-    /// staged attempt as the recipient FIFO owner.
-    pub(crate) fn settle_claimed_staged_clear(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        if let Some(current) =
-            self.projection
-                .notification(recipient, &message_id)
-                .filter(|record| {
-                    record.attempt_id == attempt_id
-                        && record.state == NotificationState::WithdrawnAfterStaging
-                })
-        {
-            let claimed_by_recipient = self
-                .projection
-                .get_entry(recipient, &message_id)
-                .is_some_and(|entry| {
-                    matches!(
-                        &entry.state,
-                        MailboxEntryState::Claimed { claimant, .. } if *claimant == recipient
-                    )
-                });
-            if current.transport != NotificationTransport::Doorbell
-                || !claimed_by_recipient
-                || self
-                    .projection
-                    .active_notification_barriers
-                    .contains_key(&attempt_id)
-            {
-                return Err(MailboxError::InvalidNotificationFact(
-                    "settled claimed staged clear has inconsistent projection state".into(),
-                )
-                .into());
-            }
-            return Ok(current.clone());
-        }
-
-        let fact = NotificationFact::NotificationClaimedStagedCleared {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-        };
-        let line = LedgerLine {
-            seq: self.writer.next_seq(),
-            boot_id: self.writer.boot_id().to_string(),
-            id: message_id.to_string(),
-            ts: now_ms().max(1),
-            kind: Kind::State,
-            from: "cyclopsd".into(),
-            to: vec![recipient.to_string()],
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(serde_json::to_value(fact)?),
-        };
-        let prepared = self.projection.prepare_line(&line)?;
-        #[cfg(test)]
-        if self.fail_claimed_staged_clear_appends > 0 {
-            self.fail_claimed_staged_clear_appends -= 1;
-            return Err(LedgerError::Io {
-                path: self.writer.path().to_path_buf(),
-                source: std::io::Error::other(
-                    "injected claimed staged clear journal append failure",
-                ),
-            }
-            .into());
-        }
-        let persisted = self.writer.append(line)?;
-        self.projection.commit_line(persisted, prepared);
-        Ok(self
-            .projection
-            .notification(recipient, &message_id)
-            .cloned()
-            .expect("claimed staged clear retains its notification record"))
-    }
-
-    /// Settle a claimed exact-attempt ACK timeout after composer reconciliation.
-    ///
-    /// The dedicated identity-only fact moves the notification to Notified and
-    /// retires its barrier together. Until that append succeeds, the alarm
-    /// remains visible and the attempt remains the recipient FIFO owner.
-    pub(crate) fn settle_claimed_ack_timeout_reconciliation(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<NotificationRecord, MessageStoreError> {
-        if self
-            .projection
-            .claimed_ack_timeout_reconciliations
-            .contains(&attempt_id)
-        {
-            let current = self
-                .projection
-                .notification(recipient, &message_id)
-                .filter(|record| {
-                    record.attempt_id == attempt_id
-                        && record.state == NotificationState::Notified
-                        && record.transport == NotificationTransport::Doorbell
-                        && doorbell_format_names_exact_attempt(record.doorbell_format)
-                        && !self
-                            .projection
-                            .active_notification_barriers
-                            .contains_key(&attempt_id)
-                })
-                .ok_or_else(|| {
-                    MailboxError::InvalidNotificationFact(
-                        "settled ACK-timeout reconciliation has inconsistent projection state"
-                            .into(),
-                    )
-                })?;
-            return Ok(current.clone());
-        }
-
-        let fact = NotificationFact::NotificationClaimedAckTimeoutReconciled {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-        };
-        let line = LedgerLine {
-            seq: self.writer.next_seq(),
-            boot_id: self.writer.boot_id().to_string(),
-            id: message_id.to_string(),
-            ts: now_ms().max(1),
-            kind: Kind::State,
-            from: "cyclopsd".into(),
-            to: vec![recipient.to_string()],
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(serde_json::to_value(fact)?),
-        };
-        let prepared = self.projection.prepare_line(&line)?;
-        #[cfg(test)]
-        if self.fail_claimed_ack_timeout_reconciliation_appends > 0 {
-            self.fail_claimed_ack_timeout_reconciliation_appends -= 1;
-            return Err(LedgerError::Io {
-                path: self.writer.path().to_path_buf(),
-                source: std::io::Error::other(
-                    "injected claimed ACK-timeout reconciliation journal append failure",
-                ),
-            }
-            .into());
-        }
-        let persisted = self.writer.append(line)?;
-        self.projection.commit_line(persisted, prepared);
-        Ok(self
-            .projection
-            .notification(recipient, &message_id)
-            .cloned()
-            .expect("ACK-timeout reconciliation retains its notification record"))
-    }
-
-    /// Retire one active composer barrier after external safety proof.
-    pub(crate) fn retire_notification_barrier(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        cause: NotificationBarrierRetirementCause,
-        replacement: Option<NotificationBinding>,
-    ) -> Result<(), MessageStoreError> {
-        let fact = NotificationFact::NotificationBarrierRetired {
-            record_version: CANONICAL_RECORD_VERSION,
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            cause,
-            replacement,
-        };
-        let line = LedgerLine {
-            seq: self.writer.next_seq(),
-            boot_id: self.writer.boot_id().to_string(),
-            id: message_id.to_string(),
-            ts: now_ms().max(1),
-            kind: Kind::State,
-            from: "cyclopsd".into(),
-            to: vec![recipient.to_string()],
-            subject: None,
-            body: None,
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: Some(serde_json::to_value(fact)?),
-        };
-        let prepared = self.projection.prepare_line(&line)?;
-        let persisted = self.writer.append(line)?;
-        self.projection.commit_line(persisted, prepared);
-        Ok(())
-    }
-
     /// Resolve post-write attempts left ambiguous by a daemon restart.
     ///
     /// Opening a store only replays. Daemon startup calls this explicitly
@@ -1539,34 +1088,31 @@ impl MessageStore {
                 .projection
                 .get_entry(record.recipient, &record.message_id)
                 .is_some_and(|entry| entry.state.is_claimed());
-            if record.state == NotificationState::Staged
-                && record.transport == NotificationTransport::Doorbell
-                && claimed
-            {
-                // Claim won before terminal submit intent. Preserve Staged and
-                // its binding so the exact attempt can resume clear proof.
-                continue;
-            }
-            let (state, cause) = if (record.state == NotificationState::Submitted
+            // A claim after Enter is the receipt. Everything else from the
+            // paste onward closes to attention: no hold is restored, and the
+            // next doorbell for the recipient goes through the ordinary
+            // gate, where a line left in the composer reads as human input.
+            if (record.state == NotificationState::Submitted
                 || record.state == NotificationState::SubmittedUnverified)
                 && record.transport == NotificationTransport::Doorbell
                 && claimed
             {
-                (NotificationState::Notified, None)
+                recovered.push(self.advance_notification_notified(
+                    record.message_id,
+                    record.recipient,
+                    record.attempt_id,
+                    None,
+                )?);
             } else {
-                (
+                recovered.push(self.advance_notification(
+                    record.message_id,
+                    record.recipient,
+                    record.attempt_id,
                     NotificationState::AttentionRequired,
+                    None,
                     Some(NotificationAttentionCause::DaemonRestart),
-                )
-            };
-            recovered.push(self.advance_notification(
-                record.message_id,
-                record.recipient,
-                record.attempt_id,
-                state,
-                None,
-                cause,
-            )?);
+                )?);
+            }
         }
         Ok(recovered)
     }

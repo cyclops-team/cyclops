@@ -1739,7 +1739,7 @@ fn vendor_between_observed<'a>(
 /// name.
 pub(crate) fn is_vendor_now(inner: &Inner, pid: i32) -> crate::identity::Vendorship {
     use crate::identity::Vendorship;
-    match vendor_read(inner, pid, argv_basename, crate::identity::proc_facts) {
+    match vendor_read(inner, pid, argv_line, crate::identity::proc_facts) {
         VendorRead::Vendor(_, _) => Vendorship::Vendor,
         VendorRead::NotVendor => Vendorship::NotVendor,
         VendorRead::Unprovable => Vendorship::Unprovable,
@@ -1752,7 +1752,7 @@ fn argv_live<'a>(
     pid: i32,
 ) -> Option<(&'a Manifest, crate::identity::ProcId)> {
     let _ = pane_id;
-    match vendor_read(inner, pid, argv_basename, crate::identity::proc_facts) {
+    match vendor_read(inner, pid, argv_line, crate::identity::proc_facts) {
         VendorRead::Vendor(m, proc) => Some((m, proc)),
         VendorRead::NotVendor | VendorRead::Unprovable => None,
     }
@@ -1764,7 +1764,7 @@ fn argv_live_observed<'a>(
     pid: i32,
 ) -> crate::identity::VendorAncestor<(&'a Manifest, crate::identity::ProcId)> {
     let _ = pane_id;
-    match vendor_read(inner, pid, argv_basename, crate::identity::proc_facts) {
+    match vendor_read(inner, pid, argv_line, crate::identity::proc_facts) {
         VendorRead::Vendor(manifest, process) => {
             crate::identity::VendorAncestor::Vendor((manifest, process))
         }
@@ -1816,7 +1816,7 @@ where
     if before.1 != unsafe { libc::getuid() } {
         return VendorRead::NotVendor;
     }
-    let Some(base) = read_argv(pid) else {
+    let Some(argv) = read_argv(pid) else {
         return VendorRead::Unprovable;
     };
     // Both halves are re-proven across the argv read, for the same reason
@@ -1826,7 +1826,7 @@ where
         return VendorRead::Unprovable;
     }
     let proc = before.0;
-    match manifest_for_basename(&inner.manifests, &base) {
+    match manifest_for_argv(&inner.manifests, &argv) {
         Some(m) => VendorRead::Vendor(m, proc),
         None => VendorRead::NotVendor,
     }
@@ -1976,6 +1976,35 @@ fn composer_hold_carried_entry<'a>(
     })
 }
 
+/// The exact durable recipient this watcher observation describes: the
+/// adopted route whose pane root is the process in the pane now.
+fn pane_recipient(
+    inner: &Inner,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    row: &PaneRow,
+) -> Option<RecipientKey> {
+    let slot = inner.session(session_idx)?;
+    let session_instance_id = {
+        let link = slot.link.lock().expect("session link lock");
+        let current = link.watcher.as_ref()?;
+        if !link.attached
+            || current.session_id() != watcher.session_id()
+            || current.session() != watcher.session()
+        {
+            return None;
+        }
+        link.identity.as_ref()?.session_instance_id()
+    };
+    let pane = row.pane_id.parse::<cyclops_proto::TmuxPaneId>().ok()?;
+    let root = crate::identity::ProcId::of(row.pane_pid)?;
+    let pane_root = ProcessInstanceId::new(root.pid, root.birth).ok()?;
+    let recipient = RecipientKey::agent(inner.workspace_id, session_instance_id, pane);
+    inner
+        .adoption_for_observed_route(recipient, &row.pane_id, pane_root)
+        .map(|_| recipient)
+}
+
 /// The current binding of a pane, or None if any part of it could not be
 /// proven now.
 pub(crate) fn admitted_binding(
@@ -2000,6 +2029,17 @@ pub(crate) fn manifest_for_basename<'a>(
         m.agent.argv_basenames.iter().any(|name| name == base)
             || m.agent.process_names.iter().any(|name| name == base)
     })
+}
+
+/// The manifest that claims what a ps args line runs: the script behind
+/// an interpreter first, then the interpreter itself.
+pub(crate) fn manifest_for_argv<'a>(
+    manifests: &'a BTreeMap<String, Manifest>,
+    args_line: &str,
+) -> Option<&'a Manifest> {
+    argv_programs(args_line)
+        .into_iter()
+        .find_map(|base| manifest_for_basename(manifests, &base))
 }
 
 /// The pid whose argv says what a pane is RUNNING.
@@ -2034,8 +2074,8 @@ pub(crate) fn foreground_pid(pane_pid: i32) -> i32 {
 /// The same lookup, with the observation failure kept separate from the
 /// answer.
 ///
-/// [`foreground_pid`] reports the pane root when `ps` cannot be read. That
-/// is right for BINDING a manifest: a pane nobody can observe binds
+/// [`foreground_pid`] reports the pane root when the kernel record cannot
+/// be read. That is right for BINDING a manifest: a pane nobody can observe binds
 /// nothing new, and the shell is the honest fallback identity. It is wrong
 /// for holding a pin. A caller comparing a stored agent pid against a
 /// silently substituted shell pid compares two different domains and gets
@@ -2079,14 +2119,7 @@ pub(crate) fn occupant_of(pane_pid: i32) -> Occupant {
 }
 
 pub(crate) fn foreground_pid_checked(pane_pid: i32) -> Option<i32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "tpgid=", "-p", &pane_pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_tpgid(&String::from_utf8_lossy(&out.stdout))
+    crate::identity::foreground_group(pane_pid)
 }
 
 /// Change a pane's hold, but only if a named delivery still owns it.
@@ -2128,11 +2161,6 @@ pub(crate) fn set_hold_owned(
         }
         let prior_ready = readiness_key(entry);
         entry.hold = hold;
-        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
-            entry.final_submit_conflict_owner.take(),
-            entry.hold,
-            entry.hold_owner.as_deref(),
-        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2202,11 +2230,6 @@ pub(crate) fn bind_turn(
         if entry.hold.is_waiting() {
             entry.hold = ComposerHold::TurnStarted { since_ms };
         }
-        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
-            entry.final_submit_conflict_owner.take(),
-            entry.hold,
-            entry.hold_owner.as_deref(),
-        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (
             prior_ready,
@@ -2273,11 +2296,6 @@ pub(crate) fn claim_hold(
         let prior_ready = readiness_key(entry);
         entry.hold_owner = Some(owner.to_string());
         entry.hold = ComposerHold::Staged;
-        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
-            entry.final_submit_conflict_owner.take(),
-            entry.hold,
-            entry.hold_owner.as_deref(),
-        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2313,7 +2331,6 @@ pub(crate) fn release_unwritten_hold(
         let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
-        entry.final_submit_conflict_owner = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2339,7 +2356,6 @@ pub(crate) fn clear_hold_owner(
         let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
-        entry.final_submit_conflict_owner = None;
         entry.turn = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
@@ -2348,295 +2364,26 @@ pub(crate) fn clear_hold_owner(
     true
 }
 
-/// Confirm that a guarded resolution still owns the staged composer.
+/// Is the pane's composer held against a doorbell?
 ///
-/// Exact payload capture proves the bytes. This check proves that no live
-/// lifecycle or blocked-state evidence makes a terminal key unsafe.
-pub(crate) fn staged_action_ready(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    owner: &str,
-    agent: cyclops_proto::ProcessInstanceId,
-    manifest: &str,
-) -> bool {
-    let expected = crate::identity::ProcId {
-        pid: agent.pid(),
-        birth: agent.birth(),
-    };
-    let map = inner.detections.lock().expect("detections lock");
-    map.get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| staged_entry_ready(entry, owner, expected, manifest))
-}
-
-/// Confirm that one ordinary notification may submit an exact, still-owned
-/// staged doorbell even when a vendor's short screen projection cannot classify
-/// the composer. The delivery path separately re-proves the visible bytes and
-/// rejects every known blocked manifest state. This predicate keeps that
-/// narrow exception tied to the current pane, process generation, manifest,
-/// hold owner, freshness, and final-submit conflict marker.
-pub(crate) fn staged_exact_submit_ready(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    owner: &str,
-    agent: cyclops_proto::ProcessInstanceId,
-    manifest: &str,
-) -> bool {
-    let expected = crate::identity::ProcId {
-        pid: agent.pid(),
-        birth: agent.birth(),
-    };
-    let map = inner.detections.lock().expect("detections lock");
-    map.get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| staged_entry_exact_submit_ready(entry, owner, expected, manifest))
-}
-
-/// Confirm that a Working-plus-clean notification may submit its one exact
-/// staged doorbell. The caller separately proves the final bytes and carries
-/// the pre-paste clean-composer admission; this predicate makes sure fusion
-/// has not since learned a live lifecycle, mode, or sensor conflict.
-pub(crate) fn staged_working_clean_action_ready(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    owner: &str,
-    agent: cyclops_proto::ProcessInstanceId,
-    manifest: &str,
-) -> bool {
-    let expected = crate::identity::ProcId {
-        pid: agent.pid(),
-        birth: agent.birth(),
-    };
-    let map = inner.detections.lock().expect("detections lock");
-    map.get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| {
-            staged_entry_working_clean_action_ready(entry, owner, expected, manifest)
-        })
-}
-
-/// Record a confirmed, exactly keyed terminal edge that arrived after one
-/// exact doorbell was staged, but before its one final Enter. The edge cannot
-/// authorize a write and it does not change public pane state. It only
-/// prevents that same in-flight Working-submit path from treating its earlier
-/// admission as current after the terminal fact arrived.
-///
-/// A report origin is already authenticated to this pane route, root, agent,
-/// and manifest. Match that cached route here so an old end cannot attach
-/// itself to another attempt that later occupies the pane. The final action
-/// gate separately re-proves the complete current binding.
-pub(crate) fn record_final_submit_conflict(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    pane_root: crate::identity::ProcId,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> Option<String> {
-    let mut map = inner.detections.lock().expect("detections lock");
-    let entry = map.get_mut(&PaneKey::new(session_idx, pane_id))?;
-    let binding = entry.binding.as_ref()?;
-    let owner = entry.hold_owner.clone()?;
-    let exact_staged_owner = matches!(
-        entry.hold,
-        ComposerHold::Staged | ComposerHold::StagedDuringTurn
-    ) && entry.agent == Some(agent)
-        && entry.manifest.as_deref() == Some(manifest)
-        && binding.pane_root == pane_root
-        && binding.agent == agent
-        && binding.manifest == manifest;
-    if exact_staged_owner {
-        entry.final_submit_conflict_owner = Some(owner.clone());
-        Some(owner)
-    } else {
-        None
-    }
-}
-
-/// Does the pane hold an unsubmitted draft or active human typing?
-///
-/// An active agent turn (TurnStarted) with no hold owner is an active process,
-/// not an unsubmitted draft. True human typing or staged content requires
-/// Staged, StagedDuringTurn, or explicit HumanInput / IdleWithInput semantics.
-pub(crate) fn composer_has_unsubmitted_draft(
-    inner: &Inner,
-    session_idx: usize,
-    pane_id: &str,
-) -> bool {
+/// A positively observed human draft holds. So does a hold a delivery
+/// owns: a doorbell staged and not yet consumed, or the turn that consumed
+/// it and has not ended. A turn nobody owns is the agent working on its own
+/// input, and ambiguous or absent composer evidence is not a hold.
+pub(crate) fn composer_is_held(inner: &Inner, session_idx: usize, pane_id: &str) -> bool {
     let map = inner.detections.lock().expect("detections lock");
     let Some(entry) = map.get(&PaneKey::new(session_idx, pane_id)) else {
         return false;
     };
-    matches!(
-        entry.hold,
-        ComposerHold::Staged | ComposerHold::StagedDuringTurn
-    ) || entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+    match entry.hold {
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn => return true,
+        ComposerHold::TurnStarted { .. } if entry.hold_owner.is_some() => return true,
+        ComposerHold::TurnStarted { .. } | ComposerHold::Clear => {}
+    }
+    entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput)
         || entry.detection.state == AgentState::IdleWithInput
 }
 
-/// Keep a final-submit conflict only while it still names this exact staged
-/// barrier. A pane may keep the same agent and manifest while a different
-/// delivery claims its composer, so the owner comparison is essential.
-fn retained_final_submit_conflict_owner(
-    conflict_owner: Option<String>,
-    hold: ComposerHold,
-    hold_owner: Option<&str>,
-) -> Option<String> {
-    conflict_owner.filter(|conflict_owner| {
-        matches!(hold, ComposerHold::Staged | ComposerHold::StagedDuringTurn)
-            && hold_owner == Some(conflict_owner.as_str())
-    })
-}
-
-fn staged_entry_ready(
-    entry: &DetEntry,
-    owner: &str,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> bool {
-    staged_entry_binding_ready(entry, owner, agent, manifest) && staged_frame_is_quiet(entry)
-}
-
-fn staged_entry_binding_ready(
-    entry: &DetEntry,
-    owner: &str,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> bool {
-    matches!(
-        entry.hold,
-        ComposerHold::Staged | ComposerHold::StagedDuringTurn
-    ) && entry.hold_owner.as_deref() == Some(owner)
-        && entry.agent == Some(agent)
-        && entry.manifest.as_deref() == Some(manifest)
-        && !entry.in_mode
-        && !entry.detection.stale
-}
-
-fn staged_entry_exact_submit_ready(
-    entry: &DetEntry,
-    owner: &str,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> bool {
-    staged_entry_binding_ready(entry, owner, agent, manifest)
-        && entry.detection.state != AgentState::Working
-        && entry.final_submit_conflict_owner.as_deref() != Some(owner)
-}
-
-/// The Working-plus-clean submit path may retain its own barrier after fusion
-/// sees the exact staged doorbell as input during the already-running turn.
-/// That observation changes `Staged` to `StagedDuringTurn`; it does not make
-/// a human draft safe. The in-flight path separately carries its pre-paste
-/// clean admission. A later quiet frame can re-open only this exact owner,
-/// whose ordinary reconciliation re-proves the current binding and bytes.
-fn staged_entry_working_clean_binding_ready(
-    entry: &DetEntry,
-    owner: &str,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> bool {
-    matches!(
-        entry.hold,
-        ComposerHold::Staged | ComposerHold::StagedDuringTurn
-    ) && entry.hold_owner.as_deref() == Some(owner)
-        && entry.agent == Some(agent)
-        && entry.manifest.as_deref() == Some(manifest)
-        && !entry.in_mode
-        && !entry.detection.stale
-}
-
-/// The staged doorbell itself may legitimately make the screen's composer
-/// rule read idle-with-input, but the live runtime must still be an explicitly
-/// current, conflict-free Working frame. A confirmed, exactly keyed Stop may
-/// later be superseded in public detection, so its exact attempt marker below
-/// independently denies the final Enter.
-fn staged_entry_working_clean_action_ready(
-    entry: &DetEntry,
-    owner: &str,
-    agent: crate::identity::ProcId,
-    manifest: &str,
-) -> bool {
-    let permitted_staged_block = matches!(
-        entry.detection.write_block.as_deref(),
-        Some("working" | "composer_hold" | "no_write_safe_composer_evidence")
-    );
-    let current_screen_working =
-        entry.detection.readings.iter().any(|reading| {
-            reading.sensor == Sensor::Screen && reading.state == AgentState::Working
-        });
-    let no_live_conflict = entry.detection.readings.iter().all(|reading| {
-        reading.state == AgentState::Working
-            || (reading.sensor == Sensor::Screen
-                && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
-    });
-    staged_entry_working_clean_binding_ready(entry, owner, agent, manifest)
-        && entry.detection.state == AgentState::Working
-        && !entry.detection.disagreement
-        && permitted_staged_block
-        && current_screen_working
-        && no_live_conflict
-        && entry.final_submit_conflict_owner.as_deref() != Some(owner)
-}
-
-/// Release this attempt's composer barrier after a guarded resolution.
-///
-/// The caller has already proved the exact composer bytes. This final
-/// check keeps the release bound to the process generation and manifest
-/// recorded before the paste, so it cannot clear another occupant's hold.
-/// The exact settlement may race a lifecycle recompute that promotes the
-/// owned hold after the composer was cleared. That promotion must not leave
-/// an already-settled notification blocking the pane.
-pub(crate) async fn resolve_staged_hold(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    owner: &str,
-    agent: cyclops_proto::ProcessInstanceId,
-    manifest: &str,
-) -> bool {
-    let pane = PaneKey::new(session_idx, pane_id);
-    let recompute_gate = inner.pane_observation_runtime.recompute_gate(&pane);
-    let _recompute_guard = recompute_gate.lock().await;
-    let expected = crate::identity::ProcId {
-        pid: agent.pid(),
-        birth: agent.birth(),
-    };
-    let (prior_ready, now_key, det) = {
-        let mut map = inner.detections.lock().expect("detections lock");
-        let Some(entry) = map.get_mut(&pane) else {
-            return false;
-        };
-        if entry.hold == ComposerHold::Clear
-            || entry.hold_owner.as_deref() != Some(owner)
-            || entry.agent != Some(expected)
-            || entry.manifest.as_deref() != Some(manifest)
-        {
-            return false;
-        }
-        if let Some(turn) = entry.turn.as_ref() {
-            turnkey::PaneEnds::retire(
-                &mut inner.turn_ends.lock().expect("turn ends lock"),
-                &pane,
-                expected,
-                manifest,
-                turn,
-            );
-        }
-        let prior_ready = readiness_key(entry);
-        entry.hold = ComposerHold::Clear;
-        entry.hold_owner = None;
-        entry.final_submit_conflict_owner = None;
-        entry.turn = None;
-        entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, readiness_key(entry), entry.detection.clone())
-    };
-    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
-    true
-}
-
-/// Wake anyone gating on this pane's readiness when the answer moved.
-///
 /// Broadcast only. Runtime state and write-readiness move independently,
 /// so a pane can refuse and then allow with no state edge between: a
 /// composer hold lifting is exactly that shape, and a delivery sleeping
@@ -2648,58 +2395,9 @@ pub(crate) async fn resolve_staged_hold(
 /// token may still reconcile it. Tokenless status, lifecycle, and synthetic
 /// captures are observational only and never create route evidence.
 ///
-/// What a readiness wake compares: the public write verdict and, third,
-/// whether the pane's own staged notification is action-ready for its
-/// owner. The third component never makes the pane write-ready for a
-/// follower; it exists because an owned staged doorbell keeps the honest
-/// state at `idle_with_input`, which leaves the public pair unchanged
-/// across the very transition (working to idle-class) that must wake the
-/// exact-owned reconciliation. Without it that reconciliation is never
-/// requested and a claimed doorbell is never cleared.
-type ReadinessKey = (bool, Option<String>, bool);
-
-/// Should this pane wake the exact owner to recheck its staged hold? The same
-/// evidence `staged_entry_ready` demands, minus the owner and binding
-/// identity, which the reconciliation seam re-proves itself. This wake never
-/// authorizes a terminal action. A hold staged during an older running turn
-/// remains held generally; only the exact owner may recheck it once the
-/// current frame is quiet.
-fn staged_hold_ready(entry: &DetEntry) -> bool {
-    matches!(
-        entry.hold,
-        ComposerHold::Staged | ComposerHold::StagedDuringTurn
-    ) && entry.hold_owner.is_some()
-        && staged_frame_is_quiet(entry)
-}
-
-/// Is this frame quiet enough for the owner's own action on its staged
-/// notification? Idle-class fused states qualify. `Unknown` qualifies only
-/// when it is the honest reading of a staged row: the screen read the row as
-/// human input (never a ghost or a bare prompt), every retained reading is
-/// idle-class (an active start's Working reading refuses), a current Screen
-/// reading exists (hook-only readings, a failed or an empty capture refuse),
-/// the capture is fresh and out of mode. Blocked states never qualify. The exact bytes are
-/// proven again by the caller before any key is sent.
-fn staged_frame_is_quiet(entry: &DetEntry) -> bool {
-    let idle_class =
-        |state: AgentState| matches!(state, AgentState::Idle | AgentState::IdleWithInput);
-    let readings_quiet = entry
-        .detection
-        .readings
-        .iter()
-        .any(|reading| reading.sensor == Sensor::Screen)
-        && entry
-            .detection
-            .readings
-            .iter()
-            .all(|reading| idle_class(reading.state));
-    let unknown_staged = entry.detection.state == AgentState::Unknown
-        && entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput);
-    !entry.in_mode
-        && !entry.detection.stale
-        && (idle_class(entry.detection.state) || unknown_staged)
-        && readings_quiet
-}
+/// What a readiness wake compares: the public write verdict and its named
+/// block.
+type ReadinessKey = (bool, Option<String>);
 
 /// Runtime-idle admission by process-bound liveness. A separate verdict from
 /// lifecycle termination: it answers "may a wake start now?" for a pane whose
@@ -2737,23 +2435,6 @@ fn liveness_admits_idle(
         && !stale
         && !in_mode
         && binding_stable
-}
-
-/// What runtime-idle admission decided for this recompute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdmissionOutcome {
-    /// Admission did not apply: not an unknown clean frame, or refused by
-    /// one of the distinct outcomes (draft, ghost, ambiguous, stale, mode,
-    /// binding change, active start).
-    NotApplicable,
-    /// Every predicate held and a qualifying edge from this daemon boot
-    /// exists: the pane is idle.
-    Admitted,
-    /// Every predicate held except a qualifying edge from this daemon boot.
-    /// The pane stays unknown and its write block is named
-    /// `hook_admission_unproven`: a durable, recoverable pre-write block,
-    /// never a replay of an older boot's edge.
-    Unproven,
 }
 
 /// Why this pane reads `unknown`, from evidence the daemon already holds.
@@ -2878,9 +2559,9 @@ fn liveness_idle_admission(
     binding_stable: bool,
     in_mode: bool,
     detection: &mut Detection,
-) -> AdmissionOutcome {
+) {
     let (Some(agent), Some(manifest_id)) = (admitted, manifest_id) else {
-        return AdmissionOutcome::NotApplicable;
+        return;
     };
     let liveness_verified = inner
         .manifests
@@ -2910,25 +2591,20 @@ fn liveness_idle_admission(
         in_mode,
         binding_stable,
     );
-    if !frame_admissible {
-        return AdmissionOutcome::NotApplicable;
-    }
-    if !liveness_verified {
-        return AdmissionOutcome::Unproven;
+    if !frame_admissible || !liveness_verified {
+        return;
     }
     detection.state = AgentState::Idle;
     detection.decided_by = format!(
         "liveness:{}",
         screen.map(|rule| rule.id.as_str()).unwrap_or("screen")
     );
-    AdmissionOutcome::Admitted
 }
 
 fn readiness_key(entry: &DetEntry) -> ReadinessKey {
     (
         entry.detection.write_ready,
         entry.detection.write_block.clone(),
-        staged_hold_ready(entry),
     )
 }
 
@@ -3005,11 +2681,10 @@ fn readiness_wake_decision(
     prior: Option<&ReadinessKey>,
     now: &ReadinessKey,
 ) -> ReadinessWakeDecision {
-    let public_changed = prior.is_some_and(|prior| (&prior.0, &prior.1) != (&now.0, &now.1));
-    let staged_changed = prior.is_some_and(|prior| prior.2 != now.2);
+    let public_changed = prior.is_some_and(|prior| prior != now);
     ReadinessWakeDecision {
         emit_public: public_changed,
-        reconcile_route: prior.is_none() || public_changed || staged_changed,
+        reconcile_route: prior.is_none() || public_changed,
     }
 }
 
@@ -3024,9 +2699,8 @@ fn readiness_wake_plan(
     // token is still new positive evidence even when that earlier observer
     // made the tuple look unchanged. Durable route reconciliation is
     // idempotent under the token, so never let the cache ordering consume a
-    // write-ready or owned-staged source edge. Unchanged negative observations
-    // remain quiet.
-    decision.reconcile_route = has_route_evidence && (decision.reconcile_route || now.0 || now.2);
+    // write-ready source edge. Unchanged negative observations remain quiet.
+    decision.reconcile_route = has_route_evidence && (decision.reconcile_route || now.0);
     decision
 }
 
@@ -3081,13 +2755,6 @@ fn retain_stale(
     Some(p)
 }
 
-/// A `ps -o tpgid=` line as a pid. A pane with no controlling terminal
-/// reports -1, which names no process and must not be looked up.
-pub(crate) fn parse_tpgid(line: &str) -> Option<i32> {
-    let value: i32 = line.trim().parse().ok()?;
-    (value > 0).then_some(value)
-}
-
 /// Bind a manifest by the argv[0] basename of a pane's foreground process,
 /// memoising the reading only once it has actually bound something. The ps
 /// spawn runs when comm binding already missed; never on a clock.
@@ -3134,7 +2801,7 @@ pub(crate) fn argv_bound_manifest<'a>(
         session_idx,
         pane_id,
         pid,
-        argv_basename,
+        argv_line,
         crate::identity::ProcId::of,
     )
 }
@@ -3162,11 +2829,11 @@ where
         .expect("argv cache lock")
         .get(&key)
         .cloned();
-    if let Some(base) = cached {
-        return manifest_for_basename(&inner.manifests, &base).map(|m| (m, proc));
+    if let Some(argv) = cached {
+        return manifest_for_argv(&inner.manifests, &argv).map(|m| (m, proc));
     }
     // Spawn outside the lock: ps is slower than every other holder of it.
-    let base = read_argv(pid)?;
+    let argv = read_argv(pid)?;
     // The identity was read BEFORE the argv, and they are two separate
     // observations of a system that does not hold still. A process can
     // exit and its number be handed on between them, in which case this
@@ -3177,12 +2844,12 @@ where
     if read_ident(pid) != Some(proc) {
         return None;
     }
-    let bound = manifest_for_basename(&inner.manifests, &base)?;
+    let bound = manifest_for_argv(&inner.manifests, &argv)?;
     let mut cache = inner.argv_cache.lock().expect("argv cache lock");
     cache.retain(|(cached_pane, _), _| cached_pane != &pane);
     // One entry per pane, so a reused pid cannot even collide with a
     // stale sibling entry: the pane's previous binding is already gone.
-    cache.insert(key, base);
+    cache.insert(key, argv);
     // The identity is returned WITH the manifest, from this one verified
     // observation. Handing back only the manifest would leave the caller
     // to re-read the identity, and a process replaced between the two
@@ -3190,8 +2857,9 @@ where
     Some((bound, proc))
 }
 
-/// argv[0] basename of a live pid via `ps -o args=`.
-fn argv_basename(pid: i32) -> Option<String> {
+/// The args line of a live pid via `ps -o args=`, or None when the process
+/// is gone or its argv is not readable.
+fn argv_line(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-o", "args=", "-p", &pid.to_string()])
         .output()
@@ -3199,18 +2867,50 @@ fn argv_basename(pid: i32) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    parse_argv_basename(&String::from_utf8_lossy(&out.stdout))
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
 }
 
-/// First whitespace-separated token of a ps args line, basename only.
-pub(crate) fn parse_argv_basename(args_line: &str) -> Option<String> {
-    let first = args_line.split_whitespace().next()?;
-    let base = first.rsplit('/').next()?;
-    if base.is_empty() {
-        None
-    } else {
-        Some(base.to_string())
+/// The programs a ps args line may name, basenames only, most specific
+/// first.
+///
+/// Usually just the first token. When that token is an interpreter, the
+/// program is the script it runs: `node /opt/gemini/cli.js` is gemini, not
+/// node, and the Node and Python CLIs (gemini, qwen, amp, aider) would
+/// otherwise never bind. The script is the next token that is not an
+/// interpreter flag; the interpreter follows it, so a manifest that claims
+/// the interpreter itself still binds.
+pub(crate) fn argv_programs(args_line: &str) -> Vec<String> {
+    let mut tokens = args_line.split_whitespace();
+    let Some(first) = tokens.next().and_then(basename) else {
+        return Vec::new();
+    };
+    if !is_interpreter(&first) {
+        return vec![first];
     }
+    let mut programs = Vec::with_capacity(2);
+    if let Some(script) = tokens
+        .find(|token| !token.starts_with('-'))
+        .and_then(basename)
+    {
+        programs.push(script);
+    }
+    programs.push(first);
+    programs
+}
+
+fn basename(token: &str) -> Option<String> {
+    let base = token.rsplit('/').next()?;
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+fn is_interpreter(base: &str) -> bool {
+    matches!(
+        base,
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3"
+    ) || base
+        .strip_prefix("python3.")
+        .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// What a recompute should do with the stored hook reading.
@@ -3381,7 +3081,7 @@ fn manifest_uses_screen_tier(m: &Manifest) -> bool {
 /// restored to top-down order. Production goes through
 /// [`screen_winner_esc`] (the recompute may carry an escaped capture);
 /// this plain form serves the tests that assert single-capture behavior.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn screen_winner<'m>(m: &'m Manifest, screen: &str) -> Option<&'m CompiledRule> {
     screen_winner_esc(m, screen, None)
 }
@@ -3733,22 +3433,6 @@ fn composer_capture_binding_is_stable(
         && binding_after == Some(binding_before)
 }
 
-fn claimed_legacy_recovery_ready(
-    detection: &Detection,
-    in_mode: bool,
-    detection_manifest: Option<&str>,
-    binding: &cyclops_proto::NotificationBinding,
-    capture: &ComposerCapture,
-) -> bool {
-    crate::composer_recovery::clean_composer_for_binding(
-        detection,
-        in_mode,
-        detection_manifest,
-        binding,
-    ) && detection.composer_semantic == Some(ComposerSemantic::Clean)
-        && matches!(capture, ComposerCapture::Visible(content) if content.is_empty())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn project_composer(
     probe: &crate::messaging::MessagingComposerProjectionProbe,
@@ -3934,46 +3618,6 @@ struct RecomputeEvidence<'a> {
     route: Option<&'a NotificationRouteEvidenceId>,
 }
 
-/// Opaque durable inputs for one physical composer observation.
-///
-/// The composition root obtains these from `WorkspaceMessaging`. Fusion may
-/// ask whether capture is required and return immutable physical evidence, but
-/// it cannot inspect journal records, projection variants, or recovery locks.
-pub(crate) struct PaneComposerMessagingContext {
-    recovery_probe: crate::messaging::MessagingComposerRecoveryProbe,
-    composer_probe: crate::messaging::MessagingComposerProjectionProbe,
-}
-
-impl PaneComposerMessagingContext {
-    pub(crate) fn new(
-        recovery_probe: crate::messaging::MessagingComposerRecoveryProbe,
-        composer_probe: crate::messaging::MessagingComposerProjectionProbe,
-    ) -> Self {
-        Self {
-            recovery_probe,
-            composer_probe,
-        }
-    }
-
-    fn into_parts(
-        self,
-    ) -> (
-        crate::messaging::MessagingComposerRecoveryProbe,
-        crate::messaging::MessagingComposerProjectionProbe,
-    ) {
-        (self.recovery_probe, self.composer_probe)
-    }
-}
-
-/// One exact lifecycle start relevant to a previously recovered composer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PaneRecoveredTurnEvidence {
-    pub(crate) session_idx: usize,
-    pub(crate) pane_id: String,
-    pub(crate) turn: turnkey::TurnKey,
-    pub(crate) since_ms: u64,
-}
-
 /// One exact dispatch start confirmed by immutable pane evidence.
 ///
 /// Fusion owns the physical correlation. The composition root hands this
@@ -4030,31 +3674,15 @@ impl PaneDispatchAckEvidence {
     }
 }
 
-/// Composition-root boundary for the messaging decisions required while one
-/// pane observation is committed.
+/// Composition-root boundary for the durable read one pane observation needs.
 ///
 /// Fusion owns physical evidence and cache serialization. The implementation
-/// owns every durable read, recovery decision, and recovery-coordinator lock.
+/// owns the durable read behind the composer projection.
 pub(crate) trait PaneMessagingBoundary: Sync {
-    fn composer_context(&self, recipient: Option<RecipientKey>) -> PaneComposerMessagingContext;
-
-    fn recovered_turn_observed(&self, evidence: PaneRecoveredTurnEvidence);
-
-    fn decide_composer_recovery(
+    fn composer_context(
         &self,
         recipient: Option<RecipientKey>,
-        probe: crate::messaging::MessagingComposerRecoveryProbe,
-        evidence: crate::messaging::MessagingComposerRecoveryObservation,
-        lifecycle_candidate: Option<NotificationAttemptId>,
-    ) -> Option<crate::messaging::MessagingComposerRecoveryPlan>;
-
-    fn merge_composer_recovery(
-        &self,
-        plan: Option<crate::messaging::MessagingComposerRecoveryPlan>,
-        base_hold: ComposerHold,
-        owner: Option<String>,
-        turn_running: bool,
-    ) -> crate::messaging::MessagingComposerBarrierUpdate;
+    ) -> crate::messaging::MessagingComposerProjectionProbe;
 }
 
 /// One exact, immutable runtime observation relevant to durable messaging.
@@ -4066,17 +3694,6 @@ pub(crate) trait PaneMessagingBoundary: Sync {
 pub(crate) enum PaneMessagingObservation {
     RouteEvidenceObserved {
         evidence: crate::messaging::MessagingRouteEvidence,
-    },
-    PaneSizeChanged {
-        evidence: crate::messaging::MessagingPaneSizeEvidence,
-    },
-    QuotaResetObserved {
-        recipient: RecipientKey,
-        session_idx: usize,
-        pane_id: String,
-    },
-    ExactOwnedEvidenceChanged {
-        recipient: RecipientKey,
     },
 }
 
@@ -4158,52 +3775,6 @@ impl PaneMessagingObservation {
     pub(crate) fn route_evidence(evidence: crate::messaging::MessagingRouteEvidence) -> Self {
         Self::RouteEvidenceObserved { evidence }
     }
-
-    pub(crate) fn pane_size_changed(evidence: crate::messaging::MessagingPaneSizeEvidence) -> Self {
-        Self::PaneSizeChanged { evidence }
-    }
-
-    pub(crate) fn quota_reset(
-        recipient: RecipientKey,
-        session_idx: usize,
-        pane_id: impl Into<String>,
-    ) -> Self {
-        Self::QuotaResetObserved {
-            recipient,
-            session_idx,
-            pane_id: pane_id.into(),
-        }
-    }
-
-    pub(crate) fn exact_owned_evidence_changed(recipient: RecipientKey) -> Self {
-        Self::ExactOwnedEvidenceChanged { recipient }
-    }
-}
-
-fn pane_messaging_observations(
-    route: Option<PaneMessagingObservation>,
-    exact_owned_recipient: Option<RecipientKey>,
-    quota_reset_recipient: Option<RecipientKey>,
-    session_idx: usize,
-    pane_id: &str,
-) -> Vec<PaneMessagingObservation> {
-    let mut observations = Vec::new();
-    if let Some(route) = route {
-        observations.push(route);
-    }
-    if let Some(recipient) = exact_owned_recipient {
-        observations.push(PaneMessagingObservation::exact_owned_evidence_changed(
-            recipient,
-        ));
-    }
-    if let Some(recipient) = quota_reset_recipient {
-        observations.push(PaneMessagingObservation::quota_reset(
-            recipient,
-            session_idx,
-            pane_id,
-        ));
-    }
-    observations
 }
 
 /// A committed pane-cache result and its ordered immutable post-commit
@@ -4275,11 +3846,8 @@ async fn observe_pane_with_evidence(
         cancel_lifecycle_recheck(inner, &route);
         return None;
     };
-    let recovery_recipient =
-        crate::composer_recovery::exact_recipient(inner, session_idx, watcher, &row);
-    let (recovery_probe, composer_probe) =
-        messaging.composer_context(recovery_recipient).into_parts();
-    let recovering = recovery_probe.is_recovering();
+    let recipient = pane_recipient(inner, session_idx, watcher, &row);
+    let composer_probe = messaging.composer_context(recipient);
     let manifest = bind_manifest_for(inner, session_idx, &row);
     let manifest_id = manifest.map(|m| m.agent.id.clone());
     // Resolved once, before anything that needs it: the pane's admitted
@@ -4386,7 +3954,7 @@ async fn observe_pane_with_evidence(
             || m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
     });
 
-    if !row.dead && row.in_mode && !recovering {
+    if !row.dead && row.in_mode {
         // Copy mode and other pane modes gate delivery; they are not agent
         // states. Keep the prior verdict; status exposes in_mode per row.
         //
@@ -4401,10 +3969,6 @@ async fn observe_pane_with_evidence(
         // this pane had before the human started scrolling.
         let det = match map.get_mut(&route) {
             Some(e) => {
-                let same_agent_manifest = unobservable
-                    || (e.agent == admitted && e.manifest.as_deref() == manifest_id.as_deref());
-                let same_complete_binding =
-                    unobservable || e.binding.as_ref() == observed_binding.as_ref();
                 // Only an observation that answered may rewrite the
                 // binding: overwriting it with the nothing a failed
                 // lookup returned would strand the hold it protects.
@@ -4413,12 +3977,6 @@ async fn observe_pane_with_evidence(
                     e.manifest = manifest_id.clone();
                     e.occupant = occupant;
                     e.agent = admitted;
-                }
-                if !same_agent_manifest {
-                    e.quota_screen_clear = false;
-                }
-                if !same_complete_binding {
-                    e.final_submit_conflict_owner = None;
                 }
                 e.in_mode = true;
                 e.detection = e.detection.clone().stamped(true, e.hold);
@@ -4432,7 +3990,7 @@ async fn observe_pane_with_evidence(
                     &e.detection,
                     true,
                     &binding_observation,
-                    recovery_recipient,
+                    recipient,
                     &ComposerCapture::NotRead,
                 );
                 e.detection.clone()
@@ -4460,7 +4018,7 @@ async fn observe_pane_with_evidence(
                     &det,
                     true,
                     &binding_observation,
-                    recovery_recipient,
+                    recipient,
                     &ComposerCapture::NotRead,
                 );
                 map.insert(
@@ -4472,11 +4030,9 @@ async fn observe_pane_with_evidence(
                         occupant,
                         agent: admitted,
                         in_mode: true,
-                        quota_screen_clear: false,
                         hold: ComposerHold::default(),
                         turn: None,
                         hold_owner: None,
-                        final_submit_conflict_owner: None,
                         composer,
                         working_confirmed: false,
                         since: std::time::Instant::now(),
@@ -4488,7 +4044,7 @@ async fn observe_pane_with_evidence(
         let now_key = map
             .get(&route)
             .map(readiness_key)
-            .unwrap_or_else(|| (det.write_ready, det.write_block.clone(), false));
+            .unwrap_or_else(|| (det.write_ready, det.write_block.clone()));
         drop(map);
         if candidate_lane {
             if let (Some(agent), Some(manifest)) = (admitted, manifest_id.as_deref()) {
@@ -4533,7 +4089,6 @@ async fn observe_pane_with_evidence(
     let mut idle_confirmed = false;
     let mut active_start_terminal = false;
     let mut screen_winner_id: Option<String> = None;
-    let mut admission = AdmissionOutcome::NotApplicable;
     let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
@@ -4571,10 +4126,7 @@ async fn observe_pane_with_evidence(
                             foreground_pid_checked(row.pane_pid),
                             manifest_id.as_deref(),
                         );
-                        let now_key = map
-                            .get(&route)
-                            .map(readiness_key)
-                            .unwrap_or((false, None, false));
+                        let now_key = map.get(&route).map(readiness_key).unwrap_or((false, None));
                         retained.map(|det| (prior_ready, now_key, det))
                     };
                     if let Some((prior_ready, now_key, p)) = retained {
@@ -4627,9 +4179,9 @@ async fn observe_pane_with_evidence(
         }
         capture_binding_changed = if need_screen || inspect_composer {
             let row_after_capture = watcher.pane(pane_id);
-            let recipient_after_capture = row_after_capture.as_ref().and_then(|current| {
-                crate::composer_recovery::exact_recipient(inner, session_idx, watcher, current)
-            });
+            let recipient_after_capture = row_after_capture
+                .as_ref()
+                .and_then(|current| pane_recipient(inner, session_idx, watcher, current));
             let binding_after_capture = row_after_capture.as_ref().map(|current| {
                 let seen_after_capture = occupant_of(current.pane_pid);
                 pane_binding_observation(inner, session_idx, current, seen_after_capture)
@@ -4637,7 +4189,7 @@ async fn observe_pane_with_evidence(
             !composer_capture_binding_is_stable(
                 &row,
                 row_after_capture.as_ref(),
-                recovery_recipient,
+                recipient,
                 recipient_after_capture,
                 &binding_observation,
                 binding_after_capture.as_ref(),
@@ -4758,12 +4310,6 @@ async fn observe_pane_with_evidence(
                 &confirmed.edge.turn,
             );
         }
-        messaging.recovered_turn_observed(PaneRecoveredTurnEvidence {
-            session_idx,
-            pane_id: pane_id.to_string(),
-            turn: confirmed.edge.turn.clone(),
-            since_ms: confirmed.accepted_ms,
-        });
     }
 
     // Hook sensor (agent.state.report): high-precision edges, incomplete
@@ -4823,7 +4369,7 @@ async fn observe_pane_with_evidence(
         let screen_rule = screen_winner_id
             .as_deref()
             .and_then(|id| m.rules.iter().find(|rule| rule.id == id));
-        admission = liveness_idle_admission(
+        liveness_idle_admission(
             inner,
             &route,
             admitted,
@@ -4835,61 +4381,10 @@ async fn observe_pane_with_evidence(
         );
     }
 
-    let recovery_live = recovery_recipient.and_then(|recipient| match &binding_observation {
-        BindingObservation::Bound(binding) => {
-            crate::composer_recovery::observed_binding(recipient, binding)
-        }
-        BindingObservation::NotVendor
-        | BindingObservation::Gone
-        | BindingObservation::Unprovable => None,
-    });
-    let recovery_clean = recovery_live.as_ref().is_some_and(|binding| {
-        crate::composer_recovery::clean_composer_for_binding(
-            &detection,
-            row.in_mode,
-            manifest_id.as_deref(),
-            binding,
-        )
-    });
-    let legacy_composer_ready = recovery_live.as_ref().is_some_and(|binding| {
-        claimed_legacy_recovery_ready(
-            &detection,
-            row.in_mode,
-            manifest_id.as_deref(),
-            binding,
-            &composer_capture,
-        )
-    });
-    let lifecycle_candidate = crate::composer_recovery::exact_lifecycle_candidate(
-        inner,
-        session_idx,
-        pane_id,
-        recovery_live.as_ref(),
-        recovery_clean,
-    );
-    let mut recovery_plan = messaging.decide_composer_recovery(
-        recovery_recipient,
-        recovery_probe,
-        crate::messaging::MessagingComposerRecoveryObservation {
-            binding: recovery_live.clone(),
-            clean_composer: recovery_clean,
-            legacy_composer_ready,
-        },
-        lifecycle_candidate,
-    );
-
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
 
-    let (
-        prior,
-        prior_ready,
-        now_key,
-        detection,
-        probe_quota_reset,
-        composer_changed,
-        missing_end_diagnostic,
-    ) = {
+    let (prior, prior_ready, now_key, detection, missing_end_diagnostic) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let prior_entry = map.get(&route);
         let prior = prior_entry.map(|e| e.detection.state);
@@ -4911,12 +4406,11 @@ async fn observe_pane_with_evidence(
             row.dead,
             seen,
         );
-        let prior_quota_screen_clear = carried.is_some_and(|entry| entry.quota_screen_clear);
         // Holds carry only across observations of the same cached agent
         // and manifest, or while preserving an active hold across an unproven identity.
         // First sight of an occupant therefore starts clear.
         let base_hold = carried.map(|entry| entry.hold).unwrap_or_default();
-        let mut turn = carried.and_then(|entry| entry.turn.clone());
+        let turn = carried.and_then(|entry| entry.turn.clone());
         let hold_owner = carried.and_then(|entry| entry.hold_owner.clone());
         // Human input and runtime lifecycle are independent facts. Once a
         // settled output burst proves the visible composer is exactly empty,
@@ -4928,28 +4422,6 @@ async fn observe_pane_with_evidence(
         } else {
             base_hold
         };
-        let turn_running = detection.turn_running_at().is_some();
-        let recovery_update = messaging.merge_composer_recovery(
-            recovery_plan.take(),
-            base_hold,
-            hold_owner,
-            turn_running,
-        );
-        let base_hold = recovery_update.hold;
-        let hold_owner = recovery_update.owner;
-        if recovery_update.clear_turn {
-            turn = None;
-        }
-        // Any unresolved recovered action owns the runtime barrier. It may
-        // not fall through the ordinary screen lifecycle: ambiguous restart
-        // states require an exact post-recovery start and end, and a failed
-        // retirement append must keep both the hold and its end reusable.
-        //
-        // The one safe transition is the bookkeeping step that ends a turn
-        // already running when recovery restored the barrier. That turn
-        // cannot consume the payload, so the hold becomes Staged and waits
-        // for the next exact start.
-        let recovered_hold = recovery_update.recovered_hold;
         // `settle_turn` owns the lane rule. Called here, under both
         // locks, because the advance and the consumption of an exact end
         // are one decision: splitting them leaves a window where another
@@ -4973,13 +4445,6 @@ async fn observe_pane_with_evidence(
                 false,
                 entry.turn.clone(),
                 entry.hold_owner.clone(),
-                false,
-            ),
-            None if recovered_hold.is_some() => (
-                recovered_hold.expect("guarded recovered hold"),
-                false,
-                turn,
-                hold_owner,
                 false,
             ),
             None => {
@@ -5007,21 +4472,6 @@ async fn observe_pane_with_evidence(
                 )
             }
         };
-        // A confirmed Stop is a conflict only for the exact staged attempt
-        // that was live when it arrived. Preserve it across an unproven
-        // observation, but a proven binding change or a different barrier
-        // starts clean even when the agent and manifest names coincide.
-        let carried_final_submit_conflict_owner = match &frozen {
-            Some(entry) => entry.final_submit_conflict_owner.clone(),
-            None => carried
-                .filter(|entry| entry.binding.as_ref() == observed_binding.as_ref())
-                .and_then(|entry| entry.final_submit_conflict_owner.clone()),
-        };
-        let carried_final_submit_conflict_owner = retained_final_submit_conflict_owner(
-            carried_final_submit_conflict_owner,
-            hold,
-            final_owner.as_deref(),
-        );
         // Stamped BEFORE it is cached, because the cache is what the gate
         // and every status surface read. Stamping afterwards would leave
         // them all reading a verdict nobody finished.
@@ -5030,9 +4480,6 @@ async fn observe_pane_with_evidence(
             detection = detection.occupant_unprovable();
         } else if stranded {
             detection = detection.refused("turn_evidence_lost");
-        }
-        if let Some(reason) = recovery_update.refusal {
-            detection = detection.refused(reason);
         }
         // Before the cache, for the same reason the stamp is: the cache is
         // what every status surface reads, so a reason attached after it is
@@ -5047,15 +4494,6 @@ async fn observe_pane_with_evidence(
                 &row.current_command,
             );
         }
-        // Restart truth: a clean, current, exact-bound frame with no active
-        // start and no qualifying edge from THIS daemon boot stays unknown
-        // and names its block, so the notification path records a durable,
-        // recoverable pre-write block instead of guessing. Applied after the
-        // stamp so the name survives readiness computation, like the other
-        // named refusals above.
-        if admission == AdmissionOutcome::Unproven {
-            detection = detection.refused("hook_admission_unproven");
-        }
         let composer = project_composer(
             &composer_probe,
             detection.composer_semantic,
@@ -5063,34 +4501,9 @@ async fn observe_pane_with_evidence(
             &detection,
             row.in_mode,
             &binding_observation,
-            recovery_recipient,
+            recipient,
             &composer_capture,
         );
-        let composer_changed = prior_entry.is_none_or(|entry| entry.composer != composer);
-        // A positive screen baseline is enough to discover durable quota
-        // holds after restart. Carry that baseline across title-only and
-        // hook-only redraws for the same occupant. A positive quota screen
-        // clears it and forces screen capture until reset is observed.
-        let prior_quota_screen_clear = frozen
-            .as_ref()
-            .map(|entry| entry.quota_screen_clear)
-            .unwrap_or(prior_quota_screen_clear);
-        let quota_screen_clear = if unobservable {
-            prior_quota_screen_clear
-        } else if positive_quota_reset_observation(&detection) {
-            true
-        } else if detection.state == AgentState::BlockedQuota
-            && detection
-                .readings
-                .iter()
-                .any(|reading| reading.sensor == Sensor::Screen)
-        {
-            false
-        } else {
-            prior_quota_screen_clear
-        };
-        let probe_quota_reset =
-            !unobservable && quota_reset_probe_needed(prior_quota_screen_clear, &detection);
         // `since` marks the state CHANGING, so a recompute that confirms
         // the same state carries the old mark forward. Without this the
         // elapsed column would reset on every unrelated event.
@@ -5124,31 +4537,24 @@ async fn observe_pane_with_evidence(
                     None => admitted,
                 },
                 in_mode: row.in_mode,
-                quota_screen_clear,
                 hold,
                 turn: final_turn,
                 // The claim is retired with the barrier it protected: a
                 // cleared hold owns nothing, so the next attempt is free
                 // to take it.
                 hold_owner: final_owner,
-                final_submit_conflict_owner: carried_final_submit_conflict_owner,
                 composer,
                 working_confirmed,
                 since,
             },
         );
         {
-            let now_key = map
-                .get(&route)
-                .map(readiness_key)
-                .unwrap_or((false, None, false));
+            let now_key = map.get(&route).map(readiness_key).unwrap_or((false, None));
             (
                 prior,
                 prior_ready,
                 now_key,
                 detection,
-                probe_quota_reset,
-                composer_changed,
                 missing_end_diagnostic,
             )
         }
@@ -5184,19 +4590,7 @@ async fn observe_pane_with_evidence(
         && prior == Some(AgentState::Working)
         && prior_working_confirmed != working_confirmed;
     let changed = state_changed || certainty_changed;
-    let exact_owned_recipient = (state_changed || composer_changed)
-        .then_some(recovery_recipient)
-        .flatten();
-    let quota_reset_recipient = probe_quota_reset
-        .then(|| inner.recipient_key(session_idx, pane_id))
-        .flatten();
-    let messaging_observations = pane_messaging_observations(
-        readiness.messaging,
-        exact_owned_recipient,
-        quota_reset_recipient,
-        session_idx,
-        pane_id,
-    );
+    let messaging_observations = readiness.messaging.into_iter().collect();
     if changed {
         debug!(
             pane = pane_id,
@@ -5253,53 +4647,6 @@ fn is_candidate_recheck_cause(cause: &str) -> bool {
     )
 }
 
-/// Quota is a screen-only fact. Leaving it requires a fresh, agreeing
-/// screen classification, not hook-derived idle or an unknown frame.
-fn positive_quota_reset_observation(detection: &Detection) -> bool {
-    let state_disproves_quota = detection.state != AgentState::BlockedQuota
-        && (detection.state.is_blocked()
-            || matches!(
-                detection.state,
-                AgentState::Idle | AgentState::IdleWithInput | AgentState::Working
-            ));
-    !detection.stale
-        && !detection.disagreement
-        && state_disproves_quota
-        && detection.readings.iter().any(|reading| {
-            reading.sensor == Sensor::Screen
-                && reading.state == detection.state
-                && reading.state != AgentState::BlockedQuota
-        })
-}
-
-/// Recheck the cached exact route after a quota hold is made durable.
-/// This closes the race where the positive reset edge lands just before
-/// the delivery worker appends `QuotaHeld` and therefore finds no target.
-pub(crate) fn quota_reset_observation_now(
-    inner: &Inner,
-    session_idx: usize,
-    pane_id: &str,
-) -> Option<PaneMessagingObservation> {
-    let observed = inner
-        .detections
-        .lock()
-        .expect("detections lock")
-        .get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| entry.quota_screen_clear);
-    if !observed {
-        return None;
-    }
-    Some(PaneMessagingObservation::quota_reset(
-        inner.recipient_key(session_idx, pane_id)?,
-        session_idx,
-        pane_id,
-    ))
-}
-
-fn quota_reset_probe_needed(prior_screen_clear: bool, current: &Detection) -> bool {
-    !prior_screen_clear && positive_quota_reset_observation(current)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5326,29 +4673,6 @@ mod tests {
     use crate::StdMutex;
     use std::collections::HashMap;
     use std::path::Path;
-
-    /// Hold recovered runtime state until its retirement fact is durable.
-    ///
-    /// The only transition allowed before then ends a turn that was already
-    /// running when the barrier was restored. That turn cannot consume the
-    /// staged payload, so recovery waits in `Staged` for the next exact start.
-    fn recovery_hold_before_durable_retirement(
-        action: Option<&crate::composer_recovery::RecoveryAction>,
-        hold: ComposerHold,
-        detection: &Detection,
-    ) -> Option<ComposerHold> {
-        let action = action?;
-        Some(
-            if matches!(action, crate::composer_recovery::RecoveryAction::Restore(_))
-                && hold == ComposerHold::StagedDuringTurn
-                && detection.turn_running_at().is_none()
-            {
-                ComposerHold::Staged
-            } else {
-                hold
-            },
-        )
-    }
 
     fn pane() -> PaneKey {
         PaneKey::new(0, "%1")
@@ -5390,11 +4714,9 @@ mod tests {
             occupant: Some(binding.leader.pid),
             agent: Some(binding.agent),
             in_mode: false,
-            quota_screen_clear: true,
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
-            final_submit_conflict_owner: None,
             composer: crate::ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -5917,7 +5239,7 @@ line_regex = ['^ACTIVE']
 
     #[test]
     fn first_readiness_sight_reconciles_without_publishing_a_transition() {
-        let ready = (true, None, false);
+        let ready = (true, None);
         assert_eq!(
             readiness_wake_decision(None, &ready),
             ReadinessWakeDecision {
@@ -5934,7 +5256,7 @@ line_regex = ['^ACTIVE']
             }
         );
 
-        let held = (false, Some("composer_hold".to_string()), false);
+        let held = (false, Some("composer_hold".to_string()));
         assert_eq!(
             readiness_wake_decision(Some(&held), &ready),
             ReadinessWakeDecision {
@@ -5943,29 +5265,14 @@ line_regex = ['^ACTIVE']
             }
         );
     }
-    /// An owned staged doorbell keeps the public pair unchanged across the
-    /// working-to-idle-class edge; the third component is what wakes the
-    /// exact-owned reconciliation, and it is never a public readiness event.
-    #[test]
-    fn staged_hold_readiness_alone_reconciles_the_route_without_a_public_wake() {
-        let before: ReadinessKey = (false, Some("not_idle".into()), false);
-        let after: ReadinessKey = (false, Some("not_idle".into()), true);
-        let decision = readiness_wake_decision(Some(&before), &after);
-        assert!(decision.reconcile_route);
-        assert!(!decision.emit_public);
-        let same = readiness_wake_decision(Some(&after), &after);
-        assert!(!same.reconcile_route);
-        assert!(!same.emit_public);
-    }
-
     #[test]
     fn tokenless_readiness_is_observational_and_a_mutation_mints_once() {
         let inner = inner_with(BTreeMap::new());
         let pane_id = "%1";
         let mut ready = quota_detection(Sensor::Screen, AgentState::Idle);
         ready.write_ready = true;
-        let held: ReadinessKey = (false, Some("composer_hold".to_string()), false);
-        let ready_key: ReadinessKey = (true, None, false);
+        let held: ReadinessKey = (false, Some("composer_hold".to_string()));
+        let ready_key: ReadinessKey = (true, None);
         let initial = inner.route_evidence_id(0, pane_id);
 
         let wake = wake_readiness(
@@ -5989,8 +5296,8 @@ line_regex = ['^ACTIVE']
 
     #[test]
     fn causal_route_evidence_survives_an_earlier_tokenless_readiness_observation() {
-        let held: ReadinessKey = (false, Some("composer_hold".to_string()), false);
-        let ready: ReadinessKey = (true, None, false);
+        let held: ReadinessKey = (false, Some("composer_hold".to_string()));
+        let ready: ReadinessKey = (true, None);
 
         let tokenless = readiness_wake_plan(Some(&held), &ready, false);
         assert!(tokenless.emit_public);
@@ -6041,29 +5348,6 @@ line_regex = ['^ACTIVE']
     }
 
     #[test]
-    fn quota_reset_store_probe_runs_once_per_positive_screen_edge() {
-        let clean = quota_detection(Sensor::Screen, AgentState::Idle);
-        let quota = quota_detection(Sensor::Screen, AgentState::BlockedQuota);
-        let hook_only = quota_detection(Sensor::Hook, AgentState::Idle);
-
-        assert!(quota_reset_probe_needed(false, &clean));
-        assert!(
-            !quota_reset_probe_needed(true, &clean),
-            "an identical clean redraw repeated quota store work"
-        );
-        assert!(quota_reset_probe_needed(false, &clean));
-        assert!(!quota_reset_probe_needed(false, &hook_only));
-        assert!(!quota_reset_probe_needed(true, &quota));
-
-        let mut stale = clean.clone();
-        stale.stale = true;
-        assert!(!quota_reset_probe_needed(false, &stale));
-        let mut disagreeing = clean.clone();
-        disagreeing.disagreement = true;
-        assert!(!quota_reset_probe_needed(false, &disagreeing));
-    }
-
-    #[test]
     fn only_unstable_or_held_evidence_gets_a_bounded_follow_up() {
         let stable = lifecycle_detection(Sensor::Screen, AgentState::Idle);
         assert!(!needs_targeted_reobservation(&stable, ComposerHold::Clear));
@@ -6096,11 +5380,9 @@ line_regex = ['^ACTIVE']
                 occupant: Some(agent.pid),
                 agent: Some(agent),
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: ComposerHold::Clear,
                 turn: None,
                 hold_owner: None,
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: true,
                 since: std::time::Instant::now(),
@@ -6377,11 +5659,9 @@ contains = ["done"]
                 occupant: Some(71),
                 agent: Some(agent),
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -6447,11 +5727,9 @@ contains = ["done"]
                 occupant: Some(71),
                 agent: Some(agent1),
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -6514,11 +5792,9 @@ contains = ["done"]
                 occupant: Some(71),
                 agent: None,
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -7789,79 +7065,6 @@ contains = ["done"]
         assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
     }
 
-    #[test]
-    fn unresolved_recovery_never_enters_the_ordinary_screen_lifecycle() {
-        let attempt_id = cyclops_proto::NotificationAttemptId::generate();
-        let restore = crate::composer_recovery::RecoveryAction::Restore(attempt_id);
-        let hold =
-            crate::composer_recovery::RecoveryAction::Hold("composer_recovery_retirement_failed");
-        let working = Detection {
-            state: AgentState::Working,
-            readings: vec![SensorReading {
-                sensor: Sensor::Screen,
-                state: AgentState::Working,
-                rule: "working".into(),
-                ts: 8,
-            }],
-            disagreement: false,
-            decided_by: "working".into(),
-            unknown_reason: None,
-            stale: false,
-            write_ready: false,
-            write_block: None,
-            composer_semantic: None,
-        };
-        let clean = Detection {
-            state: AgentState::Idle,
-            readings: vec![SensorReading {
-                sensor: Sensor::Screen,
-                state: AgentState::Idle,
-                rule: "composer_empty".into(),
-                ts: 9,
-            }],
-            disagreement: false,
-            decided_by: "composer_empty".into(),
-            unknown_reason: None,
-            stale: false,
-            write_ready: false,
-            write_block: None,
-            composer_semantic: None,
-        };
-
-        assert_eq!(
-            recovery_hold_before_durable_retirement(Some(&restore), ComposerHold::Staged, &working,),
-            Some(ComposerHold::Staged),
-            "a screen-only start cannot bind recovered state"
-        );
-        assert_eq!(
-            recovery_hold_before_durable_retirement(
-                Some(&restore),
-                ComposerHold::StagedDuringTurn,
-                &clean,
-            ),
-            Some(ComposerHold::Staged),
-            "the pre-recovery turn may end without consuming the payload"
-        );
-        assert_eq!(
-            recovery_hold_before_durable_retirement(
-                Some(&hold),
-                ComposerHold::TurnStarted { since_ms: 8 },
-                &clean,
-            ),
-            Some(ComposerHold::TurnStarted { since_ms: 8 }),
-            "a failed append cannot release an exact recovered turn"
-        );
-        assert_eq!(
-            recovery_hold_before_durable_retirement(
-                None,
-                ComposerHold::TurnStarted { since_ms: 8 },
-                &clean,
-            ),
-            None,
-            "durable retirement returns control to ordinary settlement"
-        );
-    }
-
     /// An exact end is evidence, and evidence is not spent until it is
     /// used.
     ///
@@ -8406,10 +7609,8 @@ contains = ["done"]
             agent: Some(agent),
             turn: turn.cloned(),
             in_mode: false,
-            quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
-            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -8439,10 +7640,7 @@ contains = ["done"]
         // The delivery holding the barrier binds its own turn, and the
         // hold leaves the screen lifecycle for it.
         start(entry(Some("m-1#1"), ComposerHold::Staged, None));
-        let route_before = inner.route_evidence_id(0, "%1");
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500).is_some());
-        let route_after = inner.route_evidence_id(0, "%1");
-        assert_eq!(route_after.generation, route_before.generation + 1);
         assert_eq!(
             bound(),
             (
@@ -8455,7 +7653,6 @@ contains = ["done"]
         // Binding the same turn again is idempotent: an acknowledgement
         // can arrive more than once, and the first witnessed edge stands.
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 900).is_some());
-        assert_eq!(inner.route_evidence_id(0, "%1"), route_after);
         assert_eq!(
             bound(),
             (
@@ -8534,8 +7731,8 @@ contains = ["done"]
     /// delivery take it and paste over their text. A fresh claim needs a
     /// composer this daemon believes is empty AND unclaimed; only the
     /// same owner may re-claim what it already holds.
-    #[tokio::test]
-    async fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
+    #[test]
+    fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
         let clean = Detection {
             state: AgentState::Idle,
             readings: vec![SensorReading {
@@ -8566,10 +7763,8 @@ contains = ["done"]
             agent,
             turn: None,
             in_mode: false,
-            quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
-            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -8588,35 +7783,13 @@ contains = ["done"]
             let e = map.get(&pane()).expect("entry");
             (e.hold, e.hold_owner.clone())
         };
-        let conflict_now = || {
-            inner
-                .detections
-                .lock()
-                .expect("detections lock")
-                .get(&pane())
-                .and_then(|entry| entry.final_submit_conflict_owner.clone())
-        };
-
         // Clear and unowned: the only shape a fresh claim may take.
         put(entry(ComposerHold::Clear, None));
         assert!(claim_hold(&inner, 0, "%1", "m-1#1", agent, Some("bash")));
         assert_eq!(hold_now(), (ComposerHold::Staged, Some("m-1#1".into())));
 
-        inner
-            .detections
-            .lock()
-            .expect("detections lock")
-            .get_mut(&pane())
-            .expect("claimed entry")
-            .final_submit_conflict_owner = Some("m-1#1".into());
-
         // Same owner, already staged: idempotent.
         assert!(claim_hold(&inner, 0, "%1", "m-1#1", agent, Some("bash")));
-        assert_eq!(
-            conflict_now(),
-            Some("m-1#1".into()),
-            "the same attempt retains its own terminal conflict"
-        );
 
         // A different delivery may not take a barrier that is held.
         assert!(!claim_hold(&inner, 0, "%1", "m-2#1", agent, Some("bash")));
@@ -8632,170 +7805,124 @@ contains = ["done"]
             &inner, 0, "%1", "m-1#1", admitted, "bash"
         ));
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
-        assert_eq!(
-            conflict_now(),
-            None,
-            "releasing the barrier clears its terminal conflict"
-        );
         assert!(claim_hold(&inner, 0, "%1", "m-2#1", agent, Some("bash")));
-        assert_eq!(
-            conflict_now(),
-            None,
-            "a later delivery cannot inherit the previous attempt's conflict"
-        );
         assert!(!release_unwritten_hold(
             &inner, 0, "%1", "m-1#1", admitted, "bash"
         ));
+    }
 
-        let attempt = "att-00000000-0000-4000-8000-000000000001";
-        put(entry(ComposerHold::Staged, Some(attempt)));
-        let process = cyclops_proto::ProcessInstanceId::new(admitted.pid, admitted.birth).unwrap();
-        assert!(staged_action_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-        assert!(staged_exact_submit_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-        assert!(!staged_action_ready(
-            &inner,
-            0,
-            "%1",
-            "att-00000000-0000-4000-8000-000000000002",
-            process,
-            "bash"
-        ));
-        let mut working = entry(ComposerHold::Staged, Some(attempt));
-        working.detection.state = AgentState::Working;
-        working.detection.readings.push(SensorReading {
-            sensor: Sensor::Hook,
-            state: AgentState::Working,
-            rule: "turn_start".into(),
-            ts: 2,
-        });
-        put(working);
-        assert!(!staged_action_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-        assert!(
-            !staged_exact_submit_ready(&inner, 0, "%1", attempt, process, "bash"),
-            "a current Working edge needs the separately recorded clean-composer admission"
-        );
-
-        let mut blocked = entry(ComposerHold::Staged, Some(attempt));
-        blocked.detection.state = AgentState::BlockedPermission;
-        put(blocked);
-        assert!(!staged_action_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-        assert!(staged_exact_submit_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-
-        inner
-            .detections
-            .lock()
-            .expect("detections lock")
-            .get_mut(&pane())
-            .expect("blocked entry")
-            .final_submit_conflict_owner = Some(attempt.into());
-        assert!(
-            !staged_exact_submit_ready(&inner, 0, "%1", attempt, process, "bash"),
-            "a terminal edge for this exact attempt still blocks the one Enter"
-        );
-
-        let mut stale = entry(ComposerHold::Staged, Some(attempt));
-        stale.detection.stale = true;
-        put(stale);
-        assert!(!staged_action_ready(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
-
-        put(entry(ComposerHold::Staged, Some(attempt)));
-        assert!(
-            !resolve_staged_hold(
-                &inner,
-                0,
-                "%1",
-                "att-00000000-0000-4000-8000-000000000002",
-                process,
-                "bash"
-            )
-            .await
-        );
-        assert_eq!(hold_now(), (ComposerHold::Staged, Some(attempt.into())));
-        assert!(resolve_staged_hold(&inner, 0, "%1", attempt, process, "bash").await);
-        assert_eq!(hold_now(), (ComposerHold::Clear, None));
-
-        // A recompute that started before settlement may still promote the
-        // old hold. Resolution waits for that commit, then clears it last.
-        let turn = turnkey::TurnKey::for_test(&["settled"]);
-        let mut promoted = entry(ComposerHold::TurnStarted { since_ms: 9 }, Some(attempt));
-        promoted.turn = Some(turn.clone());
-        put(entry(ComposerHold::Staged, Some(attempt)));
-        let recompute_gate = inner.pane_observation_runtime.recompute_gate(&pane());
-        let recompute_guard = recompute_gate.lock().await;
-        let mut resolution = Box::pin(resolve_staged_hold(
-            &inner, 0, "%1", attempt, process, "bash",
-        ));
-        tokio::select! {
-            biased;
-            result = &mut resolution => panic!("resolution crossed an active recompute: {result}"),
-            () = tokio::task::yield_now() => {}
-        }
-        put(promoted);
-        assert!(turnkey::PaneEnds::pin(
-            &mut inner.turn_ends.lock().expect("turn ends lock"),
-            &pane(),
-            admitted,
-            "bash",
-            &turn,
-        ));
-        drop(recompute_guard);
-        assert!(resolution.await);
-        assert_eq!(hold_now(), (ComposerHold::Clear, None));
-        assert!(turnkey::PaneEnds::pin(
-            &mut inner.turn_ends.lock().expect("turn ends lock"),
-            &pane(),
-            admitted,
-            "bash",
-            &turnkey::TurnKey::for_test(&["next"]),
-        ));
-
-        // The race this exists for: a person types between the proof and
-        // the write, a recompute records the text, and nobody owns it.
-        for hold in [ComposerHold::Staged, ComposerHold::StagedDuringTurn] {
-            put(entry(hold, None));
-            assert!(
-                !claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")),
-                "an unowned {hold:?} is somebody's text, not a free barrier"
+    /// The composer check the gate runs, from the unsafe side: a positive
+    /// human draft holds, an owned hold holds, and ambiguous or absent
+    /// composer evidence does not.
+    #[test]
+    fn only_a_positive_draft_or_an_owned_hold_holds_a_doorbell() {
+        let inner = inner_with(BTreeMap::new());
+        let put = |state, semantic, hold, owner: Option<&str>| {
+            let detection = Detection {
+                state,
+                readings: Vec::new(),
+                disagreement: false,
+                decided_by: "test".into(),
+                unknown_reason: None,
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: semantic,
+            }
+            .stamped(false, hold);
+            inner.detections.lock().expect("detections lock").insert(
+                pane(),
+                DetEntry {
+                    detection,
+                    binding: None,
+                    manifest: Some("bash".into()),
+                    occupant: Some(4242),
+                    agent: Some(crate::identity::ProcId {
+                        pid: 4242,
+                        birth: 7,
+                    }),
+                    turn: None,
+                    in_mode: false,
+                    hold,
+                    hold_owner: owner.map(str::to_string),
+                    composer: ComposerProjection::default(),
+                    working_confirmed: false,
+                    since: std::time::Instant::now(),
+                },
             );
-            assert_eq!(hold_now(), (hold, None), "a refused claim changes nothing");
-        }
+        };
 
-        // An active turn without a hold owner does not hold an unsubmitted draft;
-        // it admits a delivery doorbell interruption.
-        put(entry(ComposerHold::TurnStarted { since_ms: 9 }, None));
-        assert!(claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")));
-        assert_eq!(
-            hold_now(),
-            (ComposerHold::Staged, Some("m-3#1".to_string()))
+        assert!(
+            !composer_is_held(&inner, 0, "%1"),
+            "a pane nothing has observed holds nothing"
+        );
+        put(AgentState::Idle, None, ComposerHold::Clear, None);
+        assert!(!composer_is_held(&inner, 0, "%1"));
+        put(
+            AgentState::Idle,
+            Some(ComposerSemantic::Ambiguous),
+            ComposerHold::Clear,
+            None,
+        );
+        assert!(
+            !composer_is_held(&inner, 0, "%1"),
+            "ambiguous composer evidence is not a hold"
+        );
+        put(
+            AgentState::Working,
+            Some(ComposerSemantic::Clean),
+            ComposerHold::Clear,
+            None,
+        );
+        assert!(!composer_is_held(&inner, 0, "%1"));
+        put(
+            AgentState::Working,
+            Some(ComposerSemantic::Clean),
+            ComposerHold::TurnStarted { since_ms: 5 },
+            None,
+        );
+        assert!(
+            !composer_is_held(&inner, 0, "%1"),
+            "a turn nobody owns is the agent working on its own input"
         );
 
-        // A proven binding is still required on top of all of that.
-        put(entry(ComposerHold::Clear, None));
-        assert!(!claim_hold(&inner, 0, "%1", "m-4#1", agent, Some("codex")));
-        assert!(!claim_hold(&inner, 0, "%1", "m-4#1", None, Some("bash")));
-        assert_eq!(hold_now(), (ComposerHold::Clear, None));
-
-        // An unauthenticated pane refuses even when the cache agrees that
-        // nobody is home. A pinned manifest chooses rules without proving
-        // a process, so two absent identities matching would put a
-        // payload into a shell prompt.
-        let mut unbound = entry(ComposerHold::Clear, None);
-        unbound.agent = None;
-        put(unbound);
-        assert!(!claim_hold(&inner, 0, "%1", "m-5#1", None, Some("bash")));
-        assert_eq!(hold_now(), (ComposerHold::Clear, None));
+        put(
+            AgentState::IdleWithInput,
+            Some(ComposerSemantic::HumanInput),
+            ComposerHold::Clear,
+            None,
+        );
+        assert!(
+            composer_is_held(&inner, 0, "%1"),
+            "a positively observed human draft holds"
+        );
+        put(
+            AgentState::Idle,
+            Some(ComposerSemantic::Clean),
+            ComposerHold::Staged,
+            Some("m-1#1"),
+        );
+        assert!(
+            composer_is_held(&inner, 0, "%1"),
+            "a doorbell an earlier attempt staged holds until it is consumed"
+        );
+        put(
+            AgentState::Working,
+            Some(ComposerSemantic::Clean),
+            ComposerHold::StagedDuringTurn,
+            Some("m-1#1"),
+        );
+        assert!(composer_is_held(&inner, 0, "%1"));
+        put(
+            AgentState::Working,
+            Some(ComposerSemantic::Clean),
+            ComposerHold::TurnStarted { since_ms: 5 },
+            Some("m-1#1"),
+        );
+        assert!(
+            composer_is_held(&inner, 0, "%1"),
+            "the turn a doorbell started holds the next one until it ends"
+        );
     }
 
     /// A failed capture has to leave the same refusal everywhere.
@@ -8838,10 +7965,8 @@ contains = ["done"]
                 agent: None,
                 turn: None,
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: ComposerHold::Clear,
                 hold_owner: None,
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since,
@@ -8902,10 +8027,8 @@ contains = ["done"]
             occupant: Some(111),
             agent: None,
             in_mode: false,
-            quota_screen_clear: false,
             hold: ComposerHold::Clear,
             hold_owner: None,
-            final_submit_conflict_owner: None,
             turn: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
@@ -9102,15 +8225,6 @@ contains = ["done"]
         assert_eq!(d.decided_by, "idle_unconfirmed");
         assert_eq!(d.composer_semantic, Some(ComposerSemantic::Clean));
         assert!(!d.write_ready);
-    }
-    trait WithState {
-        fn with_state(self, state: AgentState) -> Self;
-    }
-    impl WithState for SensorReading {
-        fn with_state(mut self, state: AgentState) -> Self {
-            self.state = state;
-            self
-        }
     }
     fn working_reading(ts: u64) -> SensorReading {
         SensorReading {
@@ -9375,403 +8489,6 @@ regex = ['^']
             !provisional.unkeyed_latch_ended_by(agent, Some("fix"), 1001),
             "not yet promoted"
         );
-    }
-    fn staged_entry(
-        state: AgentState,
-        semantic: Option<ComposerSemantic>,
-        readings: Vec<SensorReading>,
-        stale: bool,
-        in_mode: bool,
-        owner: &str,
-    ) -> DetEntry {
-        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
-        DetEntry {
-            detection: Detection {
-                state,
-                readings,
-                disagreement: false,
-                decided_by: "test".into(),
-                unknown_reason: None,
-                stale,
-                write_ready: false,
-                write_block: None,
-                composer_semantic: semantic,
-            },
-            binding: None,
-            manifest: Some("fix".into()),
-            occupant: Some(4242),
-            agent: Some(agent),
-            turn: None,
-            in_mode,
-            quota_screen_clear: false,
-            hold: ComposerHold::Staged,
-            hold_owner: Some(owner.to_string()),
-            final_submit_conflict_owner: None,
-            composer: ComposerProjection::default(),
-            working_confirmed: false,
-            since: std::time::Instant::now(),
-        }
-    }
-    fn screen_reading(state: AgentState) -> SensorReading {
-        SensorReading {
-            sensor: Sensor::Screen,
-            state,
-            rule: "screen".into(),
-            ts: 1,
-        }
-    }
-    /// A staged row is not lifecycle evidence, so a pane holding our exact
-    /// doorbell fuses to `unknown`; the owner's own action on it is admitted
-    /// only when that unknown is the honest reading of a staged human-input
-    /// row on a quiet, fresh, out-of-mode frame with the exact owner.
-    #[test]
-    fn an_unknown_staged_frame_admits_only_the_exact_owner_on_a_quiet_frame() {
-        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
-        let quiet = || vec![screen_reading(AgentState::IdleWithInput)];
-        let ok = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            quiet(),
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            staged_entry_ready(&ok, "att-1", agent, "fix"),
-            "exact end then unknown plus exact proof clears once"
-        );
-        assert!(staged_hold_ready(&ok));
-        // An exact doorbell may have appeared while an unrelated turn was
-        // still running. The generic hold stays distinct to protect later
-        // human text, but once this frame proves that turn is gone, the exact
-        // owner may recheck the same bytes.
-        let mut after_old_turn = ok.clone();
-        after_old_turn.hold = ComposerHold::StagedDuringTurn;
-        assert!(
-            staged_entry_ready(&after_old_turn, "att-1", agent, "fix"),
-            "a quiet frame reopens only the exact owned doorbell"
-        );
-        assert!(staged_hold_ready(&after_old_turn));
-        let mut no_owner = after_old_turn.clone();
-        no_owner.hold_owner = None;
-        assert!(
-            !staged_entry_ready(&no_owner, "att-1", agent, "fix"),
-            "a human hold never passes the exact-owner check"
-        );
-        assert!(
-            !staged_hold_ready(&no_owner),
-            "a human hold never becomes an automatic action"
-        );
-        // exact end then unknown: a retained idle hook reading is still quiet
-        let ended = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            vec![
-                screen_reading(AgentState::IdleWithInput),
-                working_reading(1).with_state(AgentState::Idle),
-            ],
-            false,
-            false,
-            "att-1",
-        );
-        assert!(staged_entry_ready(&ended, "att-1", agent, "fix"));
-        // active start plus exact doorbell refuses
-        let active = staged_entry(
-            AgentState::Working,
-            Some(ComposerSemantic::HumanInput),
-            vec![
-                screen_reading(AgentState::IdleWithInput),
-                working_reading(1),
-            ],
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&active, "att-1", agent, "fix"),
-            "active start refuses"
-        );
-        // unknown with no readings refuses
-        let empty = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            vec![],
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&empty, "att-1", agent, "fix"),
-            "no readings refuses"
-        );
-        // ghost refuses
-        let ghost = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::GhostSuggestion),
-            quiet(),
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&ghost, "att-1", agent, "fix"),
-            "ghost refuses"
-        );
-        // bare prompt (clean) is not a staged row either
-        let bare = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::Clean),
-            quiet(),
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&bare, "att-1", agent, "fix"),
-            "bare prompt refuses"
-        );
-        // blocked refuses
-        let blocked = staged_entry(
-            AgentState::BlockedModal,
-            Some(ComposerSemantic::HumanInput),
-            vec![screen_reading(AgentState::BlockedModal)],
-            false,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&blocked, "att-1", agent, "fix"),
-            "blocked refuses"
-        );
-        // stale refuses
-        let stale = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            quiet(),
-            true,
-            false,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&stale, "att-1", agent, "fix"),
-            "stale refuses"
-        );
-        // mode refuses
-        let in_mode = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            quiet(),
-            false,
-            true,
-            "att-1",
-        );
-        assert!(
-            !staged_entry_ready(&in_mode, "att-1", agent, "fix"),
-            "mode refuses"
-        );
-        // wrong owner, generation, or manifest refuses
-        assert!(
-            !staged_entry_ready(&ok, "att-2", agent, "fix"),
-            "wrong owner refuses"
-        );
-        let other = crate::identity::ProcId { pid: 8, birth: 80 };
-        assert!(
-            !staged_entry_ready(&ok, "att-1", other, "fix"),
-            "wrong generation refuses"
-        );
-        assert!(
-            !staged_entry_ready(&ok, "att-1", agent, "other"),
-            "wrong manifest refuses"
-        );
-        // extra text is refused by the callers' exact byte proof; this seam
-        // never sees bytes, so an idle-class frame stays admitted here.
-        let idle_with_input = staged_entry(
-            AgentState::IdleWithInput,
-            Some(ComposerSemantic::HumanInput),
-            quiet(),
-            false,
-            false,
-            "att-1",
-        );
-        assert!(staged_entry_ready(&idle_with_input, "att-1", agent, "fix"));
-    }
-
-    #[test]
-    fn a_staged_doorbell_keeps_its_exact_binding_for_a_clean_working_submit() {
-        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
-        // The staged doorbell now occupies the composer, so its current
-        // semantic is human_input. The normal delivery path separately
-        // proves these exact bytes, the current Working frame, and carries
-        // the pre-paste clean proof.
-        let mut working = staged_entry(
-            AgentState::Working,
-            Some(ComposerSemantic::HumanInput),
-            vec![
-                screen_reading(AgentState::Working),
-                screen_reading(AgentState::IdleWithInput),
-            ],
-            false,
-            false,
-            "att-1",
-        );
-        working.detection.write_block = Some("composer_hold".into());
-        assert!(
-            !staged_entry_ready(&working, "att-1", agent, "fix"),
-            "the quiet action path must remain unavailable while Working"
-        );
-        assert!(staged_entry_working_clean_action_ready(
-            &working, "att-1", agent, "fix"
-        ));
-
-        // Once fusion re-observes the exact doorbell, ordinary composer-hold
-        // semantics correctly remember that it appeared during this old
-        // Working turn. The one in-flight Working admission keeps its exact
-        // binding; the quiet path remains closed while the frame is Working.
-        // A later fresh quiet frame can re-open only this exact owner.
-        let mut reobserved = working.clone();
-        reobserved.hold = ComposerHold::StagedDuringTurn;
-        assert!(
-            !staged_entry_ready(&reobserved, "att-1", agent, "fix"),
-            "the quiet action path must remain unavailable while the frame is Working"
-        );
-        assert!(staged_entry_working_clean_action_ready(
-            &reobserved,
-            "att-1",
-            agent,
-            "fix"
-        ));
-
-        let mut turn_started = reobserved.clone();
-        turn_started.hold = ComposerHold::TurnStarted { since_ms: 2 };
-        assert!(
-            !staged_entry_working_clean_action_ready(&turn_started, "att-1", agent, "fix"),
-            "a later turn-start mark cannot reuse the Working admission"
-        );
-
-        let mut late_stop = reobserved.clone();
-        late_stop.detection.readings.push(SensorReading {
-            sensor: Sensor::Hook,
-            state: AgentState::Idle,
-            rule: "hook:Stop".into(),
-            ts: 2,
-        });
-        assert!(
-            !staged_entry_working_clean_action_ready(&late_stop, "att-1", agent, "fix"),
-            "a late hook Stop is a live conflict, not composer context"
-        );
-
-        let mut exact_terminal_conflict = reobserved.clone();
-        exact_terminal_conflict.final_submit_conflict_owner = Some("att-1".into());
-        assert!(
-            !staged_entry_working_clean_action_ready(
-                &exact_terminal_conflict,
-                "att-1",
-                agent,
-                "fix"
-            ),
-            "a confirmed terminal edge blocks only the same in-flight doorbell"
-        );
-
-        let mut different_attempt_conflict = reobserved.clone();
-        different_attempt_conflict.final_submit_conflict_owner = Some("att-2".into());
-        assert!(
-            staged_entry_working_clean_action_ready(
-                &different_attempt_conflict,
-                "att-1",
-                agent,
-                "fix"
-            ),
-            "a terminal edge for another attempt cannot block this owner"
-        );
-        assert_eq!(
-            retained_final_submit_conflict_owner(
-                Some("att-1".into()),
-                ComposerHold::Staged,
-                Some("att-1"),
-            ),
-            Some("att-1".into()),
-            "the exact staged owner retains its conflict through a fresh observation"
-        );
-        assert_eq!(
-            retained_final_submit_conflict_owner(
-                Some("att-1".into()),
-                ComposerHold::Staged,
-                Some("att-2"),
-            ),
-            None,
-            "a replacement owner must not inherit the prior conflict"
-        );
-        assert_eq!(
-            retained_final_submit_conflict_owner(
-                Some("att-1".into()),
-                ComposerHold::TurnStarted { since_ms: 2 },
-                Some("att-1"),
-            ),
-            None,
-            "a staged barrier that binds a new turn no longer carries the final-submit conflict"
-        );
-
-        let mut blocked = reobserved.clone();
-        blocked.detection.readings.push(SensorReading {
-            sensor: Sensor::Screen,
-            state: AgentState::BlockedModal,
-            rule: "permission".into(),
-            ts: 2,
-        });
-        assert!(
-            !staged_entry_working_clean_action_ready(&blocked, "att-1", agent, "fix"),
-            "a blocking screen reading must withhold the Working exception"
-        );
-
-        let mut unknown = reobserved.clone();
-        unknown.detection.state = AgentState::Unknown;
-        assert!(
-            !staged_entry_working_clean_action_ready(&unknown, "att-1", agent, "fix"),
-            "unknown fusion state cannot reuse an earlier clean-composer proof"
-        );
-
-        let mut non_write_ready = reobserved.clone();
-        non_write_ready.detection.write_block = Some("occupant_unprovable".into());
-        assert!(
-            !staged_entry_working_clean_action_ready(&non_write_ready, "att-1", agent, "fix"),
-            "only the owned staged-composer refusal may remain"
-        );
-
-        let stale = staged_entry(
-            AgentState::Working,
-            Some(ComposerSemantic::HumanInput),
-            vec![screen_reading(AgentState::Working)],
-            true,
-            false,
-            "att-1",
-        );
-        assert!(!staged_entry_working_clean_action_ready(
-            &stale, "att-1", agent, "fix"
-        ));
-
-        let in_mode = staged_entry(
-            AgentState::Working,
-            Some(ComposerSemantic::HumanInput),
-            vec![screen_reading(AgentState::Working)],
-            false,
-            true,
-            "att-1",
-        );
-        assert!(!staged_entry_working_clean_action_ready(
-            &in_mode, "att-1", agent, "fix"
-        ));
-        assert!(!staged_entry_working_clean_action_ready(
-            &working, "att-2", agent, "fix"
-        ));
-        assert!(!staged_entry_working_clean_action_ready(
-            &working,
-            "att-1",
-            crate::identity::ProcId { pid: 8, birth: 80 },
-            "fix"
-        ));
-        assert!(!staged_entry_working_clean_action_ready(
-            &working, "att-1", agent, "other"
-        ));
     }
     /// Ordinary idle composer frames never end an authenticated confirmed
     /// start. One manifest-declared terminal winner may do so.
@@ -10078,21 +8795,6 @@ regex = ['^']
         assert_eq!(liveness.publish_admission(&bound, "Stop"), Ok(()));
         assert!(!liveness.seen_admitting_edge(&pane2, agent, "claude"));
     }
-    /// Hook-only readings never make a staged frame quiet, whatever they say.
-    #[test]
-    fn a_staged_frame_needs_a_current_screen_reading() {
-        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
-        let hook_only = staged_entry(
-            AgentState::Unknown,
-            Some(ComposerSemantic::HumanInput),
-            vec![working_reading(1).with_state(AgentState::Idle)],
-            false,
-            false,
-            "att-1",
-        );
-        assert!(!staged_entry_ready(&hook_only, "att-1", agent, "fix"));
-        assert!(!staged_hold_ready(&hook_only));
-    }
     /// Stable screen bookends are not terminal by themselves. A keyed start
     /// still accepts an explicitly lifecycle-capable terminal winner.
     #[test]
@@ -10122,63 +8824,6 @@ regex = ['^']
         assert_eq!(d.state, AgentState::Idle);
         assert_eq!(d.decided_by, "title_idle");
         assert!(!d.disagreement);
-    }
-
-    fn composer_detection(semantic: Option<ComposerSemantic>) -> Detection {
-        let state = match semantic {
-            Some(ComposerSemantic::Clean | ComposerSemantic::GhostSuggestion) => AgentState::Idle,
-            _ => AgentState::IdleWithInput,
-        };
-        Detection {
-            state,
-            readings: vec![SensorReading {
-                sensor: Sensor::Screen,
-                state,
-                rule: "composer".into(),
-                ts: 5,
-            }],
-            disagreement: false,
-            decided_by: "composer".into(),
-            unknown_reason: None,
-            stale: false,
-            write_ready: false,
-            write_block: None,
-            composer_semantic: semantic,
-        }
-    }
-
-    #[test]
-    fn one_pane_result_preserves_coincident_messaging_observations_in_prior_order() {
-        let recipient = RecipientKey::agent(
-            "00000000-0000-4000-8000-000000000001".parse().unwrap(),
-            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
-            "%1".parse().unwrap(),
-        );
-        let route = PaneMessagingObservation::route_evidence(
-            crate::messaging::MessagingRouteEvidence::new(
-                3,
-                "%1",
-                NotificationRouteEvidenceId {
-                    boot_id: "boot".to_string(),
-                    generation: 4,
-                },
-            ),
-        );
-
-        assert_eq!(
-            pane_messaging_observations(
-                Some(route.clone()),
-                Some(recipient),
-                Some(recipient),
-                3,
-                "%1",
-            ),
-            vec![
-                route,
-                PaneMessagingObservation::exact_owned_evidence_changed(recipient),
-                PaneMessagingObservation::quota_reset(recipient, 3, "%1"),
-            ]
-        );
     }
 
     #[test]
@@ -10265,58 +8910,6 @@ regex = ['^']
             &binding,
             Some(&replaced_agent),
         ));
-    }
-
-    #[test]
-    fn claimed_legacy_recovery_requires_semantic_clean_and_exact_visible_empty() {
-        let recipient = RecipientKey::agent(
-            "00000000-0000-4000-8000-000000000001".parse().unwrap(),
-            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
-            "%1".parse().unwrap(),
-        );
-        let binding = cyclops_proto::NotificationBinding {
-            recipient,
-            pane_root: Some(ProcessInstanceId::new(69, 1).unwrap()),
-            leader: Some(ProcessInstanceId::new(70, 2).unwrap()),
-            agent: ProcessInstanceId::new(71, 3).unwrap(),
-            manifest: cyclops_proto::NotificationManifestId::new("claude").unwrap(),
-        };
-        let clean = composer_detection(Some(ComposerSemantic::Clean));
-        assert!(claimed_legacy_recovery_ready(
-            &clean,
-            false,
-            Some("claude"),
-            &binding,
-            &ComposerCapture::Visible(String::new()),
-        ));
-
-        for semantic in [
-            ComposerSemantic::GhostSuggestion,
-            ComposerSemantic::HumanInput,
-            ComposerSemantic::Ambiguous,
-        ] {
-            assert!(!claimed_legacy_recovery_ready(
-                &composer_detection(Some(semantic)),
-                false,
-                Some("claude"),
-                &binding,
-                &ComposerCapture::Visible(String::new()),
-            ));
-        }
-        for capture in [
-            ComposerCapture::Visible("text".into()),
-            ComposerCapture::Hidden,
-            ComposerCapture::NotRead,
-            ComposerCapture::BindingChanged,
-        ] {
-            assert!(!claimed_legacy_recovery_ready(
-                &clean,
-                false,
-                Some("claude"),
-                &binding,
-                &capture,
-            ));
-        }
     }
 
     fn entry(state: AgentState, ts: u64) -> HookEntry {
@@ -10884,12 +9477,77 @@ line_regex = ['^\s*›\s*$']
     #[test]
     fn argv_basename_parses_ps_args_output() {
         assert_eq!(
-            parse_argv_basename("/Users/x/.local/bin/claude --continue\n"),
-            Some("claude".into())
+            argv_programs("/Users/x/.local/bin/claude --continue\n"),
+            vec!["claude".to_string()]
         );
-        assert_eq!(parse_argv_basename("  cat  \n"), Some("cat".into()));
-        assert_eq!(parse_argv_basename("\n"), None);
-        assert_eq!(parse_argv_basename(""), None);
+        assert_eq!(argv_programs("  cat  \n"), vec!["cat".to_string()]);
+        assert!(argv_programs("\n").is_empty());
+        assert!(argv_programs("").is_empty());
+    }
+
+    /// A Node or Python CLI shows its interpreter first; the program is the
+    /// script after the interpreter's own flags, and the interpreter is
+    /// still named after it for a manifest that binds the interpreter.
+    #[test]
+    fn argv_basename_reads_the_script_behind_an_interpreter() {
+        let programs = |line: &str| argv_programs(line);
+        assert_eq!(
+            programs("node /opt/homebrew/lib/node_modules/@google/gemini-cli/dist/gemini --yolo\n"),
+            vec!["gemini".to_string(), "node".to_string()]
+        );
+        assert_eq!(
+            programs("/usr/local/bin/node --no-warnings /home/u/.npm/bin/qwen\n"),
+            vec!["qwen".to_string(), "node".to_string()]
+        );
+        assert_eq!(
+            programs("bun run /x/amp\n"),
+            vec!["run".to_string(), "bun".to_string()]
+        );
+        assert_eq!(
+            programs("python3.12 -u /home/u/.local/bin/aider --model x\n"),
+            vec!["aider".to_string(), "python3.12".to_string()]
+        );
+        assert_eq!(
+            programs("python /home/u/.local/bin/aider\n"),
+            vec!["aider".to_string(), "python".to_string()]
+        );
+        assert_eq!(programs("nodejs\n"), vec!["nodejs".to_string()]);
+        assert_eq!(programs("node -e\n"), vec!["node".to_string()]);
+        // A program that merely starts with an interpreter's name is itself.
+        assert_eq!(
+            programs("python3-config --libs\n"),
+            vec!["python3-config".to_string()]
+        );
+
+        // A manifest that binds the script wins over one that binds the
+        // interpreter; a manifest that binds only the interpreter still
+        // binds.
+        let manifest = |id: &str, names: &str| {
+            Manifest::parse(
+                &format!(
+                    "[agent]\nid = \"{id}\"\ndisplay_name = \"{id}\"\nprocess_names = [{names}]\n"
+                ),
+                Path::new("test.toml"),
+            )
+            .unwrap()
+        };
+        let both: BTreeMap<String, Manifest> = [
+            ("aider".to_string(), manifest("aider", "\"aider\"")),
+            ("fixture".to_string(), manifest("fixture", "\"python3\"")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            manifest_for_argv(&both, "python3 /home/u/.local/bin/aider")
+                .map(|m| m.agent.id.as_str()),
+            Some("aider")
+        );
+        assert_eq!(
+            manifest_for_argv(&both, "python3 /tmp/faketui.py --manual")
+                .map(|m| m.agent.id.as_str()),
+            Some("fixture")
+        );
+        assert!(manifest_for_argv(&both, "node /x/gemini").is_none());
     }
 
     const SLEEP_FIXTURE: &str = r#"
@@ -10906,262 +9564,6 @@ priority = 1000
 region = "pane_title"
 regex = ['^IDLE']
 "#;
-
-    #[test]
-    fn a_recovered_exact_end_is_durable_before_runtime_clearance() {
-        use crate::mailbox::{MailboxDirectory, MailboxIdentity, MailboxSend, MessageStore};
-        use crate::notification_adapter::NotificationContext;
-        use cyclops_proto::{
-            NotificationAttentionCause, NotificationBinding, NotificationManifestId,
-            NotificationTransport, ProcessInstanceId, RecipientKey, SessionInstanceId, TmuxPaneId,
-        };
-
-        let mut inner = inner_with(BTreeMap::new());
-        let session = "00000000-0000-4000-8000-000000000002"
-            .parse::<SessionInstanceId>()
-            .unwrap();
-        let tmux_pane = "%1".parse::<TmuxPaneId>().unwrap();
-        let recipient = RecipientKey::agent(inner.workspace_id, session, tmux_pane);
-        let directory = MailboxDirectory::new(
-            inner.workspace_id,
-            [MailboxIdentity {
-                key: recipient,
-                label: "codex".into(),
-            }],
-        )
-        .unwrap();
-        let store = MessageStore::open(
-            &inner.state_root,
-            Path::new("workspaces/recovery/messages.ndjson"),
-            inner.workspace_id,
-            "boot",
-        )
-        .unwrap();
-        let service = Arc::new(crate::mailbox::MailboxService::new(directory, store));
-        let accepted = service
-            .send(
-                service.admin(),
-                MailboxSend {
-                    addresses: vec!["codex".into()],
-                    recipient_keys: None,
-                    subject: "recover".into(),
-                    summary: None,
-                    body: "body".into(),
-                    fyi: false,
-                    client_key: None,
-                    supersedes: None,
-                },
-            )
-            .unwrap();
-        let queued = service
-            .prepare_oldest_notification(recipient)
-            .unwrap()
-            .unwrap();
-        let context = NotificationContext::new(
-            service.store_handle(),
-            accepted.message_id,
-            recipient,
-            queued.attempt_id,
-        );
-        context.record_gating().unwrap();
-        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
-        context
-            .record_writing(
-                ProcessInstanceId::new(69, 1).unwrap(),
-                ProcessInstanceId::new(70, 2).unwrap(),
-                ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
-                "codex",
-                NotificationTransport::Doorbell,
-                None,
-            )
-            .unwrap();
-        context
-            .record_attention(NotificationAttentionCause::VerifyFailed)
-            .unwrap();
-        Arc::get_mut(&mut inner).unwrap().mailbox = Some(Arc::clone(&service));
-        *inner.composer_recovery.lock().unwrap() =
-            crate::composer_recovery::RecoveryCoordinator::new([queued.attempt_id]);
-
-        let turn = turnkey::TurnKey::for_test(&["session", "turn"]);
-        let clean = Detection {
-            state: AgentState::Idle,
-            readings: vec![SensorReading {
-                sensor: Sensor::Screen,
-                state: AgentState::Idle,
-                rule: "composer_empty".into(),
-                ts: 9,
-            }],
-            disagreement: false,
-            decided_by: "composer_empty".into(),
-            unknown_reason: None,
-            stale: false,
-            write_ready: false,
-            write_block: None,
-            composer_semantic: Some(ComposerSemantic::Clean),
-        };
-        inner.detections.lock().unwrap().insert(
-            pane(),
-            DetEntry {
-                detection: clean.clone(),
-                binding: None,
-                manifest: Some("codex".into()),
-                occupant: Some(70),
-                agent: Some(agent),
-                in_mode: false,
-                quota_screen_clear: false,
-                hold: ComposerHold::TurnStarted { since_ms: 8 },
-                turn: Some(turn.clone()),
-                hold_owner: Some(queued.attempt_id.to_string()),
-                final_submit_conflict_owner: None,
-                composer: ComposerProjection::default(),
-                working_confirmed: false,
-                since: std::time::Instant::now(),
-            },
-        );
-        {
-            let mut ends = inner.turn_ends.lock().unwrap();
-            assert!(turnkey::PaneEnds::pin(
-                &mut ends,
-                &pane(),
-                agent,
-                "codex",
-                &turn
-            ));
-            turnkey::PaneEnds::record(&mut ends, &pane(), agent, "codex", turn.clone());
-        }
-        let live = NotificationBinding {
-            recipient,
-            pane_root: Some(ProcessInstanceId::new(69, 1).unwrap()),
-            leader: Some(ProcessInstanceId::new(70, 2).unwrap()),
-            agent: ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
-            manifest: NotificationManifestId::new("codex").unwrap(),
-        };
-
-        let messaging = inner.workspace_messaging().unwrap();
-        let probe = messaging.composer_recovery_probe(recipient);
-        let plan = messaging.reconcile_composer_recovery(
-            probe,
-            crate::messaging::MessagingComposerRecoveryObservation {
-                binding: Some(live.clone()),
-                clean_composer: false,
-                legacy_composer_ready: false,
-            },
-        );
-        let candidate =
-            crate::composer_recovery::exact_lifecycle_candidate(&inner, 0, "%1", Some(&live), true);
-        messaging.settle_composer_recovery_lifecycle(plan, candidate);
-        assert!(service.active_notification_barriers().unwrap().is_empty());
-        assert!(turnkey::PaneEnds::holds(
-            &inner.turn_ends.lock().unwrap(),
-            &pane(),
-            agent,
-            "codex",
-            &turn
-        ));
-
-        let (hold, stranded, missing_end_diagnostic) = settle_turn(
-            &mut inner.turn_ends.lock().unwrap(),
-            &pane(),
-            Some(agent),
-            Some("codex"),
-            Some(&turn),
-            ComposerHold::TurnStarted { since_ms: 8 },
-            &clean,
-        );
-        assert_eq!(hold, ComposerHold::Clear);
-        assert!(!stranded);
-        assert!(!missing_end_diagnostic);
-        assert!(!turnkey::PaneEnds::holds(
-            &inner.turn_ends.lock().unwrap(),
-            &pane(),
-            agent,
-            "codex",
-            &turn
-        ));
-    }
-
-    #[test]
-    fn a_failed_recovery_retirement_keeps_the_exact_end_and_hold() {
-        let inner = inner_with(BTreeMap::new());
-        let attempt_id = cyclops_proto::NotificationAttemptId::generate();
-        *inner.composer_recovery.lock().unwrap() =
-            crate::composer_recovery::RecoveryCoordinator::new([attempt_id]);
-        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
-        let turn = turnkey::TurnKey::for_test(&["session", "turn"]);
-        inner.detections.lock().unwrap().insert(
-            pane(),
-            DetEntry {
-                detection: Detection {
-                    state: AgentState::Idle,
-                    readings: Vec::new(),
-                    disagreement: false,
-                    decided_by: "fixture".into(),
-                    unknown_reason: None,
-                    stale: false,
-                    write_ready: false,
-                    write_block: None,
-                    composer_semantic: Some(ComposerSemantic::Clean),
-                },
-                binding: None,
-                manifest: Some("codex".into()),
-                occupant: Some(70),
-                agent: Some(agent),
-                in_mode: false,
-                quota_screen_clear: false,
-                hold: ComposerHold::TurnStarted { since_ms: 8 },
-                turn: Some(turn.clone()),
-                hold_owner: Some(attempt_id.to_string()),
-                final_submit_conflict_owner: None,
-                composer: ComposerProjection::default(),
-                working_confirmed: false,
-                since: std::time::Instant::now(),
-            },
-        );
-        {
-            let mut ends = inner.turn_ends.lock().unwrap();
-            assert!(turnkey::PaneEnds::pin(
-                &mut ends,
-                &pane(),
-                agent,
-                "codex",
-                &turn
-            ));
-            turnkey::PaneEnds::record(&mut ends, &pane(), agent, "codex", turn.clone());
-        }
-        let recipient = RecipientKey::agent(
-            inner.workspace_id,
-            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
-            "%1".parse().unwrap(),
-        );
-        let live = cyclops_proto::NotificationBinding {
-            recipient,
-            pane_root: Some(cyclops_proto::ProcessInstanceId::new(69, 1).unwrap()),
-            leader: Some(cyclops_proto::ProcessInstanceId::new(70, 2).unwrap()),
-            agent: cyclops_proto::ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
-            manifest: cyclops_proto::NotificationManifestId::new("codex").unwrap(),
-        };
-
-        assert_eq!(
-            crate::composer_recovery::exact_lifecycle_candidate(&inner, 0, "%1", Some(&live), true,),
-            Some(attempt_id)
-        );
-        let entry = inner
-            .detections
-            .lock()
-            .unwrap()
-            .get(&pane())
-            .unwrap()
-            .clone();
-        assert_eq!(entry.hold, ComposerHold::TurnStarted { since_ms: 8 });
-        assert_eq!(entry.turn.as_ref(), Some(&turn));
-        assert!(turnkey::PaneEnds::holds(
-            &inner.turn_ends.lock().unwrap(),
-            &pane(),
-            agent,
-            "codex",
-            &turn
-        ));
-    }
 
     fn inner_with(manifests: BTreeMap<String, Manifest>) -> Arc<Inner> {
         inner_with_stop(manifests, tokio::sync::watch::channel(false).1)
@@ -11181,7 +9583,6 @@ regex = ['^IDLE']
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: crate::Config::defaults(&home),
-            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
@@ -11189,9 +9590,6 @@ regex = ['^IDLE']
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: std::sync::OnceLock::new(),
-            composer_recovery: Arc::new(StdMutex::new(
-                crate::composer_recovery::RecoveryCoordinator::default(),
-            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -11544,11 +9942,9 @@ regex = ['^IDLE']
             occupant: None,
             agent: None,
             in_mode: false,
-            quota_screen_clear: false,
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
-            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -11606,8 +10002,8 @@ regex = ['^IDLE']
                 .lock()
                 .unwrap()
                 .get(&(PaneKey::new(0, "%0"), proc)),
-            Some(&"sleep".to_string()),
-            "a binding basename is memoised for the pane"
+            Some(&"/bin/sleep 30".to_string()),
+            "a binding argv is memoised for the pane"
         );
 
         // The SAME pid with a different birth is a different process, and
@@ -11801,8 +10197,8 @@ regex = ['^IDLE']
 
     /// MEASURED 2026-08-06 (Claude Code 2.1.221, tmux 3.6a, live rig): a
     /// pane running a native claude read pane_current_command "2.1.221"
-    /// (version symlink, F21), `ps -o args=` on pane_pid "-zsh", and
-    /// tpgid " 19989\n" whose args were "claude". Pins every hop of the
+    /// (version symlink, F21), `ps -o args=` on pane_pid "-zsh", and the
+    /// foreground group leader's args were "claude". Pins every hop of the
     /// binding chain against the shipped manifests on that data alone.
     #[test]
     fn measured_claude_binding_triple_2_1_221() {
@@ -11816,30 +10212,12 @@ regex = ['^IDLE']
         assert!(bind_manifest(&shipped, "2.1.221").is_none());
 
         // pane_pid's argv is the login shell and binds nothing.
-        let shell = parse_argv_basename("-zsh\n").unwrap();
-        assert_eq!(shell, "-zsh");
-        assert!(manifest_for_basename(&shipped, &shell).is_none());
-
-        // The measured tpgid line resolves to the foreground group leader.
-        assert_eq!(parse_tpgid(" 19989\n"), Some(19989));
+        assert!(manifest_for_argv(&shipped, "-zsh\n").is_none());
 
         // That leader's argv is what binds the claude manifest.
-        let agent = parse_argv_basename("claude\n").unwrap();
         assert_eq!(
-            manifest_for_basename(&shipped, &agent).map(|m| m.agent.id.as_str()),
+            manifest_for_argv(&shipped, "claude\n").map(|m| m.agent.id.as_str()),
             Some("claude")
         );
-    }
-
-    #[test]
-    fn tpgid_parses_ps_output_and_rejects_no_terminal() {
-        assert_eq!(parse_tpgid("  6254\n"), Some(6254));
-        // A pane with no controlling terminal: -1 names no process, and 0
-        // is not a pid either. Both must fall back to pane_pid rather than
-        // send `ps -p` after something that cannot exist.
-        assert_eq!(parse_tpgid("   -1\n"), None);
-        assert_eq!(parse_tpgid("0\n"), None);
-        assert_eq!(parse_tpgid("\n"), None);
-        assert_eq!(parse_tpgid("not a pid\n"), None);
     }
 }

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::decoration::DecorationSnapshot;
-use crate::input::mouse::{HitMap, HitTarget};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget};
 use crate::model::TabModel;
 use crate::theme::{self, Paint};
 
@@ -50,6 +50,7 @@ pub fn paint_tab_bar(
         if x < right {
             hits.push(
                 Rect::new(x, area.y, w.min(right - x), area.height.max(1)),
+                HitLayer::SidebarChrome,
                 HitTarget::Tab {
                     window_id: tab.window_id.clone(),
                 },
@@ -77,7 +78,7 @@ pub fn paint_tab_bar(
                 && row >= rect.y
                 && row < rect.y + rect.height
         });
-        hits.push(rect, HitTarget::NewTabButton);
+        hits.push(rect, HitLayer::SidebarChrome, HitTarget::NewTabButton);
     }
     let plus_style = if plus_hovered {
         theme::add_button_hover(paint)

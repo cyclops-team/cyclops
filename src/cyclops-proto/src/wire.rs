@@ -757,23 +757,6 @@ pub struct WorkspaceUiSetParams {
     pub protocol_version: u32,
 }
 
-/// Current opt-in post-paste force-submit setting.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ForceSubmitSettings {
-    pub enabled: bool,
-    /// Whole seconds exposed by the workspace slider, from 0 through 20.
-    pub delay_seconds: u8,
-}
-
-/// Administrative update for the post-paste force-submit escape hatch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ForceSubmitSettingsSetParams {
-    pub enabled: bool,
-    pub delay_seconds: u8,
-    #[serde(default)]
-    pub protocol_version: u32,
-}
-
 // --- Messaging (implemented from M1; types are part of protocol v1) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,6 +800,11 @@ pub struct MsgSendParams {
     /// wake. This never waits for agent work or message completion.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_wake: bool,
+    /// Paste the whole rendered message into the recipient pane and press
+    /// Enter, skipping every composer check. The journal records an
+    /// unverified raw write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1208,6 +1196,9 @@ pub struct MessageNotificationSummary {
     pub attempt_id: Option<crate::notification::NotificationAttemptId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<crate::notification::NotificationAttentionCause>,
+    /// What proved a `notified` receipt; absent when nothing did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_by: Option<crate::ledger::VerifiedBy>,
     /// Content-free detail recorded with a `verify_failed` transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_outcome: Option<crate::notification::NotificationVerifyOutcome>,
@@ -1431,6 +1422,9 @@ pub struct ReplyParams {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
+    /// See [`MsgSendParams::raw`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1506,67 +1500,6 @@ pub struct AlarmClearResult {
     /// clearance. Older daemons omit this additive field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<AlarmSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionShowParams {
-    /// Exact notification attempt id, or a message id with one unresolved match.
-    pub id: String,
-    /// Return the two local diff inputs to the authenticated client.
-    #[serde(default)]
-    pub diff: bool,
-}
-
-/// Five fail-closed checks for a staged notification attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttentionChecks {
-    pub notification_exact: bool,
-    pub trailer_anchored: bool,
-    pub process_matches: bool,
-    pub manifest_matches: bool,
-    pub terminal_action_safe: bool,
-}
-
-impl AttentionChecks {
-    pub fn all_pass(&self) -> bool {
-        self.notification_exact
-            && self.trailer_anchored
-            && self.process_matches
-            && self.manifest_matches
-            && self.terminal_action_safe
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionShowResult {
-    pub attempt_id: crate::notification::NotificationAttemptId,
-    pub message_id: crate::mailbox::MessageId,
-    pub recipient: crate::identity::RecipientKey,
-    pub checks: AttentionChecks,
-    /// Verification evidence captured when this attempt entered attention.
-    ///
-    /// Missing values identify legacy attempts. Current composer checks remain
-    /// separate because they describe the pane at inspection time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_outcome: Option<crate::notification::NotificationVerifyOutcome>,
-    /// Present only for an explicit diff request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected: Option<String>,
-    /// Present only when exact visible extraction succeeded for a diff request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionResolveParams {
-    /// Exact notification attempt id, or a message id with one unresolved match.
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionResolveResult {
-    pub attempt_id: crate::notification::NotificationAttemptId,
-    pub resolution: crate::notification::NotificationResolution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2247,6 +2180,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
@@ -2338,6 +2272,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            verified_by: None,
             verify_outcome: Some(crate::NotificationVerifyOutcome {
                 kind: crate::NotificationVerifyFailureKind::Mismatch,
                 observed_composer: crate::ComposerState::ComposerAmbiguous,
@@ -2432,6 +2367,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
@@ -2471,6 +2407,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
@@ -2562,6 +2499,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
@@ -2622,52 +2560,5 @@ mod tests {
                 .as_deref(),
             Some("reviewer")
         );
-    }
-
-    #[test]
-    fn attention_show_omits_diff_inputs_until_requested() {
-        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
-        let base = AttentionShowResult {
-            attempt_id: crate::NotificationAttemptId::parse(
-                "att-00000000-0000-4000-8000-000000000003",
-            )
-            .unwrap(),
-            message_id: crate::MessageId::new("m-private").unwrap(),
-            recipient: crate::RecipientKey::agent(workspace, session, "%3".parse().unwrap()),
-            checks: AttentionChecks {
-                notification_exact: true,
-                trailer_anchored: true,
-                process_matches: true,
-                manifest_matches: true,
-                terminal_action_safe: true,
-            },
-            verify_outcome: None,
-            expected: None,
-            observed: None,
-        };
-
-        let value = serde_json::to_value(&base).unwrap();
-        assert!(value.get("expected").is_none());
-        assert!(value.get("observed").is_none());
-        assert!(base.checks.all_pass());
-
-        let legacy: AttentionShowResult = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(legacy.verify_outcome, None);
-
-        let with_diff = AttentionShowResult {
-            verify_outcome: Some(crate::NotificationVerifyOutcome {
-                kind: crate::NotificationVerifyFailureKind::Timeout,
-                observed_composer: crate::ComposerState::ComposerAmbiguous,
-            }),
-            expected: Some("expected bytes".into()),
-            observed: Some("observed bytes".into()),
-            ..base
-        };
-        let value = serde_json::to_value(&with_diff).unwrap();
-        assert_eq!(value["expected"], "expected bytes");
-        assert_eq!(value["observed"], "observed bytes");
-        assert_eq!(value["verify_outcome"]["kind"], "timeout");
-        assert!(value.get("diff").is_none());
     }
 }

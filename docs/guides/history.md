@@ -41,9 +41,9 @@ Announcements carry a distinct `fyi` mark. A broadcast is one line:
   2m  admin → 2 agents  fyi  Standup in 5
 ```
 
-Standard mailbox and notification state lives in `cyclops messages`. Old
-direct-delivery records may still carry legacy delivery badges; those fields
-remain readable for compatibility and are not the standard send contract.
+Standard mailbox and notification state lives in `cyclops messages`. Records
+an older daemon wrote may still carry direct-delivery badges; those fields
+remain readable and are never written now.
 
 ## Threads
 
@@ -52,9 +52,8 @@ cyclops thread m-3f9c2a
 ```
 
 One message and every reply that chains to it, oldest first. Bodies follow the
-same sender-or-claimant visibility rule as history. Legacy state and gate lines
-remain available in `--json` when the underlying compatibility record contains
-them.
+same sender-or-claimant visibility rule as history. The session record's state
+and gate lines are available in `--json`.
 
 ## Scripts
 
@@ -82,7 +81,8 @@ jq -c 'select(.kind == "msg" or .kind == "fyi")' \
 ```
 
 Treat raw journal bytes as sensitive owner-only state. Session records under
-`$CYCLOPS_HOME/ledger/` contain pane state and legacy direct delivery. New
+`$CYCLOPS_HOME/ledger/` contain pane state and each attempt's session
+transitions. New
 mailbox messages are never copied there.
 
 ## Exit codes

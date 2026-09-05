@@ -7,13 +7,23 @@
 
 	// The shipped manifests (resources/manifests/*.toml): each row is
 	// the CLI's command, the way a pane names it, and the manifest's display
-	// name. The next agent is the reader's, and it gets the mark.
+	// name. Five are measured against a live CLI; the seven marked unverified
+	// are written from vendor documentation and say so in the manifest
+	// (version_tested = "unverified"). The next agent is the reader's, and it
+	// gets the mark.
 	const detected = [
 		{ cmd: 'claude', name: 'Claude Code' },
 		{ cmd: 'codex', name: 'Codex CLI' },
 		{ cmd: 'cursor-agent', name: 'Cursor Agent' },
 		{ cmd: 'agy', name: 'Antigravity CLI' },
-		{ cmd: 'kimi', name: 'Kimi Code CLI' }
+		{ cmd: 'kimi', name: 'Kimi Code CLI' },
+		{ cmd: 'gemini', name: 'Gemini CLI (unverified)' },
+		{ cmd: 'qwen', name: 'Qwen Code (unverified)' },
+		{ cmd: 'goose', name: 'goose (unverified)' },
+		{ cmd: 'opencode', name: 'OpenCode (unverified)' },
+		{ cmd: 'amp', name: 'Amp (unverified)' },
+		{ cmd: 'crush', name: 'Crush (unverified)' },
+		{ cmd: 'aider', name: 'aider (unverified)' }
 	];
 </script>
 
@@ -24,8 +34,8 @@
 			<h3 class="statement">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 			<p class="lede">
 				Cyclops detects supported agents automatically. Each one is described by a small manifest
-				file: what its process is called, how it reports back, and how to tell when it's busy. 5
-				agents detected out of the box. Teaching Cyclops a new agent CLI is one file.
+				file: what its process is called, how it reports back, and how to tell when it's busy. 12
+				agents detected out of the box, five of them measured against a live CLI. Teaching Cyclops a new agent CLI is one file.
 			</p>
 		</div>
 		<div class="panel card">

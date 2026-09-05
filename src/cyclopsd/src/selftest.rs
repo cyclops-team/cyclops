@@ -12,14 +12,14 @@
 //!   pane no hook edge has EVER reached this daemon run, true once one has.
 //! - `hooks.verify`: the per-event last-seen ages behind that bit.
 //! - `hooks.selftest`: a daemon-driven no-op round trip through the normal
-//!   delivery pipeline (fyi, subject "[cyclops] hook self-test") reporting
-//!   whether the ACK hook fired with the marker. Costs the target one
-//!   trivial turn.
+//!   mailbox path (an fyi from the admin identity, subject "[cyclops] hook
+//!   self-test") reporting whether the ACK hook fired with that exact
+//!   doorbell. Costs the target one trivial turn.
 //!
-//! The first delivery that times out its tier-1 ACK window on a pane with
-//! zero edges ever seen also pings the admin once, naming the likely F1
-//! cause; the delivery itself downgrades to screen evidence as usual (no
-//! hang, no loss).
+//! The first notification that times out its tier-1 ACK window on a pane
+//! with zero edges ever seen also pings the admin once, naming the likely
+//! F1 cause; the notification itself downgrades to screen evidence as usual
+//! (no hang, no loss).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,18 +27,20 @@ use std::sync::{Arc, Mutex as StdMutex};
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     DeliveryState, HookEdgeAge, HooksSelftestParams, HooksSelftestResult, HooksVerifyParams,
-    HooksVerifyResult, Kind, LedgerLine, MsgSendParams, NotifyLevel, WireError,
+    HooksVerifyResult, Kind, LedgerLine, MessageId, MsgSendParams, NotificationState, NotifyLevel,
+    VerifiedBy, WireError,
 };
 use serde_json::{json, Value};
 use tokio::time::{Duration, Instant};
 
-use crate::{ack, daemon_line, delivery, unix_ms, Inner, PaneKey};
+use crate::{ack, daemon_line, delivery, server, unix_ms, Inner, PaneKey};
 
-/// Default and ceiling for how long hooks.selftest waits for its delivery
-/// to resolve. The happy path resolves inside the receipt block; this only
-/// bounds a busy or wedged target.
+/// Default and ceiling for how long hooks.selftest waits for its
+/// notification to resolve. The happy path resolves inside the receipt
+/// block; this only bounds a busy or wedged target.
 const SELFTEST_DEFAULT_MS: u64 = 10_000;
 const SELFTEST_MAX_MS: u64 = 60_000;
+const SELFTEST_SUBJECT: &str = "[cyclops] hook self-test";
 
 /// One pane's edges: normalized event name -> (raw vendor spelling for
 /// display, last-seen unix ms).
@@ -529,9 +531,9 @@ pub(crate) async fn verify(
     Ok(serde_json::to_value(result).expect("hooks.verify result serializes"))
 }
 
-/// hooks.selftest: send one fyi marker through the normal delivery
-/// pipeline and report whether the ACK hook fired with it. The recipient
-/// is asked for no action, so the cost is one trivial turn.
+/// hooks.selftest: send one fyi through the normal mailbox path and report
+/// whether the ACK hook fired with that exact doorbell. The recipient is
+/// asked for no action, so the cost is one trivial turn.
 pub(crate) async fn selftest(
     inner: &Arc<Inner>,
     params: HooksSelftestParams,
@@ -551,21 +553,28 @@ pub(crate) async fn selftest(
                 .map(|m| (Some(m.agent.id.clone()), tier_of(m)))
         })
         .unwrap_or((None, 2));
+    let messaging = inner.workspace_messaging().ok_or_else(|| WireError {
+        code: "mailbox_unavailable".to_string(),
+        message: "durable workspace identity is not connected".to_string(),
+        data: None,
+    })?;
+    let recipient = messaging
+        .identity_for_address(&params.target)
+        .map_err(server::mailbox_service_error)?;
 
     let timeout = params
         .timeout_ms
         .unwrap_or(SELFTEST_DEFAULT_MS)
         .min(SELFTEST_MAX_MS);
     let started = Instant::now();
-    // Subscribe before sending so a resolution racing the receipt is never
-    // missed.
-    let mut rx = inner.events.subscribe();
+    let started_ms = unix_ms();
     let send_params = MsgSendParams {
+        raw: false,
         to: vec![params.target.clone()],
         recipient_keys: None,
         expected_caller: None,
-        subject: "[cyclops] hook self-test".to_string(),
-        summary: None,
+        subject: SELFTEST_SUBJECT.to_string(),
+        summary: Some("Hook self-test from Cyclops. No reply is needed.".to_string()),
         body: "Reply not needed.".to_string(),
         fyi: true,
         client_key: None,
@@ -574,38 +583,73 @@ pub(crate) async fn selftest(
         wait: None,
         require_wake: false,
     };
-    let receipt = crate::compatibility::deliver_payload(inner, "cyclopsd", send_params).await?;
-    let msg_id = receipt["msg_id"].as_str().unwrap_or_default().to_string();
-    let mut state: DeliveryState =
-        serde_json::from_value(receipt["deliveries"][0]["state"].clone())
-            .unwrap_or(DeliveryState::Queued);
+    let accepted = messaging
+        .send(messaging.admin_identity(), send_params)
+        .await
+        .map_err(server::mailbox_service_error)?;
+    let msg_id = accepted.msg_id.clone();
+    let message_id = MessageId::new(msg_id.clone()).map_err(|error| WireError {
+        code: "internal".to_string(),
+        message: error.to_string(),
+        data: None,
+    })?;
 
-    // The receipt resolves on the idle path; a busy target answers queued
-    // and the delivery-state stream carries the resolution.
+    // The in-memory attempt is where a hook acknowledgement lands
+    // (`delivery::resolve_hook_ack`). Holding the handle keeps its final
+    // state readable after the worker retires it.
     let deadline = started + Duration::from_millis(timeout);
-    while !resolved(state) {
-        let ev = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            ev = rx.recv() => ev,
-        };
-        match ev {
-            Ok(e) if e.event == "delivery-state" && e.data["id"] == msg_id.as_str() => {
-                if let Ok(s) = serde_json::from_value::<DeliveryState>(e.data["to_state"].clone()) {
-                    state = s;
-                }
+    let handle = loop {
+        let record = messaging
+            .notification_for_message(recipient.key, &message_id)
+            .map_err(server::mailbox_service_error)?;
+        if let Some(record) = &record {
+            if let Some(handle) = inner.engine.notification_handle(record.attempt_id) {
+                break Some(handle);
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Reconcile on doubt: the ledger has the truth.
-                if let Some(s) = ledger_state(inner, session_idx, &msg_id, &params.target) {
-                    state = s;
-                }
+            if record.state != NotificationState::Queued || Instant::now() >= deadline {
+                break None;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        } else if Instant::now() >= deadline {
+            break None;
         }
-    }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let (state, hook_ack) = match handle {
+        Some(handle) => {
+            let mut rx = handle.state_tx.subscribe();
+            let _ = tokio::time::timeout_at(deadline, rx.wait_for(|s| resolved(*s))).await;
+            let (state, _, verified_by, _, _) = handle.snapshot();
+            (state, verified_by == Some(VerifiedBy::Hook))
+        }
+        None => {
+            // The worker already retired the attempt, or never owned it.
+            // The durable record gives the state; the hook edge record is
+            // the only remaining evidence that the ACK hook fired for the
+            // current occupant after this send began.
+            let record = messaging
+                .notification_for_message(recipient.key, &message_id)
+                .map_err(server::mailbox_service_error)?;
+            let state = record
+                .map(|record| delivery_state_of(record.state))
+                .unwrap_or(DeliveryState::Queued);
+            let ack_seen = inner
+                .watcher_of(session_idx)
+                .and_then(|watcher| watcher.pane(&pane_id))
+                .and_then(|row| crate::fusion::admitted_vendor(inner, session_idx, &row))
+                .zip(manifest_id.as_deref())
+                .and_then(|((_, agent), manifest)| {
+                    let ack = inner.manifests.get(manifest)?.hooks.ack.as_deref()?;
+                    inner
+                        .hook_liveness
+                        .snapshot(&PaneKey::new(session_idx, &pane_id), agent, manifest)
+                        .get(&ack::normalize_event(ack))
+                        .map(|(_, ts)| *ts >= started_ms)
+                })
+                .unwrap_or(false);
+            (state, ack_seen && resolved(state))
+        }
+    };
 
-    let hook_ack = state == DeliveryState::DeliveredVerified;
     let result = HooksSelftestResult {
         target: params.target.clone(),
         msg_id: msg_id.clone(),
@@ -645,27 +689,30 @@ fn resolved(s: DeliveryState) -> bool {
     )
 }
 
-/// Latest delivery state for (msg, recipient) read back from the session
-/// ledger, for the lagged-stream path only.
-fn ledger_state(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    msg_id: &str,
-    to: &str,
-) -> Option<DeliveryState> {
-    let slot = inner.session(session_idx)?;
-    let lines = slot.ledger.read_after(0).ok()?;
-    lines
-        .iter()
-        .rev()
-        .filter(|l| matches!(l.kind, Kind::State) && l.id == msg_id)
-        .find_map(|l| {
-            let data = l.data.as_ref()?;
-            if data.get("to")?.as_str()? != to {
-                return None;
-            }
-            serde_json::from_value(data.get("to_state")?.clone()).ok()
-        })
+/// The result's `state` field predates the mailbox path and keeps its
+/// vocabulary. A durable notification state maps onto it without inventing
+/// receipt evidence: `notified` says the pane took the row, not which tier
+/// proved it.
+fn delivery_state_of(state: NotificationState) -> DeliveryState {
+    match state {
+        NotificationState::Queued => DeliveryState::Queued,
+        NotificationState::Gating => DeliveryState::Gating,
+        NotificationState::Writing => DeliveryState::Pasting,
+        NotificationState::Staged => DeliveryState::Staged,
+        NotificationState::Submitting | NotificationState::Submitted => DeliveryState::Submitted,
+        NotificationState::Notified | NotificationState::SubmittedUnverified => {
+            DeliveryState::DeliveredUnverified
+        }
+        NotificationState::QuotaHeld | NotificationState::QuotaResetObserved => {
+            DeliveryState::ParkedBlockedQuota
+        }
+        NotificationState::BlockedPreWrite
+        | NotificationState::AttentionRequired
+        | NotificationState::Withdrawn
+        | NotificationState::WithdrawnAfterStaging
+        | NotificationState::WithdrawnByOperator
+        | NotificationState::Superseded => DeliveryState::AttentionRequired,
+    }
 }
 
 #[cfg(test)]

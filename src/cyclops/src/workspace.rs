@@ -644,7 +644,7 @@ fn sh_quote(s: &str) -> String {
 /// Layout order is the order `adopt` puts the names on, so the CLI that
 /// starts under a name is the one that was listed against it. A pane with
 /// no label keeps whatever command it had and stays unmarked: nothing
-/// addresses the `ops` dock, its `cyclops ui` is part of the arrangement
+/// addresses the `ops` dock, its `cyclops watch` is part of the arrangement
 /// rather than part of the fleet, and starting it was never asked for. The
 /// mark is what keeps the two apart in the same build, so it goes on here,
 /// beside the write it belongs to.
@@ -1262,15 +1262,10 @@ fn wire_vendor_homes() -> (
 /// Claude receives both this safe merge for normal direct launches and a
 /// per-pane settings file when Cyclops starts the pane itself.
 fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
-    use crate::hookset::CliKind;
     let mut out = Vec::new();
-    for kind in [
-        CliKind::Claude,
-        CliKind::Codex,
-        CliKind::Agy,
-        CliKind::Cursor,
-        CliKind::Kimi,
-    ] {
+    // The consumer catalog is the one list of hook-wired vendors; a vendor
+    // added there is wired here without a second list to forget.
+    for kind in crate::consumer::SHIPPED.iter().map(|spec| spec.kind) {
         match crate::hookset::wire_vendor(kind) {
             Ok(Some(w)) => out.push(w),
             // Not installed is ordinary and not worth a line.
@@ -2150,7 +2145,7 @@ mod tests {
         );
         assert_eq!(rows[1].panes.len(), 1);
         assert_eq!(rows[1].panes[0].label, None, "the dock is not an agent");
-        assert_eq!(rows[1].panes[0].command.as_deref(), Some("cyclops ui"));
+        assert_eq!(rows[1].panes[0].command.as_deref(), Some("cyclops watch"));
     }
 
     /// The ladder: each preset is the one before it plus a pane, and the
@@ -2193,7 +2188,7 @@ mod tests {
                 (Some("implementer".into()), Some("claude".into())),
                 (Some("reviewer".into()), Some("codex".into())),
                 (Some("tests".into()), Some("agy".into())),
-                (None, Some("cyclops ui".into())),
+                (None, Some("cyclops watch".into())),
             ]
         );
         // Still a layout cyclops will build.
@@ -2316,7 +2311,10 @@ mod tests {
         // would have worked.
         let why = refuse(&["cluade", "codex"], &duo, "preset duo");
         assert!(why.starts_with("no agent CLI called \"cluade\""), "{why}");
-        assert!(why.contains("agy, claude, codex, cursor"), "{why}");
+        assert!(
+            why.contains("agy, aider, amp, claude, codex, crush, cursor, gemini, goose, kimi, opencode, qwen"),
+            "{why}"
+        );
 
         // An empty id: a stray comma, not a CLI called "".
         assert!(refuse(&["claude", ""], &duo, "preset duo").contains("empty id"));

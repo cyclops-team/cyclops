@@ -1,7 +1,8 @@
 #!/bin/sh
 #
-# Cyclops installer. Builds both binaries, puts them somewhere your shell
-# looks, and sets up the home directory. One command, then `cyclops`.
+# Cyclops installer. Gets both binaries onto this machine, puts them
+# somewhere your shell looks, and sets up the home directory. One command,
+# then `cyclops`.
 #
 #   ./scripts/install.sh              from a clone
 #   curl -fsSL https://www.usecyclops.dev/install.sh | sh
@@ -10,9 +11,17 @@
 # Flags:
 #   --prefix DIR   install the binaries here instead of picking a directory
 #   --no-path      never edit a shell profile; print the line to add instead
+#   --source       skip the release download and always build from source
 #   --uninstall    stop the daemon, remove the complete Cyclops state home,
 #                  binaries, and the profile block
 #   --help
+#
+# Without --source this tries a published release for the requested version
+# (CYCLOPS_VERSION, default the latest) and this host's platform first: a
+# download and a SHA256 check, no compiler. No release for this host, no
+# release at that version, or anything that fails along the way falls back
+# to the source build this installer has always done, with a message
+# saying so. Either way the result is the same matched, activated pair.
 #
 # What it will and will not do: it never uses sudo, never touches your
 # tmux config, and never edits a shell profile without printing the exact
@@ -22,12 +31,18 @@
 # stopping its matched daemon; unrelated vendor configuration stays intact.
 #
 # POSIX sh on purpose. It runs before cyclops exists on the machine, so it
-# cannot assume anything more than the system shell.
+# cannot assume anything more than the system shell. No dependency beyond
+# curl, tar, and shasum or sha256sum, on top of what the source build
+# already needed.
 
 set -eu
 
 REPO_URL="${CYCLOPS_REPO:-https://github.com/cyclops-team/cyclops.git}"
 REF="${CYCLOPS_REF:-main}"
+# Same repository, as the HTTPS base the release download path below reads
+# instead of a git remote: release pages, the "latest" redirect, and asset
+# downloads all live under this.
+RELEASE_REPO="${REPO_URL%.git}"
 
 # Source installs must not hide an optimized Cargo build under macOS's
 # per-process /private temporary directory. Keep every rebuildable installer
@@ -52,6 +67,7 @@ MARK_END="# <<< cyclops <<<"
 PREFIX=""
 NO_PATH=0
 UNINSTALL=0
+SOURCE_ONLY=0
 
 # ---------------------------------------------------------------------------
 # output
@@ -87,7 +103,7 @@ incomplete() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-    say "Cyclops installer. Builds cyclops and cyclopsd from source."
+    say "Cyclops installer. Downloads a release, or builds cyclops and cyclopsd from source."
     say ""
     say "Usage:"
     say "  curl -fsSL https://www.usecyclops.dev/install.sh | sh"
@@ -96,8 +112,11 @@ usage() {
     say "Options:"
     say "  --prefix DIR   install the binaries in DIR"
     say "  --no-path      do not edit a shell profile"
+    say "  --source       skip the release download; always build from source"
     say "  --uninstall    stop Cyclops, remove its state, binaries, hooks, skills, and PATH block"
     say "  --help         show this help"
+    say ""
+    say "CYCLOPS_VERSION selects the release to download (default: latest)."
     exit 0
 }
 
@@ -110,6 +129,7 @@ while [ $# -gt 0 ]; do
         --prefix)    [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX="$2"; shift 2 ;;
         --prefix=*)  PREFIX="${1#--prefix=}"; shift ;;
         --no-path)   NO_PATH=1; shift ;;
+        --source)    SOURCE_ONLY=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help)   usage ;;
         *)           die "unknown option: $1" "rerun the installer with --help to list its options" ;;
@@ -348,38 +368,15 @@ elif [ "$tmux_major" = "3" ] && [ -n "$tmux_minor" ] && [ "$tmux_minor" -lt 2 ] 
 fi
 note "tmux $tmux_version"
 
-# Cyclops builds from source, so a machine without cargo cannot finish.
-# Rather than stopping to hand the operator the rustup command, run it:
-# rustup's own installer is non-interactive with -y, --no-modify-path
-# keeps it out of shell profiles (this installer already manages PATH for
-# its own prefix and does not want a second writer), and sourcing the env
-# file puts cargo on PATH for this run only. CYCLOPS_NO_RUSTUP=1 declines
-# and gets the old refusal with the command to run by hand.
-if ! have cargo; then
-    if [ -n "${CYCLOPS_NO_RUSTUP:-}" ]; then
-        die "cargo is not installed; cyclops builds from source" \
-            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    fi
-    step "cargo not found; installing Rust with rustup (CYCLOPS_NO_RUSTUP=1 declines)"
-    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --default-toolchain stable; then
-        die "the rustup install failed" \
-            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    fi
-    # shellcheck disable=SC1091
-    . "${CARGO_HOME:-$HOME/.cargo}/env"
-    have cargo || die "rustup finished but cargo is still not on PATH" \
-        "open a new shell and run this installer again"
-    note "installed rust via rustup"
-fi
-note "cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
-
 # ---------------------------------------------------------------------------
-# 2. the source
+# 2. a release, or the source
 # ---------------------------------------------------------------------------
 
 # Run from a clone, build that clone. Piped from the network with no clone
-# around it, fetch one. Both end with SRC pointing at a workspace root.
+# around it, a source build fetches one. Both end with SRC pointing at a
+# workspace root; the download path below never sets it. Computed before
+# any download attempt because whether an operator has a local install.sh
+# to rerun does not depend on which install path this run takes.
 SRC=""
 case "$0" in
     */install.sh)
@@ -387,89 +384,258 @@ case "$0" in
         [ -f "$candidate/Cargo.toml" ] && SRC="$candidate"
         ;;
 esac
+if [ -n "$SRC" ]; then
+    UNINSTALL_HINT='./scripts/install.sh --uninstall'
+else
+    UNINSTALL_HINT='curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall'
+fi
 
 CLONED=""
 PAIR_SOURCE=""
+DOWNLOAD_DIR=""
 cleanup() {
     [ -z "$PAIR_SOURCE" ] || rm -rf "$PAIR_SOURCE"
+    [ -z "$DOWNLOAD_DIR" ] || rm -rf "$DOWNLOAD_DIR"
     [ -z "$CLONED" ] || rm -rf "$CLONED"
 }
 trap cleanup EXIT INT TERM
 
 mkdir -p "$INSTALLER_CACHE" 2>/dev/null ||
-    die "cannot create the Cyclops build cache at $INSTALLER_CACHE"
+    die "cannot create the Cyclops installer cache at $INSTALLER_CACHE"
 chmod 700 "$INSTALLER_CACHE" 2>/dev/null ||
-    die "cannot secure the Cyclops build cache at $INSTALLER_CACHE"
-note "build cache $INSTALLER_CACHE"
+    die "cannot secure the Cyclops installer cache at $INSTALLER_CACHE"
+note "installer cache $INSTALLER_CACHE"
 
-if [ -z "$SRC" ]; then
-    have git || die "git is not installed, and there is no clone to build from" \
-        "install git, or clone the repo and run ./scripts/install.sh inside it"
-    step "fetching the source"
-    CLONED="$(mktemp -d "$INSTALLER_CACHE/source.XXXXXX")"
-    git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
-        die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
-    SRC="$CLONED/cyclops"
-    note "$REPO_URL at $REF"
-else
-    note "building the clone at $SRC"
-fi
-
-if [ -n "$CLONED" ]; then
-    UNINSTALL_HINT='curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall'
-else
-    UNINSTALL_HINT='./scripts/install.sh --uninstall'
-fi
-
-# ---------------------------------------------------------------------------
-# 3. build
-# ---------------------------------------------------------------------------
-
-step "building cyclops and cyclopsd"
-say "${DIM}  a first build takes a few minutes${OFF}"
-# The dist profile is release without the thin-LTO link step, and the two
-# named packages skip workspace members an install never runs. Both trims
-# exist because this compile happens on every installing machine.
-BUILD_TARGET="${CARGO_TARGET_DIR:-$INSTALLER_CACHE/target}"
-( cd "$SRC" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
-
-TARGET="$BUILD_TARGET/dist"
-for name in cyclops cyclopsd; do
-    [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
-done
-
-# Cargo may hard-link a top-level binary to its hashed build artifact. Copy
-# both binaries into one private directory so the validator executes and
-# stages the same unlinked candidate pair.
-#
-# F81 records a macOS fcopyfile failure after a successful Cargo build. The
-# private destination is newly created and not public yet, so a verified byte
-# copy is a safe fallback rather than a partial install.
-copy_private_candidate() {
-    if cp "$1" "$2" 2>/dev/null && cmp -s "$1" "$2"; then
-        return 0
-    fi
-    rm -f "$2" || return 1
-    if candidate_copy_error="$(dd if="$1" of="$2" bs=65536 2>&1)"; then
-        if cmp -s "$1" "$2"; then
-            return 0
-        fi
-        printf '%s\n' "private candidate copy did not preserve $1" >&2
-    else
-        printf '%s\n' "$candidate_copy_error" >&2
-    fi
-    return 1
+# The target triple release-binaries.yml publishes a pair for, or empty when
+# this host has none. Keep this in sync with the workflow's build matrix.
+host_target() {
+    case "$(uname -s)" in
+        Darwin)
+            case "$(uname -m)" in
+                arm64)  printf 'aarch64-apple-darwin\n' ;;
+                x86_64) printf 'x86_64-apple-darwin\n' ;;
+            esac
+            ;;
+        Linux)
+            case "$(uname -m)" in
+                x86_64 | amd64)  printf 'x86_64-unknown-linux-gnu\n' ;;
+                aarch64 | arm64) printf 'aarch64-unknown-linux-gnu\n' ;;
+            esac
+            ;;
+    esac
 }
 
-PAIR_SOURCE="$(mktemp -d "$INSTALLER_CACHE/pair.XXXXXX")" ||
-    die "cannot create a private candidate directory"
-chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
-for name in cyclops cyclopsd; do
-    copy_private_candidate "$TARGET/$name" "$PAIR_SOURCE/$name" ||
-        die "cannot stage $name in the private candidate directory"
-    chmod 755 "$PAIR_SOURCE/$name" ||
-        die "cannot make the private $name candidate executable"
-done
+# GitHub's release page already redirects "latest" to the tagged release,
+# so this reads that redirect instead of calling the API: no token, and
+# none of the unauthenticated API's tight rate limit. A pinned version
+# skips the network round trip and is used as given.
+resolve_release_tag() {
+    case "$1" in
+        latest)
+            effective="$(curl -fsSL --connect-timeout 5 --max-time 15 \
+                -o /dev/null -w '%{url_effective}' \
+                "$RELEASE_REPO/releases/latest" 2>/dev/null)" || return 1
+            case "$effective" in
+                */releases/tag/*) printf '%s\n' "${effective##*/releases/tag/}" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        v*) printf '%s\n' "$1" ;;
+        *)  printf 'v%s\n' "$1" ;;
+    esac
+}
+
+# Download, unpack, and verify one released pair for this host. Sets
+# PAIR_SOURCE and returns 0 only once both binaries are staged, executable,
+# and checked against the SHA256SUMS the release archive carries itself.
+# Any earlier failure cleans up its own scratch directory and returns 1, so
+# the caller can fall back to a source build without special-casing why.
+try_download_pair() {
+    target="$(host_target)"
+    if [ -z "$target" ]; then
+        note "no published release build for $(uname -s) $(uname -m)"
+        return 1
+    fi
+    have curl || { note "curl is not installed; cannot download a release"; return 1; }
+    have tar || { note "tar is not installed; cannot unpack a release"; return 1; }
+
+    requested="${CYCLOPS_VERSION:-latest}"
+    tag="$(resolve_release_tag "$requested")" || {
+        note "could not resolve the $requested Cyclops release"
+        return 1
+    }
+    version="${tag#v}"
+    asset="cyclops-$version-$target.tar.gz"
+    url="$RELEASE_REPO/releases/download/$tag/$asset"
+
+    DOWNLOAD_DIR="$(mktemp -d "$INSTALLER_CACHE/release.XXXXXX")" || return 1
+    chmod 700 "$DOWNLOAD_DIR" || { rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""; return 1; }
+
+    step "downloading $asset"
+    if ! curl -fsSL --connect-timeout 5 --max-time 120 -o "$DOWNLOAD_DIR/$asset" "$url"; then
+        note "no release asset at $url"
+        rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+        return 1
+    fi
+    if ! ( cd "$DOWNLOAD_DIR" && tar xzf "$asset" ); then
+        note "$asset did not unpack"
+        rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+        return 1
+    fi
+
+    staged="$DOWNLOAD_DIR/cyclops-$version-$target"
+    if [ ! -f "$staged/SHA256SUMS" ]; then
+        note "$asset is missing SHA256SUMS"
+        rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+        return 1
+    fi
+    # The assignment is the `if` condition, not a bare statement: under
+    # `set -e` a bare `verify_output=$(cmd)` would exit this whole script
+    # the moment a checksum fails to verify, instead of falling back below.
+    verify_output=""
+    verify_status=0
+    if have sha256sum; then
+        if verify_output="$(cd "$staged" && sha256sum -c SHA256SUMS 2>&1)"; then
+            verify_status=0
+        else
+            verify_status=$?
+        fi
+    elif have shasum; then
+        if verify_output="$(cd "$staged" && shasum -a 256 -c SHA256SUMS 2>&1)"; then
+            verify_status=0
+        else
+            verify_status=$?
+        fi
+    else
+        note "neither sha256sum nor shasum is installed; cannot verify $asset"
+        rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+        return 1
+    fi
+    if [ "$verify_status" -ne 0 ]; then
+        note "checksum verification failed for $asset"
+        printf '%s\n' "$verify_output" >&2
+        rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+        return 1
+    fi
+    note "verified $asset (sha256)"
+
+    for name in cyclops cyclopsd; do
+        if [ ! -f "$staged/$name" ]; then
+            note "$asset is missing $name"
+            rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+            return 1
+        fi
+        chmod 755 "$staged/$name" || {
+            note "cannot make the downloaded $name executable"
+            rm -rf "$DOWNLOAD_DIR"; DOWNLOAD_DIR=""
+            return 1
+        }
+    done
+
+    PAIR_SOURCE="$staged"
+    return 0
+}
+
+METHOD=source
+if [ "$SOURCE_ONLY" -eq 0 ]; then
+    if try_download_pair; then
+        METHOD=download
+    else
+        note "falling back to a source build"
+    fi
+fi
+
+if [ "$METHOD" = "source" ]; then
+    # Cyclops builds from source when there is no release for this host or
+    # none was requested. A machine without cargo cannot finish that build.
+    # Rather than stopping to hand the operator the rustup command, run it:
+    # rustup's own installer is non-interactive with -y, --no-modify-path
+    # keeps it out of shell profiles (this installer already manages PATH
+    # for its own prefix and does not want a second writer), and sourcing
+    # the env file puts cargo on PATH for this run only. CYCLOPS_NO_RUSTUP=1
+    # declines and gets the old refusal with the command to run by hand.
+    if ! have cargo; then
+        if [ -n "${CYCLOPS_NO_RUSTUP:-}" ]; then
+            die "cargo is not installed; cyclops builds from source" \
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        fi
+        step "cargo not found; installing Rust with rustup (CYCLOPS_NO_RUSTUP=1 declines)"
+        if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain stable; then
+            die "the rustup install failed" \
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        fi
+        # shellcheck disable=SC1091
+        . "${CARGO_HOME:-$HOME/.cargo}/env"
+        have cargo || die "rustup finished but cargo is still not on PATH" \
+            "open a new shell and run this installer again"
+        note "installed rust via rustup"
+    fi
+    note "cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
+
+    if [ -z "$SRC" ]; then
+        have git || die "git is not installed, and there is no clone to build from" \
+            "install git, or clone the repo and run ./scripts/install.sh inside it"
+        step "fetching the source"
+        CLONED="$(mktemp -d "$INSTALLER_CACHE/source.XXXXXX")"
+        git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
+            die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
+        SRC="$CLONED/cyclops"
+        note "$REPO_URL at $REF"
+    else
+        note "building the clone at $SRC"
+    fi
+
+    # ---------------------------------------------------------------------------
+    # 3. build
+    # ---------------------------------------------------------------------------
+
+    step "building cyclops and cyclopsd"
+    say "${DIM}  a first build takes a few minutes${OFF}"
+    # The dist profile is release without the thin-LTO link step, and the two
+    # named packages skip workspace members an install never runs. Both trims
+    # exist because this compile happens on every installing machine.
+    BUILD_TARGET="${CARGO_TARGET_DIR:-$INSTALLER_CACHE/target}"
+    ( cd "$SRC" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
+
+    TARGET="$BUILD_TARGET/dist"
+    for name in cyclops cyclopsd; do
+        [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
+    done
+
+    # Cargo may hard-link a top-level binary to its hashed build artifact. Copy
+    # both binaries into one private directory so the validator executes and
+    # stages the same unlinked candidate pair.
+    #
+    # F81 records a macOS fcopyfile failure after a successful Cargo build. The
+    # private destination is newly created and not public yet, so a verified byte
+    # copy is a safe fallback rather than a partial install.
+    copy_private_candidate() {
+        if cp "$1" "$2" 2>/dev/null && cmp -s "$1" "$2"; then
+            return 0
+        fi
+        rm -f "$2" || return 1
+        if candidate_copy_error="$(dd if="$1" of="$2" bs=65536 2>&1)"; then
+            if cmp -s "$1" "$2"; then
+                return 0
+            fi
+            printf '%s\n' "private candidate copy did not preserve $1" >&2
+        else
+            printf '%s\n' "$candidate_copy_error" >&2
+        fi
+        return 1
+    }
+
+    PAIR_SOURCE="$(mktemp -d "$INSTALLER_CACHE/pair.XXXXXX")" ||
+        die "cannot create a private candidate directory"
+    chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
+    for name in cyclops cyclopsd; do
+        copy_private_candidate "$TARGET/$name" "$PAIR_SOURCE/$name" ||
+            die "cannot stage $name in the private candidate directory"
+        chmod 755 "$PAIR_SOURCE/$name" ||
+            die "cannot make the private $name candidate executable"
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 4. install the binaries

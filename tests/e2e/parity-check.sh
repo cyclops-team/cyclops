@@ -139,6 +139,21 @@ cleanup() {
         tail -30 "$log" | sed 's/^/   /'
       fi
     done
+    # The mailbox journal is where a doorbell that never reached the pane
+    # says why: the last notification facts name the state and the hold
+    # cause the gate recorded.
+    find "${CYCLOPS_HOME:-/nonexistent}" -name '*.ndjson' 2>/dev/null | while read -r journal; do
+      if grep -aq '"notification' "$journal"; then
+        echo
+        echo "== $journal (notification facts, last 40):"
+        grep -a '"notification' "$journal" | tail -40 \
+          | jq -c '{seq, kind, type: .data.type, state: .data.state, cause: .data.cause,
+                    pre_write_cause: .data.pre_write_cause, wake_block: .data.wake_block,
+                    transport: .data.transport, verified_by: .data.verified_by,
+                    observation: .data.pre_write_observation}' 2>/dev/null \
+          | sed 's/^/   /'
+      fi
+    done
     # Nested daemons write structured lifecycle events under their private
     # homes; their launch redirection is still useful for an early process
     # failure. Show both when a nested journey fails.
@@ -421,9 +436,6 @@ ack = "UserPromptSubmit"
 ack_evidence = "dispatch"
 ack_payload_field = "prompt"
 
-[messaging]
-mailbox_capability_file = "__CYCLOPS_MAILBOX_CAPABILITY__"
-
 [[rule]]
 id = "title_working"
 state = "working"
@@ -488,7 +500,6 @@ composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 EOF
 )
-DEMO_MANIFEST="${DEMO_MANIFEST/__CYCLOPS_MAILBOX_CAPABILITY__/$DEMO_SKILL}"
 
 if [ "$INSTALLER_ONLY" -eq 0 ]; then
 echo "== rig home:   $CYCLOPS_HOME (removed on exit)"
@@ -508,7 +519,7 @@ run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
 check "setup installs the sounds"         '^  wrote 2 sounds to .*/sounds$'
-check "setup installs the manifests"      '^  wrote 5 detection manifests to .*/manifests$'
+check "setup installs the manifests"      '^  wrote 12 detection manifests to .*/manifests$'
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
 # write one: a file in the home directory the daemon reads at boot. It
@@ -628,7 +639,7 @@ check "--raw without detection is a usage error" 'pairs with --source detection'
 check_exit "and exits 2" 2
 
 run "$CYC" name "$P2" reviewer --manifest cluade --plain
-check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, claude, codex, cursor, demo$'
+check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, aider, amp, claude, codex, crush, cursor, demo, gemini, goose, kimi, opencode, qwen$'
 
 echo
 echo "#### Rung 4: layouts"
@@ -795,8 +806,8 @@ check "the workspace journal is plain NDJSON" '"subject":"Release notes review"'
 check_file_absent "standard messages are not copied to the session ledger" \
   "$CYCLOPS_HOME/ledger/main.ndjson" '"subject":"Release notes review"'
 
-run "$CYC" --json ui
-check "ui points machine readers at watch" 'cyclops watch --json'
+run "$CYC" ui
+check "the retired ui alias is gone" "unrecognized subcommand 'ui'"
 check_exit "and exits on usage" 2
 
 run "$CYC" theme --plain
@@ -985,7 +996,7 @@ printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
 check "setup writes the config"           'wrote .*/config\.toml$'
-check "and installs the manifests"        '^  wrote 5 detection manifests to .*/manifests$'
+check "and installs the manifests"        '^  wrote 12 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
 printf '%s\n' 'set-option -g exit-empty off' 'set-option -g exit-unattached off' \

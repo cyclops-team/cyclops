@@ -15,7 +15,7 @@ use ratatui::text::Span;
 use crate::copy;
 use crate::decoration::DecorationSnapshot;
 use crate::drag::{DragState, DragTarget};
-use crate::input::mouse::{HitMap, HitTarget, PaneGeometry};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget, PaneGeometry};
 use crate::layout::{layout_gap_overhead, layout_geometry, DividerSeg, PaneGaps};
 use crate::model::{PaneSlot, RuntimeRegistry, TabModel};
 use crate::resilience::LinkState;
@@ -248,11 +248,11 @@ pub fn paint_window(
             scroll_depth(runtimes, slot),
         );
     }
-    // Shared pane borders are resize handles. Put divider regions above the
-    // generic frame regions, then restore the visibly overlaid controls as
-    // the most specific hit targets. The frame rects are not needed here
-    // any more: all three controls, the grip included, are placed from the
-    // slot's own rect by `pane_controls`.
+    // Shared pane borders are resize handles, and the controls painted
+    // over a frame are the most specific targets on it; `HitLayer` ranks
+    // them, so the order here is not load-bearing. The frame rects are
+    // not needed here: all three controls, the grip included, are placed
+    // from the slot's own rect by `pane_controls`.
     push_divider_hits(&dividers, ctx.hits);
     for slot in slots.iter() {
         push_pane_overlay_hits(
@@ -333,6 +333,7 @@ fn push_divider_hits(dividers: &[DividerSeg], hits: &mut HitMap) {
     for seg in dividers {
         hits.push(
             seg.rect,
+            HitLayer::Seam,
             HitTarget::Divider {
                 pane_id: seg.pane_id.clone(),
                 dir: seg.dir,
@@ -429,6 +430,7 @@ fn paint_pane_slot(
 
     ctx.hits.push(
         vis,
+        HitLayer::Canvas,
         HitTarget::PaneBody {
             pane_id: slot.pane_id.clone(),
         },
@@ -532,8 +534,11 @@ fn paint_pane_frame(
     let top = vis.y.saturating_sub(1).max(bounds.y);
     let right = (vis.x + vis.width).min(bounds.x + bounds.width - 1);
     let bottom = (vis.y + vis.height).min(bounds.y + bounds.height - 1);
+    // The four passive edges: a focus click, and nothing a seam or a
+    // button painted over them should lose to.
     ctx.hits.push(
         Rect::new(left, top, right.saturating_sub(left).saturating_add(1), 1),
+        HitLayer::Canvas,
         HitTarget::PaneFrame {
             pane_id: slot.pane_id.clone(),
         },
@@ -545,18 +550,21 @@ fn paint_pane_frame(
             right.saturating_sub(left).saturating_add(1),
             1,
         ),
+        HitLayer::Canvas,
         HitTarget::PaneFrame {
             pane_id: slot.pane_id.clone(),
         },
     );
     ctx.hits.push(
         Rect::new(left, top, 1, bottom.saturating_sub(top).saturating_add(1)),
+        HitLayer::Canvas,
         HitTarget::PaneFrame {
             pane_id: slot.pane_id.clone(),
         },
     );
     ctx.hits.push(
         Rect::new(right, top, 1, bottom.saturating_sub(top).saturating_add(1)),
+        HitLayer::Canvas,
         HitTarget::PaneFrame {
             pane_id: slot.pane_id.clone(),
         },
@@ -918,9 +926,10 @@ pub fn pane_clear_hit_rect(slot: &PaneSlot, bounds: Rect) -> Option<Rect> {
 
 /// Hit regions for the controls painted over a pane's frame: the labeled
 /// title strip (a focus click, or the attention eye), the split buttons,
-/// and the corner swap grip. Pushed after the divider bands so these
-/// visibly overlaid cells win the hit test; the grip is the only one of
-/// them that starts a drag.
+/// the corner swap grip, the minimize and clear buttons. All on
+/// [`HitLayer::PaneChrome`], above the seams they are painted across:
+/// the title strip is the one of them `app` still looks under, with
+/// [`HitMap::divider_at`]. The grip is the only one that starts a drag.
 fn push_pane_overlay_hits(
     slot: &PaneSlot,
     can_shrink: bool,
@@ -946,11 +955,12 @@ fn push_pane_overlay_hits(
                 pane_id: slot.pane_id.clone(),
             }
         };
-        hits.push(rect, target);
+        hits.push(rect, HitLayer::PaneChrome, target);
     }
     if let Some(controls) = controls {
         hits.push(
             controls.grip,
+            HitLayer::PaneChrome,
             HitTarget::PaneGrip {
                 pane_id: slot.pane_id.clone(),
             },
@@ -958,6 +968,7 @@ fn push_pane_overlay_hits(
         if let Some(rename) = controls.rename {
             hits.push(
                 rename,
+                HitLayer::PaneChrome,
                 HitTarget::PaneRename {
                     pane_id: slot.pane_id.clone(),
                 },
@@ -965,12 +976,14 @@ fn push_pane_overlay_hits(
         }
         hits.push(
             controls.split_right,
+            HitLayer::PaneChrome,
             HitTarget::PaneSplitRight {
                 pane_id: slot.pane_id.clone(),
             },
         );
         hits.push(
             controls.split_down,
+            HitLayer::PaneChrome,
             HitTarget::PaneSplitDown {
                 pane_id: slot.pane_id.clone(),
             },
@@ -979,6 +992,7 @@ fn push_pane_overlay_hits(
     if let Some(cell) = minimize_cell(slot, bounds, can_shrink) {
         hits.push(
             cell,
+            HitLayer::PaneChrome,
             HitTarget::PaneMinimize {
                 pane_id: slot.pane_id.clone(),
             },
@@ -988,35 +1002,11 @@ fn push_pane_overlay_hits(
     if let Some(rect) = pane_clear_hit_rect(slot, bounds) {
         hits.push(
             rect,
+            HitLayer::PaneChrome,
             HitTarget::PaneClear {
                 pane_id: slot.pane_id.clone(),
             },
         );
-    }
-}
-
-/// Re-assert pane clear hit targets over any canvas-level resize divider that
-/// shares the canvas's leftmost column.
-pub fn reassert_pane_clear_hits(tab: &TabModel, canvas: Rect, hits: &mut HitMap) {
-    let inner = pane_canvas(canvas);
-    let slots = if tab.zoomed {
-        vec![PaneSlot {
-            pane_id: tab.active_pane.clone(),
-            rect: inner,
-            focused: true,
-        }]
-    } else {
-        layout_geometry(&tab.layout, inner, &tab.active_pane, PANE_GAPS).slots
-    };
-    for slot in &slots {
-        if let Some(rect) = pane_clear_hit_rect(slot, canvas) {
-            hits.push(
-                rect,
-                HitTarget::PaneClear {
-                    pane_id: slot.pane_id.clone(),
-                },
-            );
-        }
     }
 }
 
@@ -1180,7 +1170,6 @@ mod tests {
             active_pane: focused.into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
         let mut runtimes = RuntimeRegistry::default();
         let mut runtime = crate::runtime::PaneRuntime::new(5, 5);
@@ -2651,7 +2640,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2753,7 +2741,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2810,7 +2797,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2968,7 +2954,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -3060,7 +3045,6 @@ mod tests {
                 active_pane: "%0".to_string(),
                 zoomed: false,
                 minimized: std::collections::HashMap::new(),
-                minimization_provenance: std::collections::HashMap::new(),
             }
         }
 
@@ -3172,7 +3156,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
 
         // 1. Closed Messages: Rail occupies 1 column on right.
@@ -3250,7 +3233,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
 
         // 1. Closed Messages: Full agent card geometry.
@@ -3341,28 +3323,21 @@ mod tests {
             clear_hit_right
         );
 
-        // Verify that if a SidebarDivider is pushed along the leftmost canvas column,
-        // reassert_pane_clear_hits restores PaneClear priority over the button cells.
+        // `app::draw` pushes the sidebar's resize handle down the canvas's
+        // leftmost column after `paint_window`, over this button. The
+        // button is the higher layer, so it keeps its two cells and the
+        // handle keeps every other row of the column.
         let canvas = Rect::new(0, 0, 50, 15);
         hits.push(
             Rect::new(canvas.x, canvas.y, 1, canvas.height),
+            HitLayer::Seam,
             HitTarget::SidebarDivider,
         );
-        // Before reassert, SidebarDivider shadows column region_rect.x
-        assert!(
-            matches!(
-                hits.hit(region_rect.x, region_rect.y),
-                Some(HitTarget::SidebarDivider)
-            ),
-            "SidebarDivider must initially shadow the column"
-        );
-        reassert_pane_clear_hits(&tab, canvas, &mut hits);
         assert!(
             matches!(hits.hit(region_rect.x, region_rect.y), Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
-            "reassert_pane_clear_hits must restore PaneClear priority on button cell: {:?}",
+            "the clear button must win its cell over the sidebar divider: {:?}",
             hits.hit(region_rect.x, region_rect.y)
         );
-        // But other rows on that column still belong to SidebarDivider
         assert!(
             matches!(hits.hit(region_rect.x, 0), Some(HitTarget::SidebarDivider)),
             "non-button rows on canvas.x must remain SidebarDivider"
@@ -3380,7 +3355,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();

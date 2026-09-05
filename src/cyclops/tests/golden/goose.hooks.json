@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook SessionStart", "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PreToolUse", "timeout": 5 } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PostToolUse", "timeout": 5 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop", "timeout": 5 } ] }
+    ]
+  }
+}

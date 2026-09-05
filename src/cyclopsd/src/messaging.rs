@@ -5,37 +5,32 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_proto::{
-    AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition, ComposerHold,
+    AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition,
     ComposerProof, ComposerSemantic, ComposerState, DeliveryReceipt, DeliveryState, HistoryParams,
     HistoryResult, InboxClaimResult, InboxListResult, InboxSummaryEntry, MessageId,
     MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBarrierRetirementCause,
-    NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
-    NotificationPreWriteObservation, NotificationRecord, NotificationResolution,
-    NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
-    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, OpenDelivery,
-    ProcessInstanceId, RecipientKey, StatusBlockedNotification, StatusMailboxRoute, ThreadResult,
+    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
+    NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
+    NotificationWithdrawResult, OpenDelivery, ProcessInstanceId, RecipientKey,
+    StatusBlockedNotification, StatusMailboxRoute, ThreadResult,
 };
-use cyclops_tmux::{PaneRow, SessionWatcher};
+use cyclops_tmux::PaneRow;
 use tokio::time::Instant;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
-use crate::compatibility::CompatibilityHistorySources;
 use crate::delivery;
-#[cfg(test)]
-use crate::mailbox::UnclaimedReminderQueue;
 use crate::mailbox::{
-    AcceptResult, AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget,
-    ClaimOutcome, ExactOwnedRecoveryAction, MailboxDirectory, MailboxError, MailboxIdentity,
-    MailboxSend, MailboxService, MailboxServiceError, MessageStoreError,
+    AcceptResult, ClaimOutcome, MailboxDirectory, MailboxIdentity, MailboxSend, MailboxService,
+    MailboxServiceError,
 };
 use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
+use crate::session_history::SessionHistorySources;
 
 pub(crate) struct NotificationRoute {
     pub(crate) session_idx: usize,
     pub(crate) pane_id: String,
     pub(crate) label: String,
-    pub(crate) watcher: Arc<SessionWatcher>,
     pub(crate) row: PaneRow,
 }
 
@@ -109,17 +104,6 @@ struct AcceptanceSchedule {
     unavailable: HashSet<RecipientKey>,
 }
 
-/// One explicit post-commit effect requested by an observation application.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MessagingAdminNotice {
-    pub(crate) level: NotifyLevel,
-    pub(crate) subject: String,
-    pub(crate) body: String,
-    pub(crate) message_id: MessageId,
-    pub(crate) session_idx: usize,
-    pub(crate) recipient_label: String,
-}
-
 /// One immutable causal token proving that a pane route was freshly
 /// observed.
 ///
@@ -130,23 +114,6 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) session_idx: usize,
     pub(crate) pane_id: String,
     pub(crate) evidence_id: NotificationRouteEvidenceId,
-}
-
-/// One immutable pane-size edge joined to the exact durable recipient.
-///
-/// The tmux event source proves the physical edge and identity. Durable width
-/// block lookup and the decision to reconcile remain inside
-/// `WorkspaceMessaging`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MessagingPaneSizeEvidence {
-    recipient: RecipientKey,
-    route: MessagingRouteEvidence,
-}
-
-impl MessagingPaneSizeEvidence {
-    pub(crate) fn new(recipient: RecipientKey, route: MessagingRouteEvidence) -> Self {
-        Self { recipient, route }
-    }
 }
 
 /// Body-free result of one durable pre-write block transition.
@@ -165,49 +132,6 @@ pub(crate) enum MessagingPreWriteBlockOutcome {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub(crate) struct MessagingPreWriteBlockError(#[from] NotificationAdapterError);
-
-/// One immutable authenticated hook observation for an exact attention
-/// consumption candidate.
-///
-/// Hook handling proves the process and payload facts. `WorkspaceMessaging`
-/// owns candidate lookup, exact durable-binding comparison, and the one-shot
-/// consumption signal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MessagingAttentionConsumptionObservation {
-    session_idx: usize,
-    pane_id: String,
-    recipient: RecipientKey,
-    pane_root: crate::identity::ProcId,
-    agent: crate::identity::ProcId,
-    manifest: String,
-    prompt: String,
-    observed_at_ms: u64,
-}
-
-impl MessagingAttentionConsumptionObservation {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        session_idx: usize,
-        pane_id: impl Into<String>,
-        recipient: RecipientKey,
-        pane_root: crate::identity::ProcId,
-        agent: crate::identity::ProcId,
-        manifest: impl Into<String>,
-        prompt: impl Into<String>,
-        observed_at_ms: u64,
-    ) -> Self {
-        Self {
-            session_idx,
-            pane_id: pane_id.into(),
-            recipient,
-            pane_root,
-            agent,
-            manifest: manifest.into(),
-            prompt: prompt.into(),
-            observed_at_ms,
-        }
-    }
-}
 
 /// Current pane evidence supplied to the body-free messaging status operation.
 ///
@@ -682,16 +606,6 @@ fn project_runtime_composer(
     }
 }
 
-/// Boot-local facts supplied by the daemon composition adapter.
-///
-/// WorkspaceMessaging asks for these named capabilities while it still owns
-/// the durable record. Callers never receive the record or recovery variant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct MessagingComposerRuntimeFacts {
-    pub(crate) active_worker_owns: bool,
-    pub(crate) clear_supported: bool,
-}
-
 /// One immutable, body-free observation of the current terminal route.
 ///
 /// The daemon adapter observes these runtime facts. `WorkspaceMessaging`
@@ -724,155 +638,6 @@ pub(crate) struct MessagingDeadlockCandidate {
 struct MessagingComposerCandidate {
     record: NotificationRecord,
     message_state: Option<cyclops_proto::ComposerMessageState>,
-    recovery_action: ExactOwnedRecoveryAction,
-    runtime: MessagingComposerRuntimeFacts,
-}
-
-/// Opaque durable half of one composer-recovery observation.
-///
-/// Fusion may ask whether screen capture is required and later return current
-/// terminal evidence, but it cannot inspect the journal records or recovery
-/// coordinator that made the answer necessary.
-pub(crate) struct MessagingComposerRecoveryProbe {
-    records: Vec<NotificationRecord>,
-    store_error: Option<&'static str>,
-}
-
-impl MessagingComposerRecoveryProbe {
-    pub(crate) fn none() -> Self {
-        Self {
-            records: Vec::new(),
-            store_error: None,
-        }
-    }
-
-    pub(crate) fn store_unavailable() -> Self {
-        Self {
-            records: Vec::new(),
-            store_error: Some("composer_recovery_store_unavailable"),
-        }
-    }
-
-    pub(crate) fn is_recovering(&self) -> bool {
-        !self.records.is_empty() || self.store_error.is_some()
-    }
-}
-
-/// Immutable physical evidence supplied to durable composer recovery.
-///
-/// Process, screen, and manifest adapters prove these facts. The messaging
-/// Module decides how they join to an active durable barrier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MessagingComposerRecoveryObservation {
-    pub(crate) binding: Option<NotificationBinding>,
-    pub(crate) clean_composer: bool,
-    pub(crate) legacy_composer_ready: bool,
-}
-
-/// Opaque recovery decision carried through one fusion transaction.
-pub(crate) struct MessagingComposerRecoveryPlan {
-    action: Option<crate::composer_recovery::RecoveryAction>,
-    attempt_id: Option<NotificationAttemptId>,
-    retired_attempt: Option<NotificationAttemptId>,
-}
-
-impl MessagingComposerRecoveryPlan {
-    pub(crate) fn store_unavailable() -> Self {
-        Self {
-            action: Some(crate::composer_recovery::RecoveryAction::Hold(
-                "composer_recovery_store_unavailable",
-            )),
-            attempt_id: None,
-            retired_attempt: None,
-        }
-    }
-
-    pub(crate) fn merge_without_module(
-        self,
-        base_hold: ComposerHold,
-        owner: Option<String>,
-        turn_running: bool,
-    ) -> MessagingComposerBarrierUpdate {
-        self.barrier_update(base_hold, owner, turn_running)
-    }
-
-    fn barrier_update(
-        self,
-        base_hold: ComposerHold,
-        owner: Option<String>,
-        turn_running: bool,
-    ) -> MessagingComposerBarrierUpdate {
-        let (hold, owner, clear_turn, refusal) = crate::composer_recovery::merge_barrier(
-            self.action.as_ref(),
-            self.retired_attempt,
-            base_hold,
-            owner,
-            turn_running,
-        );
-        let recovered_hold = self.action.as_ref().map(|action| {
-            if matches!(action, crate::composer_recovery::RecoveryAction::Restore(_))
-                && hold == ComposerHold::StagedDuringTurn
-                && !turn_running
-            {
-                ComposerHold::Staged
-            } else {
-                hold
-            }
-        });
-        MessagingComposerBarrierUpdate {
-            hold,
-            owner,
-            clear_turn,
-            refusal,
-            recovered_hold,
-        }
-    }
-}
-
-/// Finished runtime barrier update. No durable record or recovery variant
-/// crosses the Module boundary.
-pub(crate) struct MessagingComposerBarrierUpdate {
-    pub(crate) hold: ComposerHold,
-    pub(crate) owner: Option<String>,
-    pub(crate) clear_turn: bool,
-    pub(crate) refusal: Option<&'static str>,
-    pub(crate) recovered_hold: Option<ComposerHold>,
-}
-
-/// One Module-owned decision for an elected exact-attention worker.
-///
-/// The runtime adapter owns task execution. It does not inspect the mailbox
-/// projection, recovery policy, or boot-local election locks.
-pub(crate) enum ExactAttentionWork {
-    Retire,
-    Recheck,
-    Resolve {
-        target: Box<AttentionTarget>,
-        resolution: NotificationResolution,
-    },
-}
-
-/// Boot-local consumption observation registered through WorkspaceMessaging.
-///
-/// Dropping the handle deterministically removes the candidate without
-/// exposing the mailbox service to the terminal mechanism.
-pub(crate) struct AttentionConsumptionRegistration {
-    service: Arc<MailboxService>,
-    attempt_id: NotificationAttemptId,
-    signal: Arc<AttentionConsumptionSignal>,
-}
-
-impl AttentionConsumptionRegistration {
-    pub(crate) fn signal(&self) -> Arc<AttentionConsumptionSignal> {
-        Arc::clone(&self.signal)
-    }
-}
-
-impl Drop for AttentionConsumptionRegistration {
-    fn drop(&mut self) {
-        self.service
-            .unregister_attention_consumption_candidate(self.attempt_id);
-    }
 }
 
 impl MessagingRouteEvidence {
@@ -889,13 +654,6 @@ impl MessagingRouteEvidence {
     }
 }
 
-/// Durable transitions and requested effects produced by one observation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ObservationApplication {
-    durable_messages: Vec<MessageId>,
-    pub(crate) notices: Vec<MessagingAdminNotice>,
-}
-
 /// Stable operation failures for selecting or administering attention.
 ///
 /// The socket adapter maps these outcomes to wire errors without inspecting
@@ -904,11 +662,6 @@ pub(crate) struct ObservationApplication {
 pub(crate) enum MessagingAttentionError {
     #[error("this operation requires the workspace administrator")]
     Denied,
-    #[error("{message}")]
-    Ambiguous {
-        message: String,
-        candidates: Vec<NotificationAttemptId>,
-    },
     #[error(transparent)]
     Mailbox(#[from] MailboxServiceError),
 }
@@ -1040,12 +793,9 @@ impl WorkspaceMessagingStatus {
             return status;
         }
 
-        status.next_action = Some(composer_next_action(
-            status.composer,
-            candidate.record.state,
-            status.message_state,
-            candidate.recovery_action,
-            candidate.runtime,
+        status.next_action = Some(operator_composer_next_action(
+            status.notification_state,
+            true,
         ));
         status
     }
@@ -1070,54 +820,6 @@ pub(crate) fn operator_composer_next_action(
             | NotificationState::WithdrawnAfterStaging,
         ) if has_exact_attempt => ComposerNextAction::CheckHealth,
         _ => ComposerNextAction::InspectMessages,
-    }
-}
-
-fn composer_next_action(
-    composer: cyclops_proto::ComposerState,
-    notification: NotificationState,
-    message: Option<cyclops_proto::ComposerMessageState>,
-    recovery_action: ExactOwnedRecoveryAction,
-    runtime: MessagingComposerRuntimeFacts,
-) -> cyclops_proto::ComposerNextAction {
-    use cyclops_proto::{ComposerMessageState, ComposerNextAction, ComposerState};
-
-    let exact_composer = matches!(
-        composer,
-        ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
-    );
-    if exact_composer && notification == NotificationState::AttentionRequired {
-        return match recovery_action {
-            ExactOwnedRecoveryAction::Submit => ComposerNextAction::AutomaticSubmit,
-            ExactOwnedRecoveryAction::Clear if runtime.clear_supported => {
-                ComposerNextAction::AutomaticReconcile
-            }
-            ExactOwnedRecoveryAction::Reconcile => ComposerNextAction::AutomaticReconcile,
-            ExactOwnedRecoveryAction::Ineligible
-            | ExactOwnedRecoveryAction::Clear
-            | ExactOwnedRecoveryAction::Inspect => ComposerNextAction::InspectAttention,
-        };
-    }
-    if !exact_composer || !runtime.active_worker_owns {
-        return operator_composer_next_action(Some(notification), true);
-    }
-    match (composer, notification, message) {
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Pending),
-        ) => ComposerNextAction::AutomaticSubmit,
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Claimed),
-        ) => ComposerNextAction::AutomaticReconcile,
-        (
-            ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted,
-            NotificationState::Submitting | NotificationState::Submitted,
-            _,
-        ) => ComposerNextAction::AutomaticReconcile,
-        _ => operator_composer_next_action(Some(notification), true),
     }
 }
 
@@ -1150,40 +852,13 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
         recipient: RecipientKey,
     ) -> Result<Option<MessagingNotificationRouteObservation>, MailboxServiceError>;
 
-    fn composer_runtime_facts(
-        &self,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        manifest: Option<&NotificationManifestId>,
-    ) -> MessagingComposerRuntimeFacts;
-
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId);
 
-    fn observe_claimed_composer(
-        &self,
-        service: &Arc<MailboxService>,
-        claimant: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<(), MailboxServiceError>;
-
-    fn recover_claimed_notification(
-        &self,
-        service: &Arc<MailboxService>,
-        claimant: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<(), MailboxServiceError>;
-
     fn cancel_notification(&self, attempt_id: NotificationAttemptId);
-
-    fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId);
 
     fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence);
 
     fn reconcile_current_route(&self, session_idx: usize, pane_id: String);
-
-    fn schedule_unclaimed_reminder(&self, record: NotificationRecord);
-
-    fn schedule_force_submit(&self, record: NotificationRecord);
 
     fn receipt_block(&self) -> Duration;
 }
@@ -1200,37 +875,18 @@ pub(crate) struct WorkspaceMessaging {
     service: Arc<MailboxService>,
     publication: Arc<StdMutex<()>>,
     effects: Arc<dyn WorkspaceMessagingEffects>,
-    composer_recovery: Arc<StdMutex<crate::composer_recovery::RecoveryCoordinator>>,
 }
 
 impl WorkspaceMessaging {
-    #[cfg(test)]
     pub(crate) fn new(
         service: Arc<MailboxService>,
         publication: Arc<StdMutex<()>>,
         effects: Arc<dyn WorkspaceMessagingEffects>,
     ) -> Self {
-        Self::new_with_recovery(
-            service,
-            publication,
-            effects,
-            Arc::new(StdMutex::new(
-                crate::composer_recovery::RecoveryCoordinator::default(),
-            )),
-        )
-    }
-
-    pub(crate) fn new_with_recovery(
-        service: Arc<MailboxService>,
-        publication: Arc<StdMutex<()>>,
-        effects: Arc<dyn WorkspaceMessagingEffects>,
-        composer_recovery: Arc<StdMutex<crate::composer_recovery::RecoveryCoordinator>>,
-    ) -> Self {
         Self {
             service,
             publication,
             effects,
-            composer_recovery,
         }
     }
 
@@ -1252,291 +908,6 @@ impl WorkspaceMessaging {
         }
     }
 
-    /// Read the exact active durable barriers for one physical composer.
-    pub(crate) fn composer_recovery_probe(
-        &self,
-        recipient: RecipientKey,
-    ) -> MessagingComposerRecoveryProbe {
-        let canonical = match self.service.active_notification_barriers() {
-            Ok(records) => records,
-            Err(_) => return MessagingComposerRecoveryProbe::store_unavailable(),
-        };
-        let mut recovery = self
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock");
-        let records = recovery.active_for_recipient(&canonical, recipient);
-        let store_error = (recovery.writer_unknown() && !records.is_empty())
-            .then_some("composer_recovery_reopen_required");
-        MessagingComposerRecoveryProbe {
-            records,
-            store_error,
-        }
-    }
-
-    /// Join current physical evidence to the exact durable recovery head and
-    /// persist any immediately proven retirement.
-    pub(crate) fn reconcile_composer_recovery(
-        &self,
-        probe: MessagingComposerRecoveryProbe,
-        observation: MessagingComposerRecoveryObservation,
-    ) -> MessagingComposerRecoveryPlan {
-        let attempt_id = probe.records.first().map(|record| record.attempt_id);
-        let exact_claim_after_write = match probe.records.as_slice() {
-            [record] => self
-                .service
-                .exact_recipient_claimed_after_write(record)
-                .unwrap_or(false),
-            _ => false,
-        };
-        let mut action = if let Some(reason) = probe.store_error {
-            Some(crate::composer_recovery::RecoveryAction::Hold(reason))
-        } else {
-            self.composer_recovery
-                .lock()
-                .expect("composer recovery lock")
-                .reconcile(
-                    &probe.records,
-                    observation.binding.as_ref(),
-                    observation.clean_composer,
-                    exact_claim_after_write,
-                )
-        };
-        let retired_attempt = match action.as_ref() {
-            Some(retirement @ crate::composer_recovery::RecoveryAction::Retire { .. }) => {
-                match self.persist_composer_recovery(retirement) {
-                    Ok(attempt_id) => {
-                        action = None;
-                        Some(attempt_id)
-                    }
-                    Err(reason) => {
-                        action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-        MessagingComposerRecoveryPlan {
-            action,
-            attempt_id,
-            retired_attempt,
-        }
-    }
-
-    /// Persist an exact post-restart lifecycle retirement when the physical
-    /// adapter supplies the matching completed attempt.
-    pub(crate) fn settle_composer_recovery_lifecycle(
-        &self,
-        mut plan: MessagingComposerRecoveryPlan,
-        candidate: Option<NotificationAttemptId>,
-    ) -> MessagingComposerRecoveryPlan {
-        let Some(candidate) = candidate else {
-            return plan;
-        };
-        if !matches!(
-            plan.action,
-            Some(crate::composer_recovery::RecoveryAction::Restore(attempt))
-                if attempt == candidate
-        ) {
-            return plan;
-        }
-        let canonical = match self.service.active_notification_barriers() {
-            Ok(records) => records,
-            Err(_) => {
-                plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(
-                    "composer_recovery_store_unavailable",
-                ));
-                return plan;
-            }
-        };
-        if canonical.iter().any(|record| {
-            record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
-        }) {
-            plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(
-                "claimed_notification_reconciliation_pending",
-            ));
-            return plan;
-        }
-        let record = match self
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .reserve_record(&canonical, candidate)
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                plan.action = None;
-                return plan;
-            }
-            Err(reason) => {
-                plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
-                return plan;
-            }
-        };
-        let action = crate::composer_recovery::RecoveryAction::Retire {
-            record: Box::new(record),
-            cause: NotificationBarrierRetirementCause::LifecycleReconciled,
-            replacement: None,
-        };
-        plan.action = match self.persist_composer_recovery(&action) {
-            Ok(_) => None,
-            Err(reason) => Some(crate::composer_recovery::RecoveryAction::Hold(reason)),
-        };
-        plan
-    }
-
-    /// Merge an opaque recovery decision into the runtime barrier while
-    /// revalidating any concurrent durable retirement.
-    pub(crate) fn merge_composer_recovery_barrier(
-        &self,
-        mut plan: MessagingComposerRecoveryPlan,
-        base_hold: ComposerHold,
-        owner: Option<String>,
-        turn_running: bool,
-    ) -> MessagingComposerBarrierUpdate {
-        if matches!(
-            plan.action,
-            Some(crate::composer_recovery::RecoveryAction::Hold(
-                "composer_recovery_retirement_pending"
-            ))
-        ) {
-            plan.action = plan.attempt_id.and_then(|attempt_id| {
-                self.composer_recovery
-                    .lock()
-                    .expect("composer recovery lock")
-                    .retirement_pending_reason(attempt_id)
-                    .map(crate::composer_recovery::RecoveryAction::Hold)
-            });
-        }
-        plan.barrier_update(base_hold, owner, turn_running)
-    }
-
-    pub(crate) fn track_composer_recovery(&self, attempt_id: NotificationAttemptId) {
-        self.composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .track(attempt_id);
-    }
-
-    pub(crate) fn composer_recovery_contains(&self, attempt_id: NotificationAttemptId) -> bool {
-        self.composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .contains(attempt_id)
-    }
-
-    pub(crate) fn composer_barrier_retired(&self, attempt_id: NotificationAttemptId) {
-        self.composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .retired(attempt_id);
-    }
-
-    pub(crate) fn retire_gone_composer_recipient(
-        &self,
-        recipient: RecipientKey,
-    ) -> Result<(), &'static str> {
-        self.retire_composer_recipient(
-            recipient,
-            NotificationBarrierRetirementCause::PaneGone,
-            None,
-        )
-    }
-
-    pub(crate) fn retire_replaced_composer_recipient(
-        &self,
-        recipient: RecipientKey,
-        replacement: Option<NotificationBinding>,
-    ) -> Result<(), &'static str> {
-        self.retire_composer_recipient(
-            recipient,
-            NotificationBarrierRetirementCause::OccupantReplaced,
-            replacement,
-        )
-    }
-
-    fn retire_composer_recipient(
-        &self,
-        recipient: RecipientKey,
-        cause: NotificationBarrierRetirementCause,
-        replacement: Option<NotificationBinding>,
-    ) -> Result<(), &'static str> {
-        let records: Vec<_> = self
-            .service
-            .active_notification_barriers()
-            .map_err(|_| "composer_recovery_store_unavailable")?
-            .into_iter()
-            .filter(|record| record.recipient == recipient)
-            .collect();
-        if records.is_empty() {
-            return Ok(());
-        }
-        if cause == NotificationBarrierRetirementCause::OccupantReplaced && replacement.is_none() {
-            return Err("composer_recovery_replacement_unproven");
-        }
-        if self
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .writer_unknown()
-        {
-            return Err("composer_recovery_reopen_required");
-        }
-        for record in records {
-            if let Err(error) =
-                self.service
-                    .retire_notification_barrier(&record, cause, replacement.clone())
-            {
-                if crate::composer_recovery::writer_requires_reopen(&error) {
-                    self.composer_recovery
-                        .lock()
-                        .expect("composer recovery lock")
-                        .require_reopen();
-                }
-                return Err("composer_recovery_retirement_failed");
-            }
-            self.composer_barrier_retired(record.attempt_id);
-        }
-        Ok(())
-    }
-
-    fn persist_composer_recovery(
-        &self,
-        action: &crate::composer_recovery::RecoveryAction,
-    ) -> Result<NotificationAttemptId, &'static str> {
-        let crate::composer_recovery::RecoveryAction::Retire {
-            record,
-            cause,
-            replacement,
-        } = action
-        else {
-            return Err("composer_recovery_not_a_retirement");
-        };
-        let attempt_id = record.attempt_id;
-        let result = self
-            .service
-            .retire_notification_barrier(record, *cause, replacement.clone());
-        let writer_unknown = result
-            .as_ref()
-            .is_err_and(crate::composer_recovery::writer_requires_reopen);
-        let mut recovery = self
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock");
-        if result.is_ok() {
-            recovery.retired(attempt_id);
-        } else {
-            recovery.retirement_failed(attempt_id);
-            if writer_unknown {
-                recovery.require_reopen();
-            }
-        }
-        result
-            .map(|()| attempt_id)
-            .map_err(|_| "composer_recovery_retirement_failed")
-    }
-
     /// Read the current directory and its matching daemon route publication as
     /// one transaction without exposing the synchronization mechanism.
     pub(crate) fn with_published<T>(&self, read: impl FnOnce(&Self) -> T) -> T {
@@ -1547,7 +918,7 @@ impl WorkspaceMessaging {
     /// Read the authorized workspace-first history projection.
     ///
     /// The caller supplies an authenticated durable identity and the immutable
-    /// sources returned by `CompatibilityHistoryAdapter`. Current journal
+    /// sources returned by `SessionHistoryAdapter`. Current journal
     /// access, collision rules, visibility, and body release remain inside
     /// this module. The publication lock is deliberately not held across replay.
     pub(crate) fn history(
@@ -1555,7 +926,7 @@ impl WorkspaceMessaging {
         caller: MailboxIdentity,
         params: HistoryParams,
         cursor2: Option<String>,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Result<HistoryResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
@@ -1574,7 +945,7 @@ impl WorkspaceMessaging {
         caller: MailboxIdentity,
         id: &str,
         reveal_body: bool,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Result<ThreadResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
@@ -1593,7 +964,7 @@ impl WorkspaceMessaging {
     /// without exposing workspace message IDs to the status caller.
     pub(crate) fn retained_open_deliveries(
         &self,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Vec<OpenDelivery> {
         let record = self.history_record(compatibility);
         let mut open = crate::history::open_from_record(&record);
@@ -1612,7 +983,7 @@ impl WorkspaceMessaging {
 
     fn history_record(
         &self,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> crate::history::HistoryRecord {
         let workspace = match self.service.journal_lines() {
             Ok(lines) if !lines.is_empty() => {
@@ -1649,6 +1020,14 @@ impl WorkspaceMessaging {
 
     pub(crate) fn admin_identity(&self) -> MailboxIdentity {
         self.service.admin()
+    }
+
+    pub(crate) fn notification_for_message(
+        &self,
+        recipient: RecipientKey,
+        message_id: &MessageId,
+    ) -> Result<Option<NotificationRecord>, MailboxServiceError> {
+        self.service.notification_for_message(recipient, message_id)
     }
 
     pub(crate) fn identity_for_recipient(
@@ -1702,49 +1081,26 @@ impl WorkspaceMessaging {
         claimant: RecipientKey,
         outcome: ClaimOutcome,
     ) -> Result<InboxClaimResult, MailboxServiceError> {
-        let (withdrawn, consumed_doorbell, claimed_ack_timeout) = match &outcome {
+        let (withdrawn, consumed_doorbell) = match &outcome {
             ClaimOutcome::Claimed {
                 withdrawn_attempt,
                 consumed_doorbell_attempt,
-                claimed_ack_timeout_attempt,
                 ..
             }
             | ClaimOutcome::AlreadyClaimed {
                 withdrawn_attempt,
                 consumed_doorbell_attempt,
-                claimed_ack_timeout_attempt,
                 ..
-            } => (
-                *withdrawn_attempt,
-                *consumed_doorbell_attempt,
-                *claimed_ack_timeout_attempt,
-            ),
+            } => (*withdrawn_attempt, *consumed_doorbell_attempt),
         };
         if let Some(attempt_id) = consumed_doorbell {
             self.effects.settle_notification_claim(attempt_id);
-            if let Err(error) =
-                self.effects
-                    .observe_claimed_composer(&self.service, claimant, attempt_id)
-            {
-                error!(%claimant, %error, "cannot observe claimed notification composer");
-            }
-        }
-        if let Some(attempt_id) = claimed_ack_timeout {
-            if let Err(error) =
-                self.effects
-                    .recover_claimed_notification(&self.service, claimant, attempt_id)
-            {
-                error!(%claimant, %error, "cannot schedule claimed notification recovery");
-            }
         }
         if let Some(attempt_id) = withdrawn {
             self.effects.cancel_notification(attempt_id);
         }
-        self.exact_owned_evidence_changed(claimant);
-        if claimed_ack_timeout.is_none() {
-            if let Err(error) = self.effects.schedule_notification(&self.service, claimant) {
-                error!(%claimant, %error, "cannot schedule mailbox notification after claim");
-            }
+        if let Err(error) = self.effects.schedule_notification(&self.service, claimant) {
+            error!(%claimant, %error, "cannot schedule mailbox notification after claim");
         }
         self.effects.invalidate_unread(claimant);
 
@@ -1824,50 +1180,10 @@ impl WorkspaceMessaging {
         })
     }
 
-    /// Continue one recipient FIFO after another durable path changed its
-    /// current notification head.
-    ///
-    /// Delivery and terminal mechanisms report the committed outcome; they do
-    /// not receive the mailbox service or choose the worker that follows it.
-    pub(crate) fn notification_head_changed(
-        &self,
-        recipient: RecipientKey,
-    ) -> Result<(), MailboxServiceError> {
-        self.effects
-            .schedule_notification(&self.service, recipient)
-            .map(|_| ())
-    }
-
-    /// Apply the shared post-commit consequences of a direct mailbox delivery.
-    pub(crate) fn direct_delivery_settled(
-        &self,
-        recipient: RecipientKey,
-    ) -> Result<(), MailboxServiceError> {
-        self.effects.invalidate_unread(recipient);
-        self.notification_head_changed(recipient)
-    }
-
     /// Apply one immutable route observation without exposing reconciliation
     /// or worker topology to the observer.
     pub(crate) fn route_evidence_observed(&self, evidence: MessagingRouteEvidence) {
         self.effects.reconcile_route_evidence(evidence);
-    }
-
-    /// Reconsider only a recipient whose durable head is blocked on pane width.
-    ///
-    /// The event source supplies immutable physical evidence. It does not read
-    /// mailbox projections or choose the retained reconciliation mechanism.
-    pub(crate) fn pane_size_observed(
-        &self,
-        evidence: MessagingPaneSizeEvidence,
-    ) -> Result<(), MailboxServiceError> {
-        if self
-            .service
-            .oldest_notification_has_width_block(evidence.recipient)?
-        {
-            self.effects.reconcile_route_evidence(evidence.route);
-        }
-        Ok(())
     }
 
     /// Resume every durable FIFO that may now have a route.
@@ -1886,18 +1202,6 @@ impl WorkspaceMessaging {
             if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
                 error!(%recipient, %error, "cannot schedule mailbox notification");
             }
-        }
-    }
-
-    /// Restore exact reminder timers from durable replay state.
-    pub(crate) fn restore_unclaimed_reminders(&self) {
-        match self.service.unclaimed_reminder_candidates() {
-            Ok(records) => {
-                for record in records {
-                    self.effects.schedule_unclaimed_reminder(record);
-                }
-            }
-            Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
         }
     }
 
@@ -1997,143 +1301,6 @@ impl WorkspaceMessaging {
     ) {
         self.effects
             .reconcile_current_route(session_idx, pane_id.into());
-    }
-
-    /// Apply post-commit policy for one durable attention record.
-    pub(crate) fn notification_attention_recorded(&self, record: NotificationRecord) {
-        if !record.needs_exact_owned_reconciliation() {
-            return;
-        }
-        self.exact_owned_evidence_changed(record.recipient);
-        self.effects.schedule_force_submit(record);
-    }
-
-    /// Apply one relevant composer or claim evidence edge.
-    ///
-    /// Candidate selection, exact-owned policy, and worker election stay
-    /// inside the messaging Module. The runtime receives only elected attempt
-    /// ids to execute.
-    pub(crate) fn exact_owned_evidence_changed(&self, recipient: RecipientKey) {
-        let candidates = match self.service.active_composer_notifications(recipient) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                debug!(%recipient, %error, "cannot select exact-attention reconciliation work");
-                return;
-            }
-        };
-        for attempt_id in candidates
-            .into_iter()
-            .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
-            .map(|candidate| candidate.record.attempt_id)
-        {
-            match self.service.request_exact_reconciliation(attempt_id) {
-                Ok(true) => self.effects.spawn_exact_attention_worker(attempt_id),
-                Ok(false) => {}
-                Err(error) => debug!(%attempt_id, %error, "cannot elect exact-attention worker"),
-            }
-        }
-    }
-
-    /// Re-elect work parked behind an explicit resolution reservation.
-    pub(crate) fn resume_exact_attention_reconciliation(&self, attempt_id: NotificationAttemptId) {
-        match self.service.resume_exact_reconciliation(attempt_id) {
-            Ok(true) => self.effects.spawn_exact_attention_worker(attempt_id),
-            Ok(false) => {}
-            Err(error) => debug!(%attempt_id, %error, "cannot resume exact-attention worker"),
-        }
-    }
-
-    /// Consume one elected evidence edge and return only the exact action the
-    /// runtime may attempt. Projection lookup and automatic policy stay here.
-    pub(crate) fn next_exact_attention_work(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> ExactAttentionWork {
-        match self.service.take_exact_reconciliation_request(attempt_id) {
-            Ok(false) => return ExactAttentionWork::Retire,
-            Ok(true) => {}
-            Err(error) => {
-                debug!(%attempt_id, %error, "cannot consume exact-attention work");
-                return ExactAttentionWork::Retire;
-            }
-        }
-        let target = match self.service.attention_target(&attempt_id.to_string()) {
-            Ok(target) => target,
-            Err(error) => {
-                debug!(%attempt_id, %error, "exact-attention target is no longer actionable");
-                return ExactAttentionWork::Recheck;
-            }
-        };
-        match self.service.automatic_attention_resolution(&target) {
-            Ok(Some(resolution)) => ExactAttentionWork::Resolve {
-                target: Box::new(target),
-                resolution,
-            },
-            Ok(None) => ExactAttentionWork::Recheck,
-            Err(error) => {
-                debug!(%attempt_id, %error, "cannot select exact-attention resolution");
-                ExactAttentionWork::Recheck
-            }
-        }
-    }
-
-    /// Preserve an evidence edge that collided with an explicit resolver.
-    /// True means the current runtime worker remains elected and should
-    /// continue; false means the reservation owner will re-elect it later.
-    pub(crate) fn park_exact_attention_after_conflict(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> bool {
-        match self
-            .service
-            .park_exact_reconciliation_after_conflict(attempt_id)
-        {
-            Ok(continue_running) => continue_running,
-            Err(error) => {
-                debug!(%attempt_id, %error, "cannot park exact-attention work");
-                false
-            }
-        }
-    }
-
-    /// Arm the optional reminder only for the first proven doorbell.
-    pub(crate) fn notification_became_notified(&self, record: NotificationRecord) {
-        if record.state == NotificationState::Notified
-            && record.transport == cyclops_proto::NotificationTransport::Doorbell
-            && record.unclaimed_reminder_count == 0
-        {
-            self.effects.schedule_unclaimed_reminder(record);
-        }
-    }
-
-    /// Reconsider existing exact attention attempts after the operator enables
-    /// force-submit. The server persists the setting; messaging owns the work
-    /// that follows from it.
-    pub(crate) fn force_submit_enabled(&self) {
-        self.schedule_force_submit_candidates();
-    }
-
-    /// Reconsider existing exact attention attempts after a watcher has
-    /// published its current routes.
-    ///
-    /// Boot discovers durable candidates before session watchers attach. A
-    /// missing route at that first pass is not a terminal refusal: the route
-    /// publication supplies the later, event-driven recheck. The runtime
-    /// still owns the enabled-setting, binding, claim-ordering, and one-key
-    /// checks.
-    pub(crate) fn force_submit_routes_available(&self) {
-        self.schedule_force_submit_candidates();
-    }
-
-    fn schedule_force_submit_candidates(&self) {
-        match self.service.force_submit_candidates() {
-            Ok(records) => {
-                for record in records {
-                    self.effects.schedule_force_submit(record);
-                }
-            }
-            Err(error) => error!(%error, "cannot inspect force-submit candidates"),
-        }
     }
 
     pub(crate) fn alarm_preview(
@@ -2292,15 +1459,6 @@ impl WorkspaceMessaging {
                     .map(|candidates| {
                         let mut grouped = HashMap::new();
                         for candidate in candidates {
-                            let runtime = messaging.effects.composer_runtime_facts(
-                                candidate.record.recipient,
-                                candidate.record.attempt_id,
-                                candidate
-                                    .record
-                                    .binding
-                                    .as_ref()
-                                    .map(|binding| &binding.manifest),
-                            );
                             grouped
                                 .entry(candidate.record.recipient)
                                 .or_insert_with(HashMap::new)
@@ -2312,8 +1470,6 @@ impl WorkspaceMessaging {
                                             .entry_state
                                             .as_ref()
                                             .map(cyclops_proto::ComposerMessageState::from),
-                                        recovery_action: candidate.recovery_action,
-                                        runtime,
                                     },
                                 );
                         }
@@ -2334,288 +1490,11 @@ impl WorkspaceMessaging {
         })
     }
 
-    /// Select one attention attempt for a read without exposing projection
-    /// lookup or recipient-privacy policy to the requesting adapter.
-    pub(crate) fn attention_for_show(
-        &self,
-        caller: RecipientKey,
-        raw: &str,
-    ) -> Result<AttentionTarget, MessagingAttentionError> {
-        let target = match self.attention_target(raw) {
-            Ok(target) => target,
-            Err(_) if !caller.is_admin() => return Err(MessagingAttentionError::Denied),
-            Err(error) => return Err(error),
-        };
-        if !caller.is_admin() && caller != target.record.recipient {
-            return Err(MessagingAttentionError::Denied);
-        }
-        Ok(target)
-    }
-
-    /// Select one exact attention attempt for an administrator mutation.
-    pub(crate) fn attention_for_resolution(
-        &self,
-        caller: RecipientKey,
-        raw: &str,
-    ) -> Result<AttentionTarget, MessagingAttentionError> {
-        self.require_admin(caller)?;
-        self.attention_target(raw)
-    }
-
-    /// Select one exact attempt for a Module-elected runtime action.
-    pub(crate) fn attention_for_runtime(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<AttentionTarget, MessagingAttentionError> {
-        self.attention_target(&attempt_id.to_string())
-    }
-
-    /// Resolve the current terminal route through the composition adapter.
-    pub(crate) fn attention_terminal_route(
-        &self,
-        recipient: RecipientKey,
-    ) -> Result<Option<NotificationRoute>, MailboxServiceError> {
-        self.effects.notification_route(&self.service, recipient)
-    }
-
-    /// Rebuild the exact body-free terminal payload from the current durable
-    /// message and attempt without exposing message lookup to terminal code.
-    pub(crate) fn expected_attention_notification(
-        &self,
-        target: &AttentionTarget,
-    ) -> Option<String> {
-        let message = self.service.message_line(&target.record.message_id).ok()?;
-        delivery::expected_notification_payload(&target.record, &message)
-    }
-
-    /// Register one exact post-dispatch consumption candidate. The returned
-    /// handle owns deterministic cleanup.
-    pub(crate) fn register_attention_consumption(
-        &self,
-        target: &AttentionTarget,
-        session_idx: usize,
-        pane_id: String,
-        expected_payload: String,
-        dispatch_started_ms: u64,
-    ) -> Result<Option<AttentionConsumptionRegistration>, MailboxServiceError> {
-        self.service
-            .register_attention_consumption_candidate(
-                target,
-                session_idx,
-                pane_id,
-                expected_payload,
-                dispatch_started_ms,
-            )
-            .map(|signal| {
-                signal.map(|signal| AttentionConsumptionRegistration {
-                    service: Arc::clone(&self.service),
-                    attempt_id: target.record.attempt_id,
-                    signal,
-                })
-            })
-    }
-
-    /// Match one authenticated hook observation to an exact registered
-    /// attention candidate without exposing candidate storage or durable
-    /// binding rules to the hook adapter.
-    pub(crate) fn attention_consumption_observed(
-        &self,
-        observation: MessagingAttentionConsumptionObservation,
-    ) -> bool {
-        self.service.confirm_attention_consumption_hook(
-            observation.session_idx,
-            &observation.pane_id,
-            observation.recipient,
-            observation.pane_root,
-            observation.agent,
-            &observation.manifest,
-            &observation.prompt,
-            observation.observed_at_ms,
-        )
-    }
-
-    /// Reserve one exact attention attempt and classify its durable recovery
-    /// state before any terminal action.
-    pub(crate) fn begin_attention_resolution(
-        &self,
-        target: &AttentionTarget,
-        resolution: NotificationResolution,
-    ) -> Result<AttentionResolutionStart, MailboxServiceError> {
-        self.service.begin_attention_resolution(target, resolution)
-    }
-
-    pub(crate) fn cancel_attention_resolution(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<(), MailboxServiceError> {
-        self.service.cancel_attention_resolution(attempt_id)
-    }
-
-    /// Subscribe to one boot-local handoff after an exact resolution
-    /// reservation is released. Terminal scheduling receives this event, not
-    /// the mailbox service or its reservation set.
-    pub(crate) fn subscribe_attention_resolution_releases(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<NotificationAttemptId> {
-        self.service.subscribe_attention_resolution_releases()
-    }
-
-    pub(crate) fn force_submit_target_is_pending(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<bool, MailboxServiceError> {
-        self.service.force_submit_target_is_pending(target)
-    }
-
-    /// Commit the explicit operator or automatic resolution intent selected by
-    /// the durable messaging projection.
-    pub(crate) fn record_attention_resolution_intent(
-        &self,
-        target: &AttentionTarget,
-        requested: NotificationResolution,
-        automatic: bool,
-    ) -> Result<NotificationResolution, MailboxServiceError> {
-        if automatic {
-            self.service
-                .record_automatic_attention_resolution_intent(target)
-        } else {
-            self.service
-                .record_attention_resolution_intent(target, requested)?;
-            Ok(requested)
-        }
-    }
-
-    /// Persist the one forced pre-key intent, releasing the boot-local
-    /// reservation if that append fails before the terminal boundary.
-    pub(crate) fn record_forced_attention_resolution_intent(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<(), MailboxServiceError> {
-        if let Err(error) = self
-            .service
-            .record_forced_attention_resolution_intent(target)
-        {
-            let _ = self
-                .service
-                .cancel_attention_resolution(target.record.attempt_id);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Reserve one forced Complete key at the mailbox/claim linearization
-    /// point. The terminal adapter only receives the key after this returns
-    /// true.
-    pub(crate) fn reserve_forced_attention_resolution_action(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<bool, MailboxServiceError> {
-        match self
-            .service
-            .reserve_forced_attention_resolution_action(target)
-        {
-            Ok(reserved) => Ok(reserved),
-            Err(error) => {
-                let _ = self
-                    .service
-                    .cancel_attention_resolution(target.record.attempt_id);
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn record_attention_resolution_action_accepted(
-        &self,
-        target: &AttentionTarget,
-        resolution: NotificationResolution,
-    ) -> Result<(), MailboxServiceError> {
-        self.service
-            .record_attention_resolution_action_accepted(target, resolution)
-    }
-
-    pub(crate) fn attention_claim_consumption(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<Option<NotificationResolutionConsumptionObservation>, MailboxServiceError> {
-        self.service.attention_claim_consumption(target)
-    }
-
-    pub(crate) fn record_attention_resolution_consumption_observed(
-        &self,
-        target: &AttentionTarget,
-        observation: NotificationResolutionConsumptionObservation,
-    ) -> Result<(), MailboxServiceError> {
-        self.service
-            .record_attention_resolution_consumption_observed(target, observation)
-    }
-
-    pub(crate) fn commit_attention_resolution(
-        &self,
-        target: &AttentionTarget,
-        resolution: NotificationResolution,
-    ) -> Result<(), MailboxServiceError> {
-        self.service.resolve_attention(target, resolution)
-    }
-
-    pub(crate) fn commit_attention_without_terminal_action(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<(), MailboxServiceError> {
-        self.service
-            .resolve_attention_without_terminal_action(target)
-    }
-
-    /// Commit one proven pre-key refusal without conflating an append failure
-    /// with the boot-local reservation release that follows it.
-    pub(crate) fn withdraw_attention_resolution_intent(
-        &self,
-        target: &AttentionTarget,
-        resolution: NotificationResolution,
-    ) -> Result<(), MailboxServiceError> {
-        self.service
-            .withdraw_attention_resolution_intent(target, resolution)
-    }
-
-    /// Release a durably withdrawn pre-key intent and continue its recipient
-    /// FIFO. A scheduling failure does not make the durable withdrawal
-    /// uncertain.
-    pub(crate) fn finish_attention_intent_withdrawal(
-        &self,
-        target: &AttentionTarget,
-    ) -> Result<(), MailboxServiceError> {
-        self.service
-            .cancel_attention_resolution(target.record.attempt_id)?;
-        if let Err(error) = self.notification_head_changed(target.record.recipient) {
-            error!(
-                recipient = %target.record.recipient,
-                %error,
-                "cannot schedule mailbox notification after attention intent withdrawal"
-            );
-        }
-        Ok(())
-    }
-
     fn require_admin(&self, caller: RecipientKey) -> Result<(), MessagingAttentionError> {
         if caller.is_admin() {
             Ok(())
         } else {
             Err(MessagingAttentionError::Denied)
-        }
-    }
-
-    fn attention_target(&self, raw: &str) -> Result<AttentionTarget, MessagingAttentionError> {
-        match self.service.attention_target(raw) {
-            Ok(target) => Ok(target),
-            Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error))) => {
-                if let MailboxError::AmbiguousAttentionTarget { candidates, .. } = error.as_ref() {
-                    return Err(MessagingAttentionError::Ambiguous {
-                        message: error.to_string(),
-                        candidates: candidates.clone(),
-                    });
-                }
-                Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error)).into())
-            }
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -2693,6 +1572,7 @@ impl WorkspaceMessaging {
                 params.summary,
                 params.body,
                 params.client_key,
+                params.raw,
             )?,
             None => self.service.send(
                 sender,
@@ -2705,6 +1585,7 @@ impl WorkspaceMessaging {
                     fyi: params.fyi,
                     client_key: params.client_key,
                     supersedes: params.supersedes,
+                    raw: params.raw,
                 },
             )?,
         };
@@ -2718,65 +1599,24 @@ impl WorkspaceMessaging {
         summary: Option<String>,
         body: String,
         client_key: Option<String>,
+        raw: bool,
     ) -> Result<MsgSendResult, MailboxServiceError> {
         let accepted = self
             .service
-            .reply_with_summary(sender, reference, summary, body, client_key)?;
+            .reply_with_summary(sender, reference, summary, body, client_key, raw)?;
         self.finish_acceptance(accepted, false).await
     }
 
     /// Apply one committed pane observation to durable messaging truth.
     ///
     /// This operation never captures a pane or resolves a live route. It owns
-    /// the durable and post-commit consequences justified by supplied evidence
-    /// and decides which explicit notices the daemon composition root commits.
-    pub(crate) fn apply_observation(
-        &self,
-        observation: crate::fusion::PaneMessagingObservation,
-    ) -> Result<ObservationApplication, MailboxServiceError> {
-        let (recipient, session_idx, pane_id) = match observation {
+    /// the post-commit consequences justified by supplied evidence.
+    pub(crate) fn apply_observation(&self, observation: crate::fusion::PaneMessagingObservation) {
+        match observation {
             crate::fusion::PaneMessagingObservation::RouteEvidenceObserved { evidence } => {
                 self.route_evidence_observed(evidence);
-                return Ok(ObservationApplication::default());
             }
-            crate::fusion::PaneMessagingObservation::PaneSizeChanged { evidence } => {
-                self.pane_size_observed(evidence)?;
-                return Ok(ObservationApplication::default());
-            }
-            crate::fusion::PaneMessagingObservation::QuotaResetObserved {
-                recipient,
-                session_idx,
-                pane_id,
-            } => (recipient, session_idx, pane_id),
-            crate::fusion::PaneMessagingObservation::ExactOwnedEvidenceChanged { recipient } => {
-                self.exact_owned_evidence_changed(recipient);
-                return Ok(ObservationApplication::default());
-            }
-        };
-        let observed = self.service.observe_quota_reset(recipient)?;
-        if observed.is_empty() {
-            return Ok(ObservationApplication::default());
         }
-        let label =
-            quota_reset_recipient_label(self.service.identity_for_recipient(recipient), pane_id);
-        let notices: Vec<_> = observed
-            .iter()
-            .map(|record| MessagingAdminNotice {
-                level: NotifyLevel::ActionRequired,
-                subject: format!("quota reset observed for {label}"),
-                body: quota_reset_notice(&record.message_id),
-                message_id: record.message_id.clone(),
-                session_idx,
-                recipient_label: label.clone(),
-            })
-            .collect();
-        Ok(ObservationApplication {
-            durable_messages: observed
-                .into_iter()
-                .map(|record| record.message_id)
-                .collect(),
-            notices,
-        })
     }
 }
 
@@ -2792,27 +1632,6 @@ fn alarm_summary(record: &NotificationRecord) -> AlarmSummary {
             .cause
             .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
         ts: record.updated_at,
-    }
-}
-
-fn quota_reset_notice(message_id: &MessageId) -> String {
-    format!("message {message_id} remains held; run `cyclops requeue {message_id}`")
-}
-
-/// Preserve the post-commit recovery cue even when current identity metadata
-/// is absent or temporarily unreadable. The immutable observation's pane ID is
-/// less friendly than a current label, but it still names the held recipient.
-fn quota_reset_recipient_label(
-    identity: Result<Option<MailboxIdentity>, MailboxServiceError>,
-    pane_id: String,
-) -> String {
-    match identity {
-        Ok(Some(identity)) => identity.label,
-        Ok(None) => pane_id,
-        Err(error) => {
-            error!(%error, %pane_id, "cannot resolve quota-reset recipient label");
-            pane_id
-        }
     }
 }
 
@@ -2954,9 +1773,7 @@ fn schedule_accepted_notifications(
 #[cfg(test)]
 mod tests {
     use crate::fusion::PaneMessagingObservation;
-    use crate::messaging_runtime::{
-        record_unowned_notification, wait_and_queue_unclaimed_reminder,
-    };
+    use crate::messaging_runtime::record_unowned_notification;
 
     use super::*;
     use std::fs;
@@ -2965,9 +1782,8 @@ mod tests {
     use std::str::FromStr;
 
     use cyclops_proto::{
-        scratch::scratch_dir, Event, NotificationAttentionCause, NotificationResolution,
-        NotificationTransport, NotificationVerifyOutcome, SessionInstanceId, TmuxPaneId,
-        WorkspaceId, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
+        scratch::scratch_dir, Event, NotificationAttentionCause, NotificationTransport,
+        SessionInstanceId, TmuxPaneId, WorkspaceId, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
     };
     use cyclops_state::StateRoot;
     use tokio::sync::broadcast;
@@ -3051,45 +1867,18 @@ mod tests {}
         );
     }
 
-    /// Syntactic architecture lint: runtime and observation adapters may
-    /// supply physical evidence, but durable recovery records, variants, and
-    /// coordinator state remain private to WorkspaceMessaging.
+    /// Syntactic architecture lint: the pane sensor supplies physical
+    /// evidence; durable composer state stays private to WorkspaceMessaging.
     #[test]
-    fn composer_recovery_policy_cannot_leak_back_into_runtime_callers() {
+    fn fusion_cannot_read_durable_composer_state() {
         let fusion = source_before_primary_tests(include_str!("fusion.rs"), "fusion.rs");
         for forbidden in [
-            "composer_recovery::RecoveryAction",
-            "composer_recovery::persist",
             "active_notification_barriers",
             "exact_recipient_claimed_after_write",
-            ".composer_recovery",
         ] {
             assert!(
                 !fusion.contains(forbidden),
                 "fusion recovered durable composer policy: {forbidden}"
-            );
-        }
-
-        let recovery = source_before_primary_tests(
-            include_str!("composer_recovery.rs"),
-            "composer_recovery.rs",
-        );
-        for forbidden in ["inner.mailbox", ".composer_recovery\n"] {
-            assert!(
-                !recovery.contains(forbidden),
-                "physical composer evidence recovered durable state: {forbidden}"
-            );
-        }
-
-        let delivery_src = delivery_production_source();
-        for (adapter, source) in [
-            ("delivery", delivery_src.as_str()),
-            ("messaging runtime", include_str!("messaging_runtime.rs")),
-            ("ack", include_str!("ack.rs")),
-        ] {
-            assert!(
-                !source.contains(".composer_recovery"),
-                "{adapter} reached into composer recovery coordinator state"
             );
         }
     }
@@ -3123,14 +1912,8 @@ mod tests {}
     fn pane_observation_cannot_apply_messaging_policy_directly() {
         let fusion = source_before_primary_tests(include_str!("fusion.rs"), "fusion.rs");
         for forbidden in [
-            ".exact_owned_evidence_changed(",
             ".route_evidence_observed(",
             "workspace_messaging()",
-            ".composer_recovery_probe(",
-            ".composer_projection_probe(",
-            ".reconcile_composer_recovery(",
-            ".settle_composer_recovery_lifecycle(",
-            ".merge_composer_recovery_barrier(",
             "confirm_dispatch_ack(",
         ] {
             assert!(
@@ -3138,15 +1921,6 @@ mod tests {}
                 "fusion applied messaging policy directly: {forbidden}"
             );
         }
-
-        let recovery = source_before_primary_tests(
-            include_str!("composer_recovery.rs"),
-            "composer_recovery.rs",
-        );
-        assert!(
-            !recovery.contains("workspace_messaging()"),
-            "physical composer evidence reached the messaging Module directly"
-        );
     }
 
     struct Scratch(PathBuf);
@@ -3209,6 +1983,7 @@ mod tests {}
                     fyi: false,
                     client_key: None,
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap()
@@ -3296,6 +2071,7 @@ mod tests {}
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
@@ -3325,7 +2101,6 @@ mod tests {}
                 record,
                 message: Some(message),
                 entry_state: Some(cyclops_proto::MailboxEntryState::Pending),
-                recovery_action: ExactOwnedRecoveryAction::Ineligible,
             },
             recipient,
             physical_binding,
@@ -3657,14 +2432,9 @@ mod tests {}
         ResolvePane(RecipientKey),
         ObserveNotificationRoute(RecipientKey),
         SettleClaim(NotificationAttemptId),
-        ObserveClaimedComposer(RecipientKey, NotificationAttemptId),
-        RecoverClaimedNotification(RecipientKey, NotificationAttemptId),
         CancelNotification(NotificationAttemptId),
-        SpawnExactAttentionWorker(NotificationAttemptId),
         ReconcileRouteEvidence(MessagingRouteEvidence),
         ReconcileCurrentRoute(usize, String),
-        ScheduleUnclaimedReminder(NotificationAttemptId),
-        ScheduleForceSubmit(NotificationAttemptId),
     }
 
     struct RecordingEffects {
@@ -3757,18 +2527,6 @@ mod tests {}
                 .cloned())
         }
 
-        fn composer_runtime_facts(
-            &self,
-            _recipient: RecipientKey,
-            _attempt_id: NotificationAttemptId,
-            _manifest: Option<&NotificationManifestId>,
-        ) -> MessagingComposerRuntimeFacts {
-            MessagingComposerRuntimeFacts {
-                active_worker_owns: true,
-                clear_supported: true,
-            }
-        }
-
         fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
             self.calls
                 .lock()
@@ -3776,43 +2534,11 @@ mod tests {}
                 .push(RecordedEffect::SettleClaim(attempt_id));
         }
 
-        fn observe_claimed_composer(
-            &self,
-            _service: &Arc<MailboxService>,
-            claimant: RecipientKey,
-            attempt_id: NotificationAttemptId,
-        ) -> Result<(), MailboxServiceError> {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::ObserveClaimedComposer(claimant, attempt_id));
-            Ok(())
-        }
-
-        fn recover_claimed_notification(
-            &self,
-            _service: &Arc<MailboxService>,
-            claimant: RecipientKey,
-            attempt_id: NotificationAttemptId,
-        ) -> Result<(), MailboxServiceError> {
-            self.calls.lock().expect("acceptance calls lock").push(
-                RecordedEffect::RecoverClaimedNotification(claimant, attempt_id),
-            );
-            Ok(())
-        }
-
         fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
                 .push(RecordedEffect::CancelNotification(attempt_id));
-        }
-
-        fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId) {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::SpawnExactAttentionWorker(attempt_id));
         }
 
         fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence) {
@@ -3827,20 +2553,6 @@ mod tests {}
                 .lock()
                 .expect("acceptance calls lock")
                 .push(RecordedEffect::ReconcileCurrentRoute(session_idx, pane_id));
-        }
-
-        fn schedule_unclaimed_reminder(&self, record: NotificationRecord) {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::ScheduleUnclaimedReminder(record.attempt_id));
-        }
-
-        fn schedule_force_submit(&self, record: NotificationRecord) {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::ScheduleForceSubmit(record.attempt_id));
         }
 
         fn receipt_block(&self) -> Duration {
@@ -3886,7 +2598,7 @@ mod tests {}
         legacy_only.to = vec!["observer".into()];
         legacy_only.subject = Some("legacy only".into());
         legacy_only.body = Some("legacy private body".into());
-        let compatibility = || CompatibilityHistorySources {
+        let compatibility = || SessionHistorySources {
             files: vec![(
                 "session-journal:legacy.ndjson".into(),
                 vec![collision.clone(), legacy_only.clone()],
@@ -4012,7 +2724,7 @@ mod tests {}
             "the legacy copy must be open when read without its current owner"
         );
 
-        let open = messaging.retained_open_deliveries(CompatibilityHistorySources {
+        let open = messaging.retained_open_deliveries(SessionHistorySources {
             files: vec![("session-journal:legacy.ndjson".into(), legacy)],
             unreadable_sources: 0,
         });
@@ -4044,7 +2756,7 @@ mod tests {}
             deliveries: Vec::new(),
             data: None,
         };
-        let compatibility = CompatibilityHistorySources {
+        let compatibility = SessionHistorySources {
             files: vec![(
                 "session-journal:only.ndjson".into(),
                 vec![line(1, "m-first"), line(2, "m-second")],
@@ -4096,6 +2808,7 @@ mod tests {}
                     supersedes: None,
                     wait: None,
                     require_wake: false,
+                    raw: false,
                 },
             )
             .await
@@ -4133,6 +2846,57 @@ mod tests {}
         let metadata: cyclops_proto::MessageMetadata =
             serde_json::from_value(line.data.unwrap()).unwrap();
         assert_eq!(metadata.recipients, vec![reviewer]);
+    }
+
+    /// A raw send to a recipient without a pane is accepted durably, records
+    /// the request, and rings nothing.
+    #[tokio::test]
+    async fn a_raw_send_to_admin_is_accepted_durably_without_a_notification() {
+        let (_scratch, service, events, reviewer, _) = mailbox_service("raw-to-admin", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let admin = service.admin().key;
+
+        let result = messaging
+            .send(
+                MailboxIdentity {
+                    key: reviewer,
+                    label: "reviewer".to_string(),
+                },
+                MsgSendParams {
+                    to: vec!["admin".to_string()],
+                    recipient_keys: None,
+                    expected_caller: None,
+                    subject: "Raw".to_string(),
+                    summary: None,
+                    body: "pasted whole when a pane exists".to_string(),
+                    fyi: false,
+                    client_key: Some("raw-to-admin".to_string()),
+                    reply_to: None,
+                    supersedes: None,
+                    wait: None,
+                    require_wake: false,
+                    raw: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.inserted, Some(true));
+        let store = service.store().unwrap();
+        assert!(store.projection().notifications_for(admin).is_empty());
+        let message = store
+            .projection()
+            .get_message(&MessageId::new(&result.msg_id).unwrap())
+            .cloned()
+            .expect("durable message");
+        let metadata: cyclops_proto::MessageMetadata =
+            serde_json::from_value(message.data.unwrap()).unwrap();
+        assert!(metadata.raw, "the raw request is part of the durable fact");
     }
 
     // Obsolete if inbox reads or claim coordination escape the
@@ -4203,8 +2967,10 @@ mod tests {}
         );
         let (accepted, context, _) = queued_attempt(&service);
         context.record_gating().unwrap();
-        context.record_quota_held().unwrap();
-        assert_eq!(service.observe_quota_reset(reviewer).unwrap().len(), 1);
+        record_doorbell_write(&context);
+        context
+            .record_attention(NotificationAttentionCause::SubmitFailed)
+            .unwrap();
 
         assert!(messaging.requeue(accepted.message_id).unwrap());
         assert_eq!(
@@ -4243,32 +3009,6 @@ mod tests {}
         );
     }
 
-    // Obsolete if delivery or attention mechanisms regain the mailbox service
-    // and directly choose how a settled head advances its recipient FIFO.
-    #[test]
-    fn workspace_messaging_owns_external_settlement_follow_up_order() {
-        let (_scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-settlement-effects", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-
-        messaging.notification_head_changed(reviewer).unwrap();
-        messaging.direct_delivery_settled(reviewer).unwrap();
-
-        assert_eq!(
-            effects.calls(),
-            vec![
-                RecordedEffect::Schedule(reviewer),
-                RecordedEffect::InvalidateUnread(reviewer),
-                RecordedEffect::Schedule(reviewer),
-            ]
-        );
-    }
-
     // Obsolete if runtime observers or adapters again choose reconciliation,
     // reminder, or force-submit workers themselves.
     #[test]
@@ -4289,124 +3029,16 @@ mod tests {}
                 generation: 9,
             },
         );
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-
         messaging.route_evidence_observed(route.clone());
         messaging.notification_prewrite_blocked(2, "%7");
-        messaging.force_submit_enabled();
 
         assert_eq!(
             effects.calls(),
             vec![
                 RecordedEffect::ReconcileRouteEvidence(route),
                 RecordedEffect::ReconcileCurrentRoute(2, "%7".to_string()),
-                RecordedEffect::ScheduleForceSubmit(attention.attempt_id),
             ]
         );
-    }
-
-    // Obsolete if delivery interprets durable notification variants to choose
-    // reminder, attention reconciliation, or force-submit scheduling.
-    #[test]
-    fn workspace_messaging_owns_durable_notification_follow_up_policy() {
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("workspace-messaging-notified-policy", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-
-        messaging.notification_became_notified(notified.clone());
-        messaging.notification_became_notified(notified);
-
-        assert_eq!(
-            effects.calls(),
-            vec![
-                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
-                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
-            ],
-            "repeated mechanism calls remain safe because the runtime helper and durable queue are idempotent"
-        );
-
-        let (_scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-attention-policy", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-
-        messaging.notification_attention_recorded(attention.clone());
-
-        assert_eq!(
-            effects.calls(),
-            vec![
-                RecordedEffect::SpawnExactAttentionWorker(attention.attempt_id),
-                RecordedEffect::ScheduleForceSubmit(attention.attempt_id),
-            ]
-        );
-        match messaging.next_exact_attention_work(attention.attempt_id) {
-            ExactAttentionWork::Resolve { target, resolution } => {
-                assert_eq!(target.record.attempt_id, attention.attempt_id);
-                assert_eq!(target.record.recipient, reviewer);
-                assert_eq!(resolution, NotificationResolution::Complete);
-            }
-            ExactAttentionWork::Retire | ExactAttentionWork::Recheck => {
-                panic!("elected exact-owned attempt did not produce its durable policy")
-            }
-        }
-        assert!(matches!(
-            messaging.next_exact_attention_work(attention.attempt_id),
-            ExactAttentionWork::Retire
-        ));
-    }
-
-    /// Syntactic architecture lint: the exact terminal mechanism performs one
-    /// requested action. It cannot select projection candidates, manipulate
-    /// election locks, or spawn messaging workers.
-    #[test]
-    fn attention_terminal_mechanism_cannot_recover_messaging_internals() {
-        let compact: String = include_str!("attention_resolution.rs")
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        for forbidden in [
-            "active_composer_notifications(",
-            "request_exact_reconciliation(",
-            "take_exact_reconciliation_request(",
-            "automatic_attention_resolution(",
-            "park_exact_reconciliation_after_conflict(",
-            "resume_exact_reconciliation(",
-            "spawn_descendant_task(",
-            "Arc<MailboxService>",
-            "&MailboxService",
-            "service.",
-            "messaging::notification_route(",
-            "messaging_runtime::notification_route(",
-            "register_attention_consumption_candidate(",
-            "message_line(",
-        ] {
-            assert!(
-                !compact.contains(forbidden),
-                "terminal mechanism recovered messaging worker topology: {forbidden}"
-            );
-        }
     }
 
     /// Syntactic architecture lint: delivery and terminal mechanisms report a
@@ -4415,22 +3047,14 @@ mod tests {}
     #[test]
     fn mechanisms_cannot_schedule_recipient_fifos_directly() {
         let delivery_src = delivery_production_source();
-        for (name, source) in [
-            ("delivery", delivery_src.as_str()),
-            (
-                "attention resolution",
-                include_str!("attention_resolution.rs"),
-            ),
+        for forbidden in [
+            "messaging::schedule_recipient(",
+            "messaging_runtime::schedule_recipient(",
         ] {
-            for forbidden in [
-                "messaging::schedule_recipient(",
-                "messaging_runtime::schedule_recipient(",
-            ] {
-                assert!(
-                    !source.contains(forbidden),
-                    "{name} recovered direct recipient scheduling knowledge through {forbidden}"
-                );
-            }
+            assert!(
+                !delivery_src.contains(forbidden),
+                "delivery recovered direct recipient scheduling knowledge through {forbidden}"
+            );
         }
     }
 
@@ -4468,21 +3092,13 @@ mod tests {}
             1,
             "route scheduling must remain confined to the effects adapter"
         );
-        for forbidden in [
-            "messaging_runtime::schedule_available(",
-            "messaging_runtime::schedule_pane_size_changed(",
-            "messaging_runtime::schedule_unclaimed_reminders(",
-            "messaging_runtime::schedule_force_submit_candidates(",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "composition event source bypasses WorkspaceMessaging through {forbidden}"
-            );
-        }
+        assert!(
+            !source.contains("messaging_runtime::schedule_available("),
+            "composition event source bypasses WorkspaceMessaging"
+        );
         for required in [
             "apply_messaging_availability_change(",
             "PaneMessagingObservation::route_evidence(",
-            "PaneMessagingObservation::pane_size_changed(",
         ] {
             assert!(
                 source.contains(required),
@@ -4536,24 +3152,14 @@ mod tests {}
         assert!(production.contains(".replace_directory(directory)"));
     }
 
-    /// Syntactic architecture lint: the authenticated hook adapter proves one
-    /// immutable observation. Candidate storage and matching stay inside the
-    /// messaging Module.
+    /// Syntactic architecture lint: the authenticated hook adapter resolves
+    /// receipts through the delivery engine and never reaches the mailbox.
     #[test]
     fn authenticated_hook_cannot_access_messaging_internals() {
         let source = include_str!("ack.rs");
         let production = source_before_primary_tests(source, "ack.rs");
 
-        assert!(
-            production.contains("MessagingAttentionConsumptionObservation::new"),
-            "authenticated hook stopped publishing its immutable observation"
-        );
-        for forbidden in [
-            "inner.mailbox",
-            "confirm_attention_consumption_hook",
-            "attention_consumption_candidates",
-            "MailboxService",
-        ] {
+        for forbidden in ["inner.mailbox", "MailboxService"] {
             assert!(
                 !production.contains(forbidden),
                 "authenticated hook recovered messaging internals through {forbidden}"
@@ -4772,7 +3378,7 @@ mod tests {}
     // Obsolete if alarm or attention adapters again inspect notification
     // records, resolve ambiguous targets, or decide recipient visibility.
     #[test]
-    fn workspace_messaging_owns_alarm_projection_and_attention_selection_without_inner() {
+    fn workspace_messaging_owns_alarm_projection_without_inner() {
         let (_scratch, service, events, reviewer, observer) =
             mailbox_service("workspace-messaging-attention", 8);
         let effects = Arc::new(RecordingEffects::new(events));
@@ -4785,7 +3391,7 @@ mod tests {}
         context.record_gating().unwrap();
         record_doorbell_write(&context);
         let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .record_attention(NotificationAttentionCause::SubmitFailed)
             .unwrap();
         let admin = service.admin().key;
 
@@ -4793,37 +3399,16 @@ mod tests {}
             messaging.alarm_preview(reviewer, 0, u64::MAX),
             Err(MessagingAttentionError::Denied)
         ));
+        assert!(matches!(
+            messaging.alarm_preview(observer, 0, u64::MAX),
+            Err(MessagingAttentionError::Denied)
+        ));
         let preview = messaging.alarm_preview(admin, 0, u64::MAX).unwrap();
         assert_eq!(preview.entries.len(), 1);
         assert_eq!(preview.entries[0].id, attention.attempt_id.to_string());
         assert_eq!(
             preview.entries[0].cause,
-            NotificationAttentionCause::VerifyFailed
-        );
-
-        let shown = messaging
-            .attention_for_show(reviewer, &attention.attempt_id.to_string())
-            .unwrap();
-        assert_eq!(shown.record.attempt_id, attention.attempt_id);
-        assert!(matches!(
-            messaging.attention_for_show(observer, &attention.attempt_id.to_string()),
-            Err(MessagingAttentionError::Denied)
-        ));
-        assert!(matches!(
-            messaging.attention_for_show(observer, "att-00000000-0000-4000-8000-000000000099"),
-            Err(MessagingAttentionError::Denied)
-        ));
-        assert!(matches!(
-            messaging.attention_for_resolution(reviewer, &attention.attempt_id.to_string()),
-            Err(MessagingAttentionError::Denied)
-        ));
-        assert_eq!(
-            messaging
-                .attention_for_resolution(admin, &attention.attempt_id.to_string())
-                .unwrap()
-                .record
-                .attempt_id,
-            attention.attempt_id
+            NotificationAttentionCause::SubmitFailed
         );
 
         let cleared = messaging
@@ -4834,224 +3419,6 @@ mod tests {}
         assert_eq!(cleared.summaries[0].id, preview.entries[0].id);
         assert_eq!(cleared.summaries[0].cause, preview.entries[0].cause);
         assert!(effects.calls().is_empty());
-    }
-
-    // Obsolete if the terminal mechanism again appends or withdraws durable
-    // resolution intent directly instead of asking WorkspaceMessaging.
-    #[test]
-    fn workspace_messaging_owns_attention_intent_and_pre_key_withdrawal() {
-        let (scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-attention-commit", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-        let target = messaging
-            .attention_for_resolution(service.admin().key, &attention.attempt_id.to_string())
-            .unwrap();
-        let journal_path = scratch
-            .0
-            .join("workspaces")
-            .join("current")
-            .join("messages.ndjson");
-        let before_lines = fs::read_to_string(&journal_path).unwrap().lines().count();
-
-        assert_eq!(
-            messaging
-                .begin_attention_resolution(&target, NotificationResolution::Complete)
-                .unwrap(),
-            AttentionResolutionStart::Fresh
-        );
-        assert_eq!(
-            messaging
-                .record_attention_resolution_intent(
-                    &target,
-                    NotificationResolution::Complete,
-                    false,
-                )
-                .unwrap(),
-            NotificationResolution::Complete
-        );
-        messaging
-            .withdraw_attention_resolution_intent(&target, NotificationResolution::Complete)
-            .unwrap();
-        messaging
-            .finish_attention_intent_withdrawal(&target)
-            .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&journal_path).unwrap().lines().count(),
-            before_lines + 2,
-            "one intent and one withdrawal remain the complete durable pre-key trace"
-        );
-        assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
-        assert_eq!(
-            messaging
-                .begin_attention_resolution(&target, NotificationResolution::Complete)
-                .unwrap(),
-            AttentionResolutionStart::Fresh
-        );
-        messaging
-            .cancel_attention_resolution(attention.attempt_id)
-            .unwrap();
-    }
-
-    #[test]
-    fn failed_forced_intent_append_releases_the_exact_reservation() {
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("forced-intent-append-failure", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging =
-            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-        let target = messaging
-            .attention_for_runtime(attention.attempt_id)
-            .unwrap();
-
-        assert_eq!(
-            messaging
-                .begin_attention_resolution(&target, NotificationResolution::Complete)
-                .unwrap(),
-            AttentionResolutionStart::Fresh
-        );
-        service.inject_notification_recovery_append_failure(attention.attempt_id);
-        assert!(messaging
-            .record_forced_attention_resolution_intent(&target)
-            .is_err());
-        assert_eq!(
-            service
-                .store_handle()
-                .lock()
-                .unwrap()
-                .projection()
-                .attention_resolution_intent(attention.attempt_id),
-            None,
-            "a failed pre-key append must not leave a durable forced intent"
-        );
-        assert_eq!(
-            messaging
-                .begin_attention_resolution(&target, NotificationResolution::Complete)
-                .unwrap(),
-            AttentionResolutionStart::Fresh,
-            "the next exact resolver may acquire the released reservation"
-        );
-        messaging
-            .cancel_attention_resolution(attention.attempt_id)
-            .unwrap();
-    }
-
-    // Obsolete if terminal or hook code again reads message rows, matches
-    // durable bindings, or owns boot-local consumption candidates.
-    #[test]
-    fn workspace_messaging_owns_attention_payload_and_consumption_registration() {
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("workspace-messaging-attention-support", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging =
-            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-        let target = messaging
-            .attention_for_runtime(attention.attempt_id)
-            .unwrap();
-        let expected = messaging
-            .expected_attention_notification(&target)
-            .expect("current message rebuilds its exact doorbell");
-        let pane_id = target.record.recipient.pane_id().unwrap().to_string();
-
-        let registration = messaging
-            .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
-            .unwrap()
-            .expect("exact-attempt doorbells register consumption");
-        let signal = registration.signal();
-        let binding = target
-            .record
-            .binding
-            .as_ref()
-            .expect("written doorbell retains its exact durable binding");
-        let pane_root = binding
-            .pane_root
-            .expect("written doorbell retains its pane root");
-        assert!(messaging.attention_consumption_observed(
-            MessagingAttentionConsumptionObservation::new(
-                0,
-                pane_id.clone(),
-                target.record.recipient,
-                crate::identity::ProcId {
-                    pid: pane_root.pid(),
-                    birth: pane_root.birth(),
-                },
-                crate::identity::ProcId {
-                    pid: binding.agent.pid(),
-                    birth: binding.agent.birth(),
-                },
-                binding.manifest.as_str(),
-                expected.clone(),
-                1,
-            ),
-        ));
-        assert_eq!(
-            signal.observation(),
-            Some(NotificationResolutionConsumptionObservation {
-                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::ExactHookPrompt,
-                observed_at_ms: 1,
-            })
-        );
-        assert!(messaging
-            .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
-            .is_err());
-        drop(registration);
-        let replacement = messaging
-            .register_attention_consumption(&target, 0, pane_id, expected, 0)
-            .unwrap()
-            .expect("dropping the Module handle releases the exact candidate");
-        drop(replacement);
-    }
-
-    /// Syntactic architecture lint: terminal code may prove and execute one
-    /// exact action, but every durable resolution boundary belongs to the
-    /// messaging Module.
-    #[test]
-    fn attention_terminal_mechanism_cannot_commit_messaging_state_directly() {
-        let compact: String = include_str!("attention_resolution.rs")
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        for forbidden in [
-            "service.begin_attention_resolution(",
-            "service.cancel_attention_resolution(",
-            "service.record_attention_resolution_intent(",
-            "service.record_automatic_attention_resolution_intent(",
-            "service.record_forced_attention_resolution_intent(",
-            "service.reserve_forced_attention_resolution_action(",
-            "service.record_attention_resolution_action_accepted(",
-            "service.record_attention_resolution_consumption_observed(",
-            "service.resolve_attention(",
-            "service.resolve_attention_without_terminal_action(",
-            "service.withdraw_attention_resolution_intent(",
-        ] {
-            assert!(
-                !compact.contains(forbidden),
-                "terminal mechanism recovered durable messaging mutation: {forbidden}"
-            );
-        }
     }
 
     // Obsolete if daemon status again reconstructs mailbox routes, unread
@@ -5069,7 +3436,10 @@ mod tests {}
         let accepted = send_to(&service, &["reviewer", "observer"], "Status boundary");
         let (_record, context) = prepare_context(&service, reviewer);
         context.record_gating().unwrap();
-        context.record_quota_held().unwrap();
+        record_doorbell_write(&context);
+        context
+            .record_attention(NotificationAttentionCause::SubmitFailed)
+            .unwrap();
 
         let quiet = messaging.status_snapshot(false, u64::MAX, 32);
         assert!(quiet.mailbox_attention.is_empty());
@@ -5093,7 +3463,7 @@ mod tests {}
         assert_eq!(detailed.mailbox_attention[0].recipient, Some(reviewer));
         assert_eq!(
             detailed.mailbox_attention[0].cause.as_deref(),
-            Some("quota_held")
+            Some("submit_failed")
         );
         assert!(detailed.blocked_notifications.is_empty());
         assert_eq!(detailed.blocked_notifications_total, 0);
@@ -5176,117 +3546,6 @@ mod tests {}
         }
     }
 
-    // Obsolete if fusion again commits quota-reset messaging state itself, or
-    // if reset observation begins to requeue held work without operator action.
-    #[test]
-    fn workspace_messaging_owns_the_quota_reset_transition_and_notice_without_inner() {
-        let (scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-quota-reset", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        context.record_quota_held().unwrap();
-
-        let journal_path = scratch
-            .0
-            .join("workspaces")
-            .join("current")
-            .join("messages.ndjson");
-        let before_lines = fs::read_to_string(&journal_path).unwrap().lines().count();
-        let application = messaging
-            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
-            .unwrap();
-
-        assert_eq!(
-            application.durable_messages,
-            vec![accepted.message_id.clone()]
-        );
-        assert_eq!(application.notices.len(), 1);
-        assert_eq!(
-            application.notices[0],
-            MessagingAdminNotice {
-                level: NotifyLevel::ActionRequired,
-                subject: "quota reset observed for reviewer".to_string(),
-                body: quota_reset_notice(&accepted.message_id),
-                message_id: accepted.message_id.clone(),
-                session_idx: 2,
-                recipient_label: "reviewer".to_string(),
-            }
-        );
-        assert!(effects.calls().is_empty());
-        assert_eq!(
-            fs::read_to_string(&journal_path).unwrap().lines().count(),
-            before_lines + 1,
-            "one observation appends one durable transition"
-        );
-        let disposition = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            disposition.notification_state_raw,
-            Some(NotificationState::QuotaResetObserved)
-        );
-        assert!(
-            service
-                .prepare_oldest_notification(reviewer)
-                .unwrap()
-                .is_none(),
-            "observation never requeues the held attempt"
-        );
-
-        let after_first = fs::read_to_string(&journal_path).unwrap().lines().count();
-        let calls_after_first = effects.calls();
-        let repeated = messaging
-            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
-            .unwrap();
-        assert_eq!(repeated, ObservationApplication::default());
-        assert_eq!(
-            fs::read_to_string(&journal_path).unwrap().lines().count(),
-            after_first
-        );
-        assert_eq!(effects.calls(), calls_after_first);
-    }
-
-    // Obsolete if fusion again invokes exact-owned messaging policy directly
-    // instead of returning immutable evidence to the composition root.
-    #[test]
-    fn workspace_messaging_applies_an_exact_owned_pane_observation() {
-        let (_scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-exact-owned-observation", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-
-        let application = messaging
-            .apply_observation(PaneMessagingObservation::exact_owned_evidence_changed(
-                reviewer,
-            ))
-            .unwrap();
-
-        assert_eq!(application, ObservationApplication::default());
-        assert_eq!(
-            effects.calls(),
-            vec![RecordedEffect::SpawnExactAttentionWorker(
-                attention.attempt_id
-            )]
-        );
-    }
-
     // Obsolete if readiness handling again invokes route reconciliation from
     // fusion instead of returning immutable evidence to the composition root.
     #[test]
@@ -5308,65 +3567,11 @@ mod tests {}
             },
         );
 
-        let application = messaging
-            .apply_observation(PaneMessagingObservation::route_evidence(evidence.clone()))
-            .unwrap();
+        messaging.apply_observation(PaneMessagingObservation::route_evidence(evidence.clone()));
 
-        assert_eq!(application, ObservationApplication::default());
         assert_eq!(
             effects.calls(),
             vec![RecordedEffect::ReconcileRouteEvidence(evidence)]
-        );
-    }
-
-    // Obsolete if a tmux size event regains durable projection knowledge or
-    // directly chooses the route-reconciliation mechanism.
-    #[test]
-    fn workspace_messaging_reconciles_a_size_edge_only_for_a_durable_width_block() {
-        let (_scratch, service, events, reviewer, _) =
-            mailbox_service("workspace-messaging-size-observation", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let route = MessagingRouteEvidence::new(
-            2,
-            "%7",
-            NotificationRouteEvidenceId {
-                boot_id: "boot".to_string(),
-                generation: 9,
-            },
-        );
-
-        messaging
-            .apply_observation(PaneMessagingObservation::pane_size_changed(
-                MessagingPaneSizeEvidence::new(reviewer, route.clone()),
-            ))
-            .unwrap();
-        assert!(effects.calls().is_empty());
-
-        let (_accepted, context, _) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        let mut narrow = durable_observation(reviewer);
-        narrow.pane_width = Some(39);
-        narrow.required_pane_width = Some(40);
-        context
-            .record_pre_write_block(
-                NotificationPreWriteCause::WriteReadinessChanged,
-                Some(narrow),
-            )
-            .unwrap();
-
-        messaging
-            .apply_observation(PaneMessagingObservation::pane_size_changed(
-                MessagingPaneSizeEvidence::new(reviewer, route.clone()),
-            ))
-            .unwrap();
-        assert_eq!(
-            effects.calls(),
-            vec![RecordedEffect::ReconcileRouteEvidence(route)]
         );
     }
 
@@ -5387,34 +3592,6 @@ mod tests {}
         messaging.availability_changed();
 
         assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
-
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("workspace-messaging-reminder-replay", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-
-        messaging.restore_unclaimed_reminders();
-
-        assert_eq!(
-            effects.calls(),
-            vec![RecordedEffect::ScheduleUnclaimedReminder(
-                notified.attempt_id
-            )]
-        );
-    }
-
-    #[test]
-    fn a_directory_read_failure_cannot_suppress_the_quota_reset_recovery_cue() {
-        assert_eq!(
-            quota_reset_recipient_label(Err(MailboxServiceError::Poisoned), "%7".to_string()),
-            "%7"
-        );
     }
 
     fn queued_attempt(
@@ -5461,168 +3638,6 @@ mod tests {}
             .unwrap();
     }
 
-    fn record_notified_doorbell(
-        context: &NotificationContext,
-    ) -> cyclops_proto::NotificationRecord {
-        context.record_gating().unwrap();
-        record_doorbell_write(context);
-        context.record_staged().unwrap();
-        assert_eq!(
-            context.reserve_submit().unwrap(),
-            crate::notification_adapter::SubmitReservation::Reserved
-        );
-        context.record_submitted().unwrap();
-        context.record_notified().unwrap()
-    }
-
-    fn composer_runtime(
-        active_worker_owns: bool,
-        clear_supported: bool,
-    ) -> MessagingComposerRuntimeFacts {
-        MessagingComposerRuntimeFacts {
-            active_worker_owns,
-            clear_supported,
-        }
-    }
-
-    #[test]
-    fn workspace_messaging_owns_composer_recovery_policy() {
-        use cyclops_proto::{
-            ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
-        };
-
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                composer_runtime(true, false),
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Ineligible,
-                composer_runtime(true, false),
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Submit,
-                composer_runtime(false, false),
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Inspect,
-                composer_runtime(false, false),
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                composer_runtime(false, true),
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                composer_runtime(false, false),
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    NotificationState::Staged,
-                    Some(message),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    composer_runtime(false, false),
-                ),
-                ComposerNextAction::CheckHealth,
-                "{message:?}"
-            );
-        }
-        for state in [NotificationState::Submitting, NotificationState::Submitted] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    composer_runtime(true, false),
-                ),
-                ComposerNextAction::AutomaticReconcile,
-                "{state:?}"
-            );
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    composer_runtime(false, false),
-                ),
-                ComposerNextAction::CheckHealth,
-                "{state:?}"
-            );
-        }
-        for (state, expected) in [
-            (NotificationState::Notified, ComposerNextAction::CheckHealth),
-            (
-                NotificationState::AttentionRequired,
-                ComposerNextAction::InspectAttention,
-            ),
-            (
-                NotificationState::WithdrawnAfterStaging,
-                ComposerNextAction::CheckHealth,
-            ),
-        ] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Claimed),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    composer_runtime(true, false),
-                ),
-                expected,
-                "{state:?}"
-            );
-        }
-        assert_eq!(
-            composer_next_action(
-                ComposerState::ComposerAmbiguous,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                composer_runtime(true, false),
-            ),
-            ComposerNextAction::CheckHealth
-        );
-    }
-
     #[test]
     fn workspace_messaging_joins_composer_evidence_without_exposing_candidates() {
         use cyclops_proto::{ComposerNextAction, ComposerProof, ComposerState};
@@ -5633,7 +3648,6 @@ mod tests {}
         let (_record, context) = prepare_context(&service, recipient);
         context.record_gating().unwrap();
         record_doorbell_write(&context);
-        context.record_staged().unwrap();
         let active = service
             .active_composer_notifications_snapshot()
             .unwrap()
@@ -5647,8 +3661,6 @@ mod tests {}
                 .entry_state
                 .as_ref()
                 .map(cyclops_proto::ComposerMessageState::from),
-            recovery_action: active.recovery_action,
-            runtime: composer_runtime(true, true),
         };
         let mut candidates = HashMap::new();
         candidates.insert(attempt_id, candidate.clone());
@@ -5669,7 +3681,7 @@ mod tests {}
         let exact = status.composer_status(Some(recipient), observation.clone());
         assert_eq!(exact.attempt, Some(attempt_id));
         assert_eq!(exact.candidate_count, 1);
-        assert_eq!(exact.next_action, Some(ComposerNextAction::AutomaticSubmit));
+        assert_eq!(exact.next_action, Some(ComposerNextAction::CheckHealth));
 
         let mut mismatched = observation.clone();
         mismatched.binding.as_mut().unwrap().manifest =
@@ -5714,7 +3726,7 @@ mod tests {}
     }
 
     #[test]
-    fn require_wake_waits_past_writing_and_staged_for_the_exact_attempt() {
+    fn require_wake_waits_past_writing_for_the_exact_attempt() {
         let (_scratch, service, _events, _recipient, _) =
             mailbox_service("require-wake-boundary", 8);
         let (accepted, context, head) = queued_attempt(&service);
@@ -5728,14 +3740,6 @@ mod tests {}
         assert!(has_first_durable_disposition(&writing, &head, false));
         assert!(!has_first_durable_disposition(&writing, &head, true));
 
-        context.record_staged().unwrap();
-        let staged = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert!(!has_first_durable_disposition(&staged, &head, true));
-
-        context.reserve_submit().unwrap();
         context.record_submitted().unwrap();
         let submitted = service
             .message_dispositions(&accepted.message_id)
@@ -5880,14 +3884,14 @@ mod tests {}
     }
 
     #[test]
-    fn verify_failed_without_a_scheduler_fact_has_no_wake_block() {
+    fn post_write_attention_without_a_scheduler_fact_has_no_wake_block() {
         let (_scratch, service, _events, _recipient, _) =
-            mailbox_service("verify-failed-no-wake-block", 8);
+            mailbox_service("post-write-attention-no-wake-block", 8);
         let (accepted, context, _head) = queued_attempt(&service);
         context.record_gating().unwrap();
         record_doorbell_write(&context);
         context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .record_attention(NotificationAttentionCause::SubmitFailed)
             .unwrap();
 
         let disposition = service
@@ -5900,125 +3904,6 @@ mod tests {}
         );
         assert_eq!(disposition.wake_block, None);
         assert_eq!(receipt_from_disposition(disposition, None).wake_block, None);
-    }
-
-    #[test]
-    fn ack_timeout_without_a_scheduler_fact_has_no_wake_block() {
-        let (_scratch, service, _events, _recipient, _) =
-            mailbox_service("ack-timeout-no-wake-block", 8);
-        let (accepted, context, _head) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        context.record_staged().unwrap();
-        context.reserve_submit().unwrap();
-        context.record_submitted().unwrap();
-        context
-            .record_attention(NotificationAttentionCause::AckTimeout)
-            .unwrap();
-
-        let disposition = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            disposition.notification_state_raw,
-            Some(NotificationState::AttentionRequired)
-        );
-        assert_eq!(disposition.wake_block, None);
-        assert_eq!(receipt_from_disposition(disposition, None).wake_block, None);
-    }
-
-    #[test]
-    fn quota_records_without_a_scheduler_fact_have_no_wake_block() {
-        let (_scratch, service, _events, recipient, _) = mailbox_service("quota-no-wake-block", 8);
-        let (accepted, context, _head) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        context.record_quota_held().unwrap();
-
-        let held = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            held.notification_state_raw,
-            Some(NotificationState::QuotaHeld)
-        );
-        assert_eq!(held.wake_block, None);
-        assert_eq!(receipt_from_disposition(held, None).wake_block, None);
-
-        service.observe_quota_reset(recipient).unwrap();
-        let reset = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            reset.notification_state_raw,
-            Some(NotificationState::QuotaResetObserved)
-        );
-        assert_eq!(reset.wake_block, None);
-        assert_eq!(receipt_from_disposition(reset, None).wake_block, None);
-    }
-
-    #[test]
-    fn a_pending_exact_resolution_is_the_receipts_wake_block() {
-        let (scratch, service, _events, recipient, _) =
-            mailbox_service("pending-resolution-receipt", 8);
-        let (accepted, context, _head) = queued_attempt(&service);
-        context.record_gating().unwrap();
-        record_doorbell_write(&context);
-        let attention = context
-            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
-            .unwrap();
-        let target = service
-            .attention_target(&attention.attempt_id.to_string())
-            .unwrap();
-        service
-            .record_attention_resolution_intent(&target, NotificationResolution::Complete)
-            .unwrap();
-        let schedule_block = service
-            .notification_schedule_block(recipient)
-            .unwrap()
-            .unwrap();
-        assert_eq!(schedule_block.message_id, accepted.message_id);
-        assert_eq!(schedule_block.attempt_id, attention.attempt_id);
-        assert_eq!(
-            schedule_block.block,
-            MessageWakeBlock::AttentionResolutionPending
-        );
-
-        let disposition = service
-            .message_dispositions(&accepted.message_id)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            disposition.wake_block,
-            Some(MessageWakeBlock::AttentionResolutionPending)
-        );
-        assert_eq!(
-            receipt_from_disposition(disposition, None).wake_block,
-            Some(MessageWakeBlock::AttentionResolutionPending)
-        );
-
-        let live = service.message_dispositions(&accepted.message_id).unwrap();
-        drop(context);
-        drop(service);
-        let (workspace, directory, replayed_recipient, _) = test_directory();
-        assert_eq!(replayed_recipient, recipient);
-        let store = MessageStore::open(
-            &scratch.root(),
-            Path::new("workspaces/current/messages.ndjson"),
-            workspace,
-            "boot-replay",
-        )
-        .unwrap();
-        let replayed = MailboxService::new(directory, store)
-            .message_dispositions(&accepted.message_id)
-            .unwrap();
-        assert_eq!(replayed, live);
-        assert_eq!(
-            receipt_from_disposition(replayed[0].clone(), None).wake_block,
-            Some(MessageWakeBlock::AttentionResolutionPending)
-        );
     }
 
     #[test]
@@ -6375,82 +4260,6 @@ mod tests {}
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_due_reminder_waits_for_the_prior_barrier_then_queues_once() {
-        let (_scratch, service, events, _recipient, _) = mailbox_service("reminder-barrier", 8);
-        let (accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-        let attempt_id = notified.attempt_id;
-        let mut receiver = events.subscribe();
-        let wait_service = Arc::clone(&service);
-        let waiter = tokio::spawn(async move {
-            wait_and_queue_unclaimed_reminder(
-                &wait_service,
-                attempt_id,
-                Duration::from_secs(10),
-                &mut receiver,
-            )
-            .await
-        });
-
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished(), "the old write barrier must win");
-        assert_eq!(
-            service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
-            Some(NotificationState::Notified)
-        );
-
-        service
-            .retire_notification_barrier(
-                &notified,
-                cyclops_proto::NotificationBarrierRetirementCause::ComposerObservedClear,
-                None,
-            )
-            .unwrap();
-        let queued = waiter.await.unwrap().unwrap().unwrap();
-        assert_eq!(queued.state, NotificationState::Gating);
-        assert_eq!(queued.attempt_id, attempt_id);
-        assert_eq!(queued.unclaimed_reminder_count, 1);
-        assert_eq!(
-            service.queue_unclaimed_reminder(attempt_id).unwrap(),
-            UnclaimedReminderQueue::Obsolete
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_claim_obsoletes_the_exact_reminder_without_a_fact_or_terminal_io() {
-        let (_scratch, service, events, recipient, _) = mailbox_service("reminder-claim", 8);
-        let (accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-        let attempt_id = notified.attempt_id;
-        let lines_before = service.journal_lines().unwrap().len();
-        let mut receiver = events.subscribe();
-        let wait_service = Arc::clone(&service);
-        let waiter = tokio::spawn(async move {
-            wait_and_queue_unclaimed_reminder(
-                &wait_service,
-                attempt_id,
-                Duration::from_secs(10),
-                &mut receiver,
-            )
-            .await
-        });
-        service.claim(recipient, accepted.message_id).unwrap();
-
-        tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(waiter.await.unwrap().unwrap(), None);
-        let lines = service.journal_lines().unwrap();
-        assert_eq!(lines.len(), lines_before + 1, "only the claim appends");
-        assert!(lines.iter().all(|line| {
-            line.data
-                .as_ref()
-                .and_then(|data| data.get("type"))
-                .and_then(|v| v.as_str())
-                != Some("notification_unclaimed_reminder_queued")
-        }));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_projection_read_that_crosses_the_deadline_takes_one_final_read() {
         let (_scratch, service, events, recipient, _) =
             mailbox_service("deadline-crossing-final-read", 8);
@@ -6517,6 +4326,7 @@ mod tests {}
                     fyi: false,
                     client_key: None,
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap();

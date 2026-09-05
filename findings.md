@@ -343,7 +343,7 @@ What it constrains: `src/cyclopsd/src/chrome.rs` writes
 `pane-border-status`, and no pane title; `cyclops_tmux::layout` writes none
 either. The border already displays `#{pane_title}` by default, so
 replacing the border FORMAT replaces the view without touching the value
-underneath. Proven by `src/cyclopsd/tests/m4_name.rs`, which drives the
+underneath. Proven by `src/cyclopsd/tests/messaging/m4_name.rs`, which drives the
 title sensor from outside the pane to move a border: that test can only
 exist because chrome does not write the title.
 
@@ -496,7 +496,7 @@ rule doing the same job. A theme SWITCH is exempt: that palette was asked
 for, so it applies with a fresh start's tolerance. `theme.reload` on the
 daemon is on the near side of that rule, which is why a half-written file
 can reach a real pane border and why
-`src/cyclopsd/tests/m5_theme.rs::a_half_written_theme_leaves_the_borders_alone`
+`src/cyclopsd/tests/messaging/m5_theme.rs::a_half_written_theme_leaves_the_borders_alone`
 reads the border back off tmux rather than off the daemon's own belief.
 
 Not a suite test, and deliberately: it measures a race and reports a
@@ -840,7 +840,7 @@ and boot, which re-verifies resurrected bindings for sessions outside the
 watched set with one has-session each. A confirmed missing configured slot
 then waits for an explicit post-creation `session.watch` edge rather than
 probing on a retry clock. A tmux error keeps the label: could-not-ask never
-releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by tests/m4_name.rs.
+releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by tests/messaging/m4_name.rs.
 
 ## F48. `window-size latest` lets any regular client out-size a control client's declared canvas (MEASURED)
 
@@ -1311,7 +1311,7 @@ ownership is checked before repair, and links or unexpected file types are
 refused before their bytes are exposed. The dedicated umask child is
 `src/cyclops-state/src/lib.rs::tests::creation_is_owner_only_under_permissive_and_restrictive_umasks`.
 The production-writer contract, startup repair, symlink, and hard-link probes
-are in `src/cyclopsd/tests/state_permission_contract.rs`. The remaining state
+are in `src/cyclopsd/tests/identity/state_permission_contract.rs`. The remaining state
 writers were migrated through the same owner before the messaging candidate
 was frozen.
 

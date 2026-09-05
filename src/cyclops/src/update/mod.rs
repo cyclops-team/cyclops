@@ -702,12 +702,7 @@ pub(crate) fn run_remove_integrations(prefix: &Path) -> i32 {
         return 1;
     }
     let mut failed = false;
-    for kind in [
-        crate::hookset::CliKind::Claude,
-        crate::hookset::CliKind::Codex,
-        crate::hookset::CliKind::Agy,
-        crate::hookset::CliKind::Cursor,
-    ] {
+    for kind in crate::consumer::SHIPPED.iter().map(|spec| spec.kind) {
         match crate::hookset::remove_vendor_wiring(kind) {
             Ok(Some(result)) if result.removed => {
                 println!(

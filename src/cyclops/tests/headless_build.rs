@@ -36,18 +36,17 @@ fn bare_cyclops_names_the_missing_workspace_without_writing_state() {
 }
 
 #[test]
-fn interactive_watch_and_its_old_alias_name_the_available_machine_stream() {
+fn interactive_watch_names_the_available_machine_stream() {
     let home = scratch_home("watch");
-    for args in [&["watch", "--plain"][..], &["ui", "--plain"][..]] {
-        let output = run(&home, args);
-        assert_eq!(output.status.code(), Some(2), "args={args:?}");
-        assert!(output.stdout.is_empty(), "args={args:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "interactive watch is not included in this build. Use cyclops watch --json for the headless event stream, or install a full Cyclops build.",
-            "args={args:?}"
-        );
-    }
+    let args = &["watch", "--plain"];
+    let output = run(&home, args);
+    assert_eq!(output.status.code(), Some(2), "args={args:?}");
+    assert!(output.stdout.is_empty(), "args={args:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "interactive watch is not included in this build. Use cyclops watch --json for the headless event stream, or install a full Cyclops build.",
+        "args={args:?}"
+    );
     assert!(
         !home.exists(),
         "a refused interactive UI created Cyclops state"

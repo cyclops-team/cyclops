@@ -25,7 +25,7 @@ pub enum MailboxTypeError {
     InvalidRequestDigest(String),
     #[error("failed to serialize semantic payload for digest: {0}")]
     SerializationError(String),
-    #[error("message summary must contain exactly two sentences on one line (maximum {MESSAGE_SUMMARY_MAX_CHARS} characters)")]
+    #[error("message summary must be one non-empty line with no control characters (maximum {MESSAGE_SUMMARY_MAX_CHARS} characters)")]
     InvalidMessageSummary,
 }
 
@@ -35,11 +35,10 @@ pub enum MailboxTypeError {
 /// preview rather than a second message body.
 pub const MESSAGE_SUMMARY_MAX_CHARS: usize = 240;
 
-/// Validate the sender-authored preview carried by CLI message notifications.
+/// Validate the preview line pasted beside the exact claim command.
 ///
-/// A sentence ends with one or more `.`, `?`, or `!` characters followed by
-/// whitespace or the end of the string. The summary is one line so terminal
-/// staging and durable reconstruction see the same bytes.
+/// One line, no control characters, and bounded, so terminal staging and
+/// durable reconstruction see the same bytes.
 pub fn validate_message_summary(summary: &str) -> Result<(), MailboxTypeError> {
     if summary.is_empty()
         || summary.trim() != summary
@@ -48,36 +47,28 @@ pub fn validate_message_summary(summary: &str) -> Result<(), MailboxTypeError> {
     {
         return Err(MailboxTypeError::InvalidMessageSummary);
     }
+    Ok(())
+}
 
-    let chars: Vec<char> = summary.chars().collect();
-    let mut sentence_count = 0;
-    let mut sentence_has_content = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let current = chars[index];
-        if matches!(current, '.' | '?' | '!') {
-            let mut end = index + 1;
-            while end < chars.len() && matches!(chars[end], '.' | '?' | '!') {
-                end += 1;
-            }
-            if sentence_has_content && (end == chars.len() || chars[end].is_whitespace()) {
-                sentence_count += 1;
-                sentence_has_content = false;
-            }
-            index = end;
-            continue;
-        }
-        if !current.is_whitespace() {
-            sentence_has_content = true;
-        }
-        index += 1;
-    }
-
-    if sentence_count == 2 && !sentence_has_content {
-        Ok(())
-    } else {
-        Err(MailboxTypeError::InvalidMessageSummary)
-    }
+/// The pane preview for a message that carries no sender-authored summary.
+///
+/// The subject is the one line a sender already wrote for a reader, so it
+/// is the preview. The body is used only when the subject is empty, and then
+/// only its first line, so a body never reaches a pane by accident: bodies
+/// stay in the mailbox until claimed. Either source is cut to a single line
+/// of at most 200 characters. None when neither yields a valid summary.
+pub fn derive_message_summary(body: &str, subject: &str) -> Option<String> {
+    const DERIVED_SUMMARY_MAX_CHARS: usize = 200;
+    [subject, body].into_iter().find_map(|source| {
+        let line = source
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary: String = line.chars().take(DERIVED_SUMMARY_MAX_CHARS).collect();
+        let summary = summary.trim_end().to_string();
+        validate_message_summary(&summary).ok().map(|()| summary)
+    })
 }
 
 /// Validated unique identifier for a message record (e.g. "m-a1b2c3").
@@ -88,9 +79,6 @@ impl MessageId {
     /// Construct and validate a message identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, MailboxTypeError> {
         let value = value.into();
-        if value == "--last" || value == "-" {
-            return Ok(Self(value));
-        }
         let suffix = value
             .strip_prefix("m-")
             .ok_or_else(|| MailboxTypeError::InvalidMessageId(value.clone()))?;
@@ -292,6 +280,10 @@ pub struct MessageMetadata {
     pub request_digest: RequestDigest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<MessageId>,
+    /// The sender asked for a raw write: the whole message is pasted and
+    /// submitted with no composer check and no receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw: bool,
 }
 
 /// Human-readable labels bound to authoritative message identities.
@@ -396,10 +388,8 @@ pub enum MailboxFact {
         /// Authenticated claimant identity (must equal recipient).
         claimant: RecipientKey,
     },
-    /// Full payload reached the recipient through the compatibility lane.
-    ///
-    /// The matching notification record owns receipt strength. This fact only
-    /// retires the pending mailbox entry so the recipient FIFO can advance.
+    /// Replay only: no longer written since 1.1.0. An older daemon retired
+    /// a mailbox entry after its direct payload delivery.
     MessageDeliveredDirect {
         record_version: u32,
         message_id: MessageId,
@@ -588,16 +578,17 @@ mod tests {
     }
 
     #[test]
-    fn message_summary_requires_two_bounded_single_line_sentences() {
+    fn message_summary_is_one_bounded_line_without_control_characters() {
         assert!(validate_message_summary("Tests pass. The change is ready.").is_ok());
-        assert!(validate_message_summary("What changed? The retry is safe!").is_ok());
+        assert!(validate_message_summary("One sentence only.").is_ok());
+        assert!(validate_message_summary("no punctuation at all").is_ok());
 
         for invalid in [
-            "One sentence only.",
-            "One. Two. Three.",
+            "",
             "First sentence.\nSecond sentence.",
             " First sentence. Second sentence.",
             "First sentence. Second sentence. ",
+            "tab\tinside",
         ] {
             assert_eq!(
                 validate_message_summary(invalid),
@@ -610,5 +601,26 @@ mod tests {
             validate_message_summary(&too_long),
             Err(MailboxTypeError::InvalidMessageSummary)
         );
+    }
+
+    #[test]
+    fn derived_summary_is_the_subject_and_only_then_the_body_first_line() {
+        assert_eq!(
+            derive_message_summary("Tests pass. The change is ready.", "Review the parser"),
+            Some("Review the parser".to_string())
+        );
+        assert_eq!(
+            derive_message_summary("line one\nline two", "  \t "),
+            Some("line one".to_string())
+        );
+        assert_eq!(
+            derive_message_summary("\n\n  spaced   words  ", ""),
+            Some("spaced words".to_string())
+        );
+        assert_eq!(derive_message_summary("", "  \t "), None);
+        let long = "x".repeat(400);
+        let derived = derive_message_summary("", &long).expect("a long subject still derives");
+        assert_eq!(derived.chars().count(), 200);
+        assert_eq!(derive_message_summary("first\u{7}bell", ""), None);
     }
 }

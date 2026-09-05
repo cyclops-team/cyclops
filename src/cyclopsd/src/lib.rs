@@ -46,10 +46,7 @@
 //! main.rs is a thin wrapper adding signals and logging.
 
 mod ack;
-mod attention_resolution;
 mod chrome;
-mod compatibility;
-mod composer_recovery;
 pub mod config;
 mod deadlock;
 mod delivery;
@@ -65,12 +62,11 @@ mod notification_adapter;
 mod registry;
 mod selftest;
 mod server;
+mod session_history;
 mod sessionid;
 mod sessionstore;
 pub(crate) mod turnkey;
 mod workspace_ui;
-// Removed when daemon startup reads the workspace identity.
-#[allow(dead_code)]
 mod workspaceid;
 
 pub use config::Config;
@@ -87,7 +83,9 @@ use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -95,10 +93,9 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId,
-    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationManifestId,
-    NotificationRouteEvidenceId, NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
-    SessionIdentityBinding, SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId,
-    WireError, WorkspaceId,
+    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationRouteEvidenceId,
+    NotificationWithdrawResult, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
+    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
 };
 use cyclops_state::{RepairSummary, StateFile, StateRoot};
 use cyclops_tmux::{
@@ -279,26 +276,8 @@ pub(crate) fn apply_messaging_observation(
     inner: &Arc<Inner>,
     observation: fusion::PaneMessagingObservation,
 ) {
-    let Some(messaging) = inner.workspace_messaging() else {
-        return;
-    };
-    match messaging.apply_observation(observation) {
-        Ok(application) => {
-            for notice in application.notices {
-                delivery::admin_notify(
-                    inner,
-                    notice.level,
-                    &notice.subject,
-                    &notice.body,
-                    Some(notice.message_id.as_str()),
-                    Some(notice.session_idx),
-                    delivery::About::delivery(&notice.recipient_label),
-                );
-            }
-        }
-        Err(error) => {
-            error!(%error, "cannot apply pane observation to workspace messaging");
-        }
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.apply_observation(observation);
     }
 }
 
@@ -319,26 +298,6 @@ fn apply_route_evidence_observation(
     );
 }
 
-/// Publish one physical pane-size edge without reading durable width state.
-fn apply_pane_size_observation(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    route_evidence: &NotificationRouteEvidenceId,
-) {
-    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
-        return;
-    };
-    let route =
-        messaging::MessagingRouteEvidence::new(session_idx, pane_id, route_evidence.clone());
-    apply_messaging_observation(
-        inner,
-        fusion::PaneMessagingObservation::pane_size_changed(
-            messaging::MessagingPaneSizeEvidence::new(recipient, route),
-        ),
-    );
-}
-
 /// Publish a route-directory or lifecycle availability change.
 fn apply_messaging_availability_change(inner: &Arc<Inner>) {
     if let Some(messaging) = inner.workspace_messaging() {
@@ -346,119 +305,32 @@ fn apply_messaging_availability_change(inner: &Arc<Inner>) {
     }
 }
 
-/// Composition adapter for the durable decisions needed during one pane
+/// Composition adapter for the durable reads needed during one pane
 /// observation. Fusion receives only this narrow boundary and immutable
-/// evidence; it cannot recover the mailbox service or recovery coordinator.
-struct DaemonPaneMessagingBoundary<'a> {
-    inner: &'a Arc<Inner>,
+/// evidence; it cannot recover the mailbox service.
+struct DaemonPaneMessagingBoundary {
     messaging: Option<Arc<messaging::WorkspaceMessaging>>,
 }
 
-impl<'a> DaemonPaneMessagingBoundary<'a> {
-    fn new(inner: &'a Arc<Inner>) -> Self {
+impl DaemonPaneMessagingBoundary {
+    fn new(inner: &Arc<Inner>) -> Self {
         Self {
-            inner,
             messaging: inner.workspace_messaging(),
         }
     }
 }
 
-impl fusion::PaneMessagingBoundary for DaemonPaneMessagingBoundary<'_> {
+impl fusion::PaneMessagingBoundary for DaemonPaneMessagingBoundary {
     fn composer_context(
         &self,
         recipient: Option<cyclops_proto::RecipientKey>,
-    ) -> fusion::PaneComposerMessagingContext {
-        let (recovery, projection) = match (self.messaging.as_ref(), recipient) {
-            (Some(messaging), Some(recipient)) => (
-                messaging.composer_recovery_probe(recipient),
-                messaging.composer_projection_probe(Some(recipient)),
-            ),
-            (Some(messaging), None) => (
-                messaging::MessagingComposerRecoveryProbe::none(),
-                messaging.composer_projection_probe(None),
-            ),
-            (None, Some(_)) => (
-                messaging::MessagingComposerRecoveryProbe::store_unavailable(),
-                messaging::MessagingComposerProjectionProbe::store_unavailable(),
-            ),
-            (None, None) => (
-                messaging::MessagingComposerRecoveryProbe::none(),
-                messaging::MessagingComposerProjectionProbe::none(),
-            ),
-        };
-        fusion::PaneComposerMessagingContext::new(recovery, projection)
-    }
-
-    fn recovered_turn_observed(&self, evidence: fusion::PaneRecoveredTurnEvidence) {
-        apply_recovered_turn_evidence(self.inner, evidence);
-    }
-
-    fn decide_composer_recovery(
-        &self,
-        recipient: Option<cyclops_proto::RecipientKey>,
-        probe: messaging::MessagingComposerRecoveryProbe,
-        evidence: messaging::MessagingComposerRecoveryObservation,
-        lifecycle_candidate: Option<cyclops_proto::NotificationAttemptId>,
-    ) -> Option<messaging::MessagingComposerRecoveryPlan> {
-        recipient?;
-        let Some(messaging) = self.messaging.as_ref() else {
-            return Some(messaging::MessagingComposerRecoveryPlan::store_unavailable());
-        };
-        let plan = messaging.reconcile_composer_recovery(probe, evidence);
-        Some(messaging.settle_composer_recovery_lifecycle(plan, lifecycle_candidate))
-    }
-
-    fn merge_composer_recovery(
-        &self,
-        plan: Option<messaging::MessagingComposerRecoveryPlan>,
-        base_hold: cyclops_proto::ComposerHold,
-        owner: Option<String>,
-        turn_running: bool,
-    ) -> messaging::MessagingComposerBarrierUpdate {
-        match (self.messaging.as_ref(), plan) {
-            (Some(messaging), Some(plan)) => {
-                messaging.merge_composer_recovery_barrier(plan, base_hold, owner, turn_running)
-            }
-            (None, Some(plan)) => plan.merge_without_module(base_hold, owner, turn_running),
-            (_, None) => messaging::MessagingComposerBarrierUpdate {
-                hold: base_hold,
-                owner,
-                clear_turn: false,
-                refusal: None,
-                recovered_hold: None,
-            },
+    ) -> messaging::MessagingComposerProjectionProbe {
+        match (self.messaging.as_ref(), recipient) {
+            (Some(messaging), recipient) => messaging.composer_projection_probe(recipient),
+            (None, Some(_)) => messaging::MessagingComposerProjectionProbe::store_unavailable(),
+            (None, None) => messaging::MessagingComposerProjectionProbe::none(),
         }
     }
-}
-
-/// Apply one exact lifecycle start to a barrier that messaging still owns.
-///
-/// Reading the cached physical owner is adapter work. Deciding whether that
-/// owner remains an active recovered attempt belongs to `WorkspaceMessaging`.
-pub(crate) fn apply_recovered_turn_evidence(
-    inner: &Arc<Inner>,
-    evidence: fusion::PaneRecoveredTurnEvidence,
-) -> bool {
-    let Some(attempt_id) =
-        composer_recovery::recovered_turn_candidate(inner, evidence.session_idx, &evidence.pane_id)
-    else {
-        return false;
-    };
-    if !inner
-        .workspace_messaging()
-        .is_some_and(|messaging| messaging.composer_recovery_contains(attempt_id))
-    {
-        return false;
-    }
-    fusion::bind_turn(
-        inner,
-        evidence.session_idx,
-        &evidence.pane_id,
-        &attempt_id.to_string(),
-        evidence.turn,
-        evidence.since_ms,
-    )
-    .is_some()
 }
 
 /// Observe one pane, apply its typed messaging consequence, and return the
@@ -639,10 +511,6 @@ impl PaneKey {
 /// need lives here behind one Arc.
 pub(crate) struct Inner {
     pub(crate) cfg: Config,
-    /// Live form of the operator's opt-in post-paste force-submit setting.
-    /// Config remains the boot snapshot; this pair is updated after an atomic
-    /// config write so the Settings card takes effect without a daemon restart.
-    pub(crate) force_submit: ForceSubmitRuntime,
     /// Validated descriptor anchoring every session-ledger open in this daemon.
     pub(crate) state_root: Arc<StateRoot>,
     /// Held for the full lifetime of any runtime task that can write a
@@ -662,9 +530,6 @@ pub(crate) struct Inner {
     /// at this composition root. The Module receives named post-commit
     /// capabilities and cannot traverse daemon state itself.
     pub(crate) workspace_messaging: OnceLock<Arc<messaging::WorkspaceMessaging>>,
-    /// Boot-scoped reconciliation state for barriers derived from the
-    /// canonical workspace projection.
-    composer_recovery: Arc<StdMutex<composer_recovery::RecoveryCoordinator>>,
     /// Serializes route state, directory replacement, and authenticated reads.
     pub(crate) mailbox_publication: Arc<StdMutex<()>>,
     /// Serializes unread badge derivations and tmux writes across concurrent sync requests.
@@ -880,131 +745,16 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         }))
     }
 
-    fn composer_runtime_facts(
-        &self,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-        manifest: Option<&NotificationManifestId>,
-    ) -> messaging::MessagingComposerRuntimeFacts {
-        let Some(inner) = self.inner.upgrade() else {
-            return messaging::MessagingComposerRuntimeFacts::default();
-        };
-        messaging::MessagingComposerRuntimeFacts {
-            active_worker_owns: inner.engine.notification_worker_owns(recipient, attempt_id),
-            clear_supported: manifest
-                .and_then(|manifest| inner.manifests.get(manifest.as_str()))
-                .is_some_and(|manifest| !manifest.injection.clear_keys.is_empty()),
-        }
-    }
-
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
         if let Some(inner) = self.inner.upgrade() {
             delivery::settle_notification_claim(&inner, attempt_id);
         }
     }
 
-    fn observe_claimed_composer(
-        &self,
-        service: &Arc<mailbox::MailboxService>,
-        claimant: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<(), mailbox::MailboxServiceError> {
-        messaging_runtime::schedule_claimed_composer_observation(
-            &self.inner()?,
-            service,
-            claimant,
-            attempt_id,
-        )
-    }
-
-    fn recover_claimed_notification(
-        &self,
-        service: &Arc<mailbox::MailboxService>,
-        claimant: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<(), mailbox::MailboxServiceError> {
-        messaging_runtime::schedule_claimed_notification_recovery(
-            &self.inner()?,
-            service,
-            claimant,
-            attempt_id,
-        )
-    }
-
     fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
         if let Some(inner) = self.inner.upgrade() {
             inner.engine.cancel_notification(attempt_id);
         }
-    }
-
-    fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId) {
-        let Some(inner) = self.inner.upgrade() else {
-            return;
-        };
-        let Some(messaging) = inner.workspace_messaging() else {
-            return;
-        };
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let task_inner = Arc::clone(&inner);
-        inner.engine.spawn_descendant_task(async move {
-            loop {
-                let (target, resolution) = match messaging.next_exact_attention_work(attempt_id) {
-                    messaging::ExactAttentionWork::Retire => return,
-                    messaging::ExactAttentionWork::Recheck => continue,
-                    messaging::ExactAttentionWork::Resolve { target, resolution } => {
-                        (target, resolution)
-                    }
-                };
-                delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
-                match attention_resolution::resolve_automatic(
-                    &task_inner,
-                    &messaging,
-                    &target,
-                    resolution,
-                )
-                .await
-                {
-                    Ok(result) => tracing::info!(
-                        %attempt_id,
-                        resolution = ?result.resolution,
-                        "exact-owned composer notification reconciled"
-                    ),
-                    Err(attention_resolution::AttentionActionError::Evidence(_)) => {}
-                    Err(attention_resolution::AttentionActionError::ForceRefused(_)) => {}
-                    Err(attention_resolution::AttentionActionError::Uncertain) => tracing::warn!(
-                        %attempt_id,
-                        "exact-owned composer reconciliation remains uncertain"
-                    ),
-                    Err(attention_resolution::AttentionActionError::DiscardUnsupported) => {
-                        tracing::warn!(
-                            %attempt_id,
-                            "exact-owned composer cannot be cleared by this manifest"
-                        )
-                    }
-                    Err(attention_resolution::AttentionActionError::ResolutionInProgress) => {
-                        if messaging.park_exact_attention_after_conflict(attempt_id) {
-                            continue;
-                        }
-                        return;
-                    }
-                    Err(attention_resolution::AttentionActionError::Store(error)) => {
-                        if error.notification_resolution_in_progress() {
-                            if messaging.park_exact_attention_after_conflict(attempt_id) {
-                                continue;
-                            }
-                            return;
-                        }
-                        tracing::debug!(
-                            %attempt_id,
-                            %error,
-                            "exact-owned composer reconciliation did not start"
-                        );
-                    }
-                }
-            }
-        });
     }
 
     fn reconcile_route_evidence(&self, evidence: messaging::MessagingRouteEvidence) {
@@ -1024,18 +774,6 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         }
     }
 
-    fn schedule_unclaimed_reminder(&self, record: cyclops_proto::NotificationRecord) {
-        if let Some(inner) = self.inner.upgrade() {
-            messaging_runtime::schedule_unclaimed_reminder(&inner, record);
-        }
-    }
-
-    fn schedule_force_submit(&self, record: cyclops_proto::NotificationRecord) {
-        if let Some(inner) = self.inner.upgrade() {
-            messaging_runtime::schedule_force_submit(&inner, record);
-        }
-    }
-
     fn receipt_block(&self) -> Duration {
         self.receipt_block
     }
@@ -1047,77 +785,12 @@ impl Inner {
     ) -> Option<Arc<messaging::WorkspaceMessaging>> {
         let service = self.mailbox.clone()?;
         Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
-            Arc::new(messaging::WorkspaceMessaging::new_with_recovery(
+            Arc::new(messaging::WorkspaceMessaging::new(
                 service,
                 Arc::clone(&self.mailbox_publication),
                 Arc::new(DaemonWorkspaceMessagingEffects::new(self)),
-                Arc::clone(&self.composer_recovery),
             ))
         })))
-    }
-}
-
-pub(crate) struct ForceSubmitRuntime {
-    enabled: AtomicBool,
-    delay_ms: AtomicU64,
-    /// Orders a persisted setting change with the one durable forced-key
-    /// reservation. The only nested lock order is this gate, then the mailbox
-    /// store inside the reservation callback.
-    reservation_gate: StdMutex<()>,
-}
-
-impl ForceSubmitRuntime {
-    fn new(enabled: bool, delay_ms: u64) -> Self {
-        Self {
-            enabled: AtomicBool::new(enabled),
-            delay_ms: AtomicU64::new(delay_ms.min(20_000)),
-            reservation_gate: StdMutex::new(()),
-        }
-    }
-
-    pub(crate) fn get(&self) -> (bool, u64) {
-        (
-            self.enabled.load(Ordering::Acquire),
-            self.delay_ms.load(Ordering::Acquire),
-        )
-    }
-
-    /// Persist and publish a setting change before another forced action may
-    /// reserve its terminal key. The caller performs no async work here.
-    pub(crate) fn save_and_set(
-        &self,
-        enabled: bool,
-        delay_ms: u64,
-        save: impl FnOnce() -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let _gate = self
-            .reservation_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        save()?;
-        self.set(enabled, delay_ms);
-        Ok(())
-    }
-
-    /// Reserve a forced key only while the setting remains enabled. The
-    /// callback is synchronous and owns the mailbox-side linearization.
-    pub(crate) fn reserve_if_enabled<E>(
-        &self,
-        reserve: impl FnOnce() -> Result<bool, E>,
-    ) -> Result<Option<bool>, E> {
-        let _gate = self
-            .reservation_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.enabled.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        reserve().map(Some)
-    }
-
-    fn set(&self, enabled: bool, delay_ms: u64) {
-        self.delay_ms.store(delay_ms.min(20_000), Ordering::Release);
-        self.enabled.store(enabled, Ordering::Release);
     }
 }
 
@@ -1640,11 +1313,6 @@ pub(crate) struct DetEntry {
     /// hold change can re-stamp the cached verdict without going back to
     /// tmux for a fact that has not moved.
     pub(crate) in_mode: bool,
-    /// Whether this exact occupant has produced a fresh, agreeing,
-    /// non-quota screen observation this boot. It gates the one durable
-    /// quota-reset scan and survives title-only redraws that carry no new
-    /// screen evidence.
-    pub(crate) quota_screen_clear: bool,
     /// What this pane's composer has proven since text was last seen
     /// staged in it. Carried across recomputes, dropped with the
     /// occupant: a hold is about one agent's composer, not the place.
@@ -1662,12 +1330,6 @@ pub(crate) struct DetEntry {
     /// would settle B's barrier: promoting, releasing or clearing a
     /// hold that belongs to a payload A never wrote.
     pub(crate) hold_owner: Option<String>,
-    /// Exact staged delivery that saw a confirmed, exactly keyed terminal
-    /// edge after its Working-plus-clean admission and before its final
-    /// Enter. This is a runtime-only conflict for that final Enter, not a new
-    /// pane state or a general delivery hold. It survives only while the same
-    /// owner keeps a staged barrier on the same cached binding.
-    pub(crate) final_submit_conflict_owner: Option<String>,
     /// Content-free result of joining the current composer observation with
     /// the exact active notification barrier. Composer bytes never enter the
     /// cache or a status response.
@@ -2594,8 +2256,7 @@ impl Daemon {
                 let _ = task.await;
             }
         }
-        let mut workers = self.inner.engine.take_legacy_worker_tasks();
-        workers.extend(self.inner.engine.take_notification_worker_tasks());
+        let workers = self.inner.engine.take_notification_worker_tasks();
         for worker in &workers {
             worker.abort();
         }
@@ -2811,16 +2472,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Re-run the production replay/runtime scan for force-submit candidates.
-    /// Tests use this to prove duplicate schedulers still elect one durable
-    /// terminal action for the exact attempt.
-    #[doc(hidden)]
-    pub fn schedule_force_submit_candidates_for_test(&self) {
-        if let Some(messaging) = self.inner.workspace_messaging() {
-            messaging.force_submit_enabled();
-        }
-    }
-
     /// Test seam for a body-free mailbox snapshot with an already-resolved
     /// caller.
     ///
@@ -2879,20 +2530,6 @@ impl Daemon {
         messaging
             .withdraw_notification(operator.key, recipient, attempt_id)
             .map_err(server::mailbox_service_error)
-    }
-
-    /// Compatibility-sensitive in-process delivery seam used by repository
-    /// tests and possible embedders. Public support status is unverified.
-    ///
-    /// This bypasses the durable mailbox contract. Its optional composed
-    /// wait is an occupant-pinned pane-state heuristic, not proof that a
-    /// specific message or task completed.
-    pub async fn deliver_payload(
-        &self,
-        from: &str,
-        params: MsgSendParams,
-    ) -> Result<Value, WireError> {
-        compatibility::deliver_payload(&self.inner, from, params).await
     }
 
     /// In-process agent.state.report with a pre-trusted origin, mirroring
@@ -3111,18 +2748,6 @@ impl Daemon {
         self.inner.engine.mailbox_worker_current_for_test(id.key)
     }
 
-    /// Test seam: inspect exact in-flight job owned by a legacy worker
-    /// under the queue mutex boundary.
-    #[doc(hidden)]
-    pub fn legacy_worker_current_for_test(
-        &self,
-        session_idx: usize,
-        pane_id: &str,
-    ) -> Option<String> {
-        let key = PaneKey::new(session_idx, pane_id);
-        self.inner.engine.legacy_worker_current_for_test(&key)
-    }
-
     /// Test seam: inspect composer hold and owner for a pane.
     #[doc(hidden)]
     pub fn composer_hold_for_test(
@@ -3133,22 +2758,6 @@ impl Daemon {
         let detections = self.inner.detections.lock().expect("detections lock");
         let entry = detections.get(&PaneKey::new(session_idx, pane_id))?;
         Some((entry.hold, entry.hold_owner.clone()))
-    }
-
-    /// Test seam: inspect the one exact staged delivery whose final Enter is
-    /// blocked by a confirmed terminal lifecycle edge.
-    #[doc(hidden)]
-    pub fn final_submit_conflict_owner_for_test(
-        &self,
-        session_idx: usize,
-        pane_id: &str,
-    ) -> Option<String> {
-        self.inner
-            .detections
-            .lock()
-            .expect("detections lock")
-            .get(&PaneKey::new(session_idx, pane_id))
-            .and_then(|entry| entry.final_submit_conflict_owner.clone())
     }
 
     /// Test-only seam: panic at the synchronous on_write boundary before record_writing for the specified attempt.
@@ -4079,7 +3688,7 @@ pub(crate) async fn repaint_chrome(
 /// theme next to a stream in this week's is the visible half of that.
 ///
 /// Returns the name now active, for the CLI to print, and emits `theme`
-/// so a running `cyclops ui` wakes and re-reads the selection itself.
+/// so a running `cyclops watch` wakes and re-reads the selection itself.
 /// The event carries no colors: every surface resolves its own, and one
 /// that took a palette off the wire could show a theme no file holds.
 pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
@@ -4218,7 +3827,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     let (manifests, manifest_dir) = load_manifests(&cfg);
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
     let mut boot_identities: Vec<(SessionIdentityBinding, usize)> = Vec::new();
-    let mut replay_roots: Vec<(usize, String, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
     for (idx, configured_name) in cfg.sessions.iter().enumerate() {
         let descendant = PathBuf::from("ledger").join(format!("{configured_name}.ndjson"));
@@ -4228,8 +3836,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                 state_root.path().join(&descendant).display()
             )
         })?;
-        // The roots and every rename-linked journal discovered from them
-        // feed both id preload and restart-limbo settlement below.
+        // The journal names the live session this slot followed on the
+        // previous run; the slot boots under that name.
         let mut boot_name = configured_name.clone();
         let mut boot_identity = None;
         match ledger.read_after(0) {
@@ -4245,10 +3853,9 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                         );
                     }
                 }
-                replay_roots.push((idx, format!("{configured_name}.ndjson"), lines));
             }
             Err(e) => {
-                warn!(session = %configured_name, error = %e, "ledger replay for id preload failed")
+                warn!(session = %configured_name, error = %e, "ledger replay for session identity failed")
             }
         }
         let slot = Arc::new(match boot_identity {
@@ -4271,14 +3878,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
         sessions.push(slot);
     }
-    let replay = compatibility::session_journal_replay(&state_root, replay_roots);
-    // This is the first Engine use after construction, so every historical
-    // id is reserved before any request can mint one. Files stay separate for
-    // history; restart recovery receives one descendant-first stream per root.
-    for (_, lines) in &replay.files {
-        engine.preload_ids(lines);
-    }
-    let replayed = replay.recovery;
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
@@ -4300,7 +3899,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             let removed = adoptions.in_session(&session);
             let mut gone = Vec::new();
             for adoption in &removed {
-                match composer_recovery::pane_root_gone(adoption) {
+                match pane_root_gone(adoption) {
                     Ok(true) => gone.extend(adoption.recipient),
                     Ok(false) => {}
                     Err(reason) => anyhow::bail!(
@@ -4309,17 +3908,9 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                     ),
                 }
             }
-            composer_recovery::retire_gone_in_store(&mut message_store, gone.iter().copied())
-                .map_err(|error| anyhow::anyhow!("retire barriers for missing session: {error}"))?;
             release_gone_recipients(&mut adoptions, gone);
         }
     }
-    let recovered_barrier_ids: Vec<_> = message_store
-        .projection()
-        .active_notification_barriers()
-        .into_iter()
-        .map(|record| record.attempt_id)
-        .collect();
     let mailbox = Arc::new(mailbox::MailboxService::new_with_events(
         mailbox_directory,
         message_store,
@@ -4335,13 +3926,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // receiver every configured session got. boot keeps the sender.
     let (stop, stop_rx) = watch::channel(false);
     let (shutdown_request, _) = watch::channel(false);
-    let force_submit = ForceSubmitRuntime::new(
-        cfg.force_notification_submit,
-        cfg.force_notification_submit_delay_ms,
-    );
     let inner = Arc::new(Inner {
         cfg,
-        force_submit,
         state_root,
         durable_record_forget_lease: StdMutex::new(Some(durable_record_forget_lease)),
         state_repair: repair,
@@ -4349,9 +3935,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         session_identities: StdMutex::new(session_identities),
         mailbox: Some(mailbox),
         workspace_messaging: OnceLock::new(),
-        composer_recovery: Arc::new(StdMutex::new(composer_recovery::RecoveryCoordinator::new(
-            recovered_barrier_ids,
-        ))),
         mailbox_publication: Arc::new(StdMutex::new(())),
         unread_projection_gate: tokio::sync::Mutex::new(()),
         unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -4405,7 +3988,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // A daemon with no manifests boots clean, watches panes, and can
     // deliver nothing. The warn! below reaches whoever is tailing stderr,
     // which after `cyclopsd &` is nobody, so the same sentence also goes on
-    // the record: it lands in `cyclops ui` and replays out of the ledger.
+    // the record: it lands in `cyclops watch` and replays out of the ledger.
     // `cyclops status` reads the same fact off the status answer and
     // explains the unknown panes it produces.
     if manifest_ids.is_empty() {
@@ -4420,14 +4003,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             None,
             delivery::About::default(),
         );
-    }
-
-    // Any delivery the previous run left unresolved gets a named ending now.
-    compatibility::recover_direct_deliveries(&inner, &replayed);
-    drop(replayed);
-    if let Some(messaging) = inner.workspace_messaging() {
-        messaging.restore_unclaimed_reminders();
-        messaging.force_submit_enabled();
     }
 
     let mut tasks = Vec::new();
@@ -4569,14 +4144,6 @@ pub(crate) async fn watch_session(
                     },
                 )?,
             );
-            // Same id-preload boot does: message ids stay unique across
-            // restarts and every session this daemon has watched.
-            match ledger.read_after(0) {
-                Ok(lines) => inner.engine.preload_ids(&lines),
-                Err(e) => {
-                    warn!(session = %name, error = %e, "ledger replay for id preload failed")
-                }
-            }
             ledger
         }
     };
@@ -4634,6 +4201,11 @@ fn load_manifests(cfg: &Config) -> (BTreeMap<String, Manifest>, Option<PathBuf>)
     match cyclops_manifest::load_dir(&dir) {
         Ok(map) => {
             info!(dir = %dir.display(), count = map.len(), "manifests loaded");
+            for (id, manifest) in &map {
+                for key in manifest.retired_keys() {
+                    warn!(manifest = %id, "`{key}` ignored: this key no longer exists since 1.1.0");
+                }
+            }
             (map.into_iter().collect(), Some(dir))
         }
         Err(e) => {
@@ -4716,6 +4288,56 @@ async fn tmux_session_presence(cfg: &Config, session: &str) -> TmuxSessionPresen
 /// missing-session evidence.
 async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
     tmux_session_presence(cfg, session).await == TmuxSessionPresence::Missing
+}
+
+/// Prove physical pane loss against the whole tmux server.
+///
+/// Absence from one session is only a route change. The pane is gone only
+/// when the server has no such pane id or that id now names a different root
+/// process generation.
+async fn physical_pane_gone(
+    watcher: &SessionWatcher,
+    adoption: &registry::Adoption,
+) -> Result<bool, &'static str> {
+    let expected = adoption.pane_root.ok_or("pane_root_unproven")?;
+    physical_pane_gone_with_expected(watcher, &adoption.pane_id, Some(expected)).await
+}
+
+/// Prove physical loss for a route that may no longer have an adoption.
+///
+/// When the prior root is unknown, continued presence is enough to prevent a
+/// false pane-gone release. Absence remains authoritative server-wide.
+async fn physical_pane_gone_with_expected(
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    expected: Option<ProcessInstanceId>,
+) -> Result<bool, &'static str> {
+    let observed_pid = watcher
+        .client()
+        .server_pane_pid(pane_id)
+        .await
+        .map_err(|_| "physical_pane_unproven")?;
+    let Some(observed_pid) = observed_pid else {
+        return Ok(true);
+    };
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    match identity::ProcId::of(observed_pid) {
+        Some(observed) => Ok(observed.pid != expected.pid() || observed.birth != expected.birth()),
+        None if !fusion::pid_alive(observed_pid) => Ok(true),
+        None => Err("physical_pane_unproven"),
+    }
+}
+
+/// Conservative physical-loss proof when no tmux watcher can be opened.
+fn pane_root_gone(adoption: &registry::Adoption) -> Result<bool, &'static str> {
+    let expected = adoption.pane_root.ok_or("pane_root_unproven")?;
+    match identity::ProcId::of(expected.pid()) {
+        Some(observed) => Ok(observed.pid != expected.pid() || observed.birth != expected.birth()),
+        None if !fusion::pid_alive(expected.pid()) => Ok(true),
+        None => Err("physical_pane_unproven"),
+    }
 }
 
 /// Release only adoptions whose physical pane loss was proven.
@@ -4922,25 +4544,13 @@ fn settle_missing_session(
             .in_session(&name);
         let mut gone = Vec::new();
         for adoption in &adoptions {
-            match crate::composer_recovery::pane_root_gone(adoption) {
+            match pane_root_gone(adoption) {
                 Ok(false) => {}
                 Ok(true) => {
                     inner
                         .hook_liveness
                         .close(&PaneKey::new(idx, &adoption.pane_id));
-                    if let Some(recipient) = adoption.recipient {
-                        match inner
-                            .workspace_messaging()
-                            .ok_or("composer_recovery_store_unavailable")
-                            .and_then(|messaging| {
-                                messaging.retire_gone_composer_recipient(recipient)
-                            }) {
-                            Ok(()) => gone.push(recipient),
-                            Err(reason) => {
-                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
-                            }
-                        }
-                    }
+                    gone.extend(adoption.recipient);
                 }
                 Err(reason) => {
                     warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
@@ -5939,14 +5549,6 @@ async fn run_session(
         .await;
         apply_route_evidence_observation(inner, idx, &row.pane_id, &route_evidence);
     }
-    // Boot scans durable force-submit candidates before watcher tasks attach.
-    // Once this watcher has published its current routes, re-arm those exact
-    // candidates so a transient missing route did not discard the one-shot
-    // fallback. The messaging Module selects candidates; the runtime still
-    // rechecks binding and reserves the only terminal key.
-    if let Some(messaging) = inner.workspace_messaging() {
-        messaging.force_submit_routes_available();
-    }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {
@@ -6069,13 +5671,8 @@ async fn reconcile_adoption_records(
         let adoption = existing
             .iter()
             .find(|adoption| adoption.recipient == Some(recipient))
-            .ok_or("composer_recovery_pane_root_unproven")?;
-        if crate::composer_recovery::physical_pane_gone(watcher, adoption).await? {
-            inner
-                .workspace_messaging()
-                .ok_or("composer_recovery_store_unavailable")?
-                .retire_gone_composer_recipient(recipient)?;
-        } else {
+            .ok_or("pane_root_unproven")?;
+        if !physical_pane_gone(watcher, adoption).await? {
             transferred.insert(recipient);
         }
     }
@@ -6132,14 +5729,11 @@ fn rebind_same_session_adoptions(
         return Ok(());
     }
 
-    with_messaging_publication(inner, |messaging| {
+    with_messaging_publication(inner, |_| {
         let slot = inner
             .session(session_idx)
             .ok_or("adoption_rebind_session_missing")?;
-        for (recipient, old_root, new_root, row) in replacements {
-            let replacement_binding = fusion::admitted_binding(inner, session_idx, &row)
-                .as_ref()
-                .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
+        for (recipient, old_root, new_root, _row) in replacements {
             let mut registry = inner.registry.lock().expect("registry lock");
             let Some(current_root) = registry
                 .for_recipient(recipient)
@@ -6149,9 +5743,6 @@ fn rebind_same_session_adoptions(
             };
             if current_root != old_root && current_root != new_root {
                 return Err("adoption_rebind_route_changed");
-            }
-            if let Some(messaging) = messaging {
-                messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
             }
             if current_root == old_root {
                 match registry.rebind_process(recipient, old_root, new_root) {
@@ -6427,9 +6018,6 @@ fn replace_pane_process_during_publication(
         return Err("pane_process_generation_invalid");
     } else {
         let new_root = replacement_root;
-        let replacement_binding = fusion::admitted_binding(inner, session_idx, &replacement.row)
-            .as_ref()
-            .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
         let mut registry = inner.registry.lock().expect("registry lock");
         let adopted_root = registry
             .for_recipient(recipient)
@@ -6437,9 +6025,6 @@ fn replace_pane_process_during_publication(
         match adopted_root {
             None => {}
             Some(current) if current == new_root || previous_root == Some(current) => {
-                if let Some(messaging) = messaging {
-                    messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
-                }
                 if current != new_root {
                     match registry.rebind_process(recipient, current, new_root) {
                         Ok(true) => {}
@@ -6529,13 +6114,8 @@ async fn handle_pane_event(
                 })
                 .or_else(|| (adoptions.len() == 1).then(|| &adoptions[0]));
             let physical_gone = match expected {
-                Some(adoption) => {
-                    crate::composer_recovery::physical_pane_gone(watcher, adoption).await
-                }
-                None => {
-                    crate::composer_recovery::physical_pane_gone_with_expected(watcher, &id, None)
-                        .await
-                }
+                Some(adoption) => physical_pane_gone(watcher, adoption).await,
+                None => physical_pane_gone_with_expected(watcher, &id, None).await,
             };
             let physical_gone = match physical_gone {
                 Ok(gone) => gone,
@@ -6544,22 +6124,6 @@ async fn handle_pane_event(
                     return true;
                 }
             };
-            if physical_gone {
-                let gone_recipients: HashSet<_> = recipient
-                    .into_iter()
-                    .chain(expected.and_then(|adoption| adoption.recipient))
-                    .collect();
-                for recipient in gone_recipients {
-                    if let Err(reason) = inner
-                        .workspace_messaging()
-                        .ok_or("composer_recovery_store_unavailable")
-                        .and_then(|messaging| messaging.retire_gone_composer_recipient(recipient))
-                    {
-                        warn!(pane = %id, %reason, "cannot retire composer barrier before pane cleanup");
-                        return true;
-                    }
-                }
-            }
             update_mailbox_route(inner, || {
                 let Some(slot) = inner.session(session_idx) else {
                     return;
@@ -6691,7 +6255,6 @@ async fn handle_pane_event(
                         | PaneField::PanePid
                 )
             });
-            let size_changed = changed.iter().any(|field| matches!(field, PaneField::Size));
             let route_changed = relevant || occupant_changed;
             let route_evidence = if route_changed {
                 inner.advance_route_evidence(session_idx, &id)
@@ -6710,9 +6273,6 @@ async fn handle_pane_event(
                 )
                 .await;
                 apply_route_evidence_observation(inner, session_idx, &id, &route_evidence);
-            }
-            if size_changed {
-                apply_pane_size_observation(inner, session_idx, &id, &route_evidence);
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's
@@ -7280,7 +6840,6 @@ mod tests {
         let session_identities = sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
-            force_submit: ForceSubmitRuntime::new(false, 5_000),
             state_root,
             durable_record_forget_lease: StdMutex::new(None),
             state_repair: RepairSummary::default(),
@@ -7288,9 +6847,6 @@ mod tests {
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: OnceLock::new(),
-            composer_recovery: Arc::new(StdMutex::new(
-                composer_recovery::RecoveryCoordinator::default(),
-            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -7495,6 +7051,7 @@ mod tests {
                 fyi: false,
                 client_key: None,
                 supersedes: None,
+                raw: false,
             },
         )
     }
@@ -7547,6 +7104,7 @@ mod tests {
                     fyi: false,
                     client_key: Some("restart-test".into()),
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap();
@@ -7567,202 +7125,6 @@ mod tests {
         assert_eq!(inbox[0].entry.message_id, message_id);
         second.shutdown().await;
         drop(second);
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[tokio::test]
-    async fn two_boots_settle_a_rename_linked_legacy_journal_once() {
-        let home = cyclops_proto::scratch::scratch_dir(&format!(
-            "cyc-linked-boot-replay-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let state_root = StateRoot::open_or_create(&home).unwrap();
-        let configured =
-            LedgerWriter::open(&state_root, Path::new("ledger/research.ndjson"), "old-boot")
-                .unwrap();
-        let linked =
-            LedgerWriter::open(&state_root, Path::new("ledger/runtime.ndjson"), "old-boot")
-                .unwrap();
-
-        let legacy_id = "m-abcdef";
-        let skewed_id = "m-123456";
-        let assert_terminal_history =
-            |configured_lines: Vec<LedgerLine>, linked_lines: Vec<LedgerLine>| {
-                // The replay traversal presents a family descendants-first
-                // and configured-root-last. Wall clocks in the older file
-                // may be ahead; causal family order still decides.
-                let history = history::merge_files(&[linked_lines, configured_lines], None);
-                let records = history
-                    .iter()
-                    .filter(|line| line.id == legacy_id)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    records.len(),
-                    1,
-                    "linked history must expose one message after recovery"
-                );
-                assert_eq!(
-                    records[0].deliveries[0].state,
-                    cyclops_proto::DeliveryState::AttentionRequired,
-                    "the terminal root fact must dominate the linked submitted copy"
-                );
-                let gating = history
-                    .iter()
-                    .filter(|line| line.id == skewed_id)
-                    .collect::<Vec<_>>();
-                assert_eq!(gating.len(), 1, "the skewed chain remains one message");
-                assert_eq!(
-                    gating[0].deliveries[0].state,
-                    cyclops_proto::DeliveryState::RetryQueued,
-                    "the root retry fact must follow the future-dated linked gating fact"
-                );
-            };
-        let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
-        message.from = "admin".into();
-        message.to = vec!["%0".into()];
-        message.subject = Some("linked before restart".into());
-        message.body = Some("body".into());
-        message.deliveries = vec![cyclops_proto::Delivery {
-            to: "%0".into(),
-            state: cyclops_proto::DeliveryState::Submitted,
-            verified_by: None,
-            attempts: 1,
-            ts: unix_ms(),
-            cause: None,
-        }];
-        linked.append(message).unwrap();
-        let future_ms = unix_ms().saturating_add(86_400_000);
-        let mut gating = daemon_line(Kind::Msg, skewed_id.into(), json!({"hosted": ["%1"]}));
-        gating.ts = future_ms;
-        gating.from = "admin".into();
-        gating.to = vec!["%1".into()];
-        gating.subject = Some("future-dated before restart".into());
-        gating.body = Some("body".into());
-        gating.deliveries = vec![cyclops_proto::Delivery {
-            to: "%1".into(),
-            state: cyclops_proto::DeliveryState::Gating,
-            verified_by: None,
-            attempts: 1,
-            ts: future_ms,
-            cause: None,
-        }];
-        linked.append(gating).unwrap();
-        configured
-            .append(daemon_line(
-                Kind::System,
-                "e-alias".into(),
-                json!({
-                    "event": "session_slot_aliased",
-                    "session": "research",
-                    "canonical_session_idx": 1,
-                    "canonical_journal": "runtime.ndjson",
-                }),
-            ))
-            .unwrap();
-        drop(linked);
-        drop(configured);
-        drop(state_root);
-
-        let mut cfg = Config::defaults(&home);
-        cfg.sessions = vec!["research".into()];
-        let daemon = boot(cfg.clone()).await.unwrap();
-        assert_eq!(
-            daemon
-                .inner
-                .engine
-                .mint_msg_id_from(&[legacy_id, skewed_id, "m-fedcba"]),
-            "m-fedcba",
-            "an id visible through linked history must be rejected by the real mint path"
-        );
-
-        let lines = daemon
-            .inner
-            .session(0)
-            .unwrap()
-            .ledger
-            .read_after(0)
-            .unwrap();
-        let settlements = lines
-            .iter()
-            .filter(|line| {
-                line.id == legacy_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "attention_required"
-                            && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(settlements, 1, "linked in-flight chain must settle once");
-        let retries = lines
-            .iter()
-            .filter(|line| {
-                line.id == skewed_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(retries, 1, "linked gating chain must requeue once");
-        let linked_lines = cyclops_ledger::read_after(
-            &daemon.inner.state_root,
-            Path::new("ledger/runtime.ndjson"),
-            0,
-        )
-        .unwrap();
-        assert_terminal_history(lines, linked_lines);
-
-        daemon.shutdown().await;
-        drop(daemon);
-
-        let daemon = boot(cfg).await.unwrap();
-        let configured_lines = daemon
-            .inner
-            .session(0)
-            .unwrap()
-            .ledger
-            .read_after(0)
-            .unwrap();
-        let settlements = configured_lines
-            .iter()
-            .filter(|line| {
-                line.id == legacy_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "attention_required"
-                            && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(
-            settlements, 1,
-            "a linked chain already settled into its root must not settle again"
-        );
-        let retries = configured_lines
-            .iter()
-            .filter(|line| {
-                line.id == skewed_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(
-            retries, 1,
-            "future timestamps must not make a linked gating fact requeue twice"
-        );
-        let linked_lines = cyclops_ledger::read_after(
-            &daemon.inner.state_root,
-            Path::new("ledger/runtime.ndjson"),
-            0,
-        )
-        .unwrap();
-        assert_terminal_history(configured_lines, linked_lines);
-
-        daemon.shutdown().await;
-        drop(daemon);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -8963,8 +8325,10 @@ process_names = ["never"]
         }
         assert_eq!(
             service
-                .active_notification_barriers()
+                .store()
                 .expect("barriers readable")
+                .projection()
+                .active_notification_barriers()
                 .len(),
             1,
             "fixture creates an active delivery barrier"
@@ -9007,8 +8371,10 @@ process_names = ["never"]
         );
         assert_eq!(
             service
-                .active_notification_barriers()
+                .store()
                 .expect("barriers readable")
+                .projection()
+                .active_notification_barriers()
                 .len(),
             1,
             "an unavailable server cannot retire the active delivery barrier"
@@ -9233,11 +8599,9 @@ process_names = ["never"]
                 occupant: Some(agent.pid),
                 agent: Some(agent),
                 in_mode: false,
-                quota_screen_clear: false,
                 hold: cyclops_proto::ComposerHold::Staged,
                 turn: Some(turnkey::TurnKey::for_test(&["turn-1"])),
                 hold_owner: Some("m-old".into()),
-                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: true,
                 since: Instant::now(),
@@ -9390,7 +8754,15 @@ process_names = ["never"]
                 )
                 .unwrap();
         }
-        assert_eq!(service.active_notification_barriers().unwrap().len(), 1);
+        assert_eq!(
+            service
+                .store()
+                .unwrap()
+                .projection()
+                .active_notification_barriers()
+                .len(),
+            1
+        );
 
         let mut replacement = std::process::Command::new("sleep")
             .arg("60")
@@ -9410,7 +8782,15 @@ process_names = ["never"]
         .unwrap_err();
 
         assert_eq!(error, "adoption_rebind_route_changed");
-        assert_eq!(service.active_notification_barriers().unwrap().len(), 1);
+        assert_eq!(
+            service
+                .store()
+                .unwrap()
+                .projection()
+                .active_notification_barriers()
+                .len(),
+            1
+        );
         assert!(inner
             .registry
             .lock()

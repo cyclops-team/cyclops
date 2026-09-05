@@ -1,4 +1,4 @@
-//! cyclops-ui: the live stream behind `cyclops ui`.
+//! cyclops-ui: the live stream behind `cyclops watch`.
 //!
 //! Three views share one terminal: the admin stream (only what is aimed at
 //! the human plus states that need one), the firehose (everything), and
@@ -150,7 +150,7 @@ pub fn terminal_size() -> (usize, usize) {
     terminal_size::get()
 }
 
-/// How `cyclops ui` was asked to run.
+/// How `cyclops watch` was asked to run.
 #[cfg(feature = "watch")]
 #[derive(Debug, Clone, Default)]
 pub struct UiOptions {
@@ -298,7 +298,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let mut term = match term::Term::enter() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("can't take over this terminal: {e}. Try cyclops ui --plain.");
+            eprintln!("can't take over this terminal: {e}. Try cyclops watch --plain.");
             return 1;
         }
     };

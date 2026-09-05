@@ -22,8 +22,6 @@ ack_timeout_ms = 1500
 delivery_retry_max = 1
 receipt_block_ms = 2500
 gate_hold_notify_ms = 120000
-ambiguous_composer_settle_ms = 10000
-unclaimed_reminder_ms = 0
 
 [workspace]
 sidebar_visible = true
@@ -49,7 +47,7 @@ terminal_default_bg = "#000000"
 | `tmux_config` | Optional tmux config path passed with `-f`. |
 | `theme` | Active theme name. `cyclops theme <name>` updates it safely. |
 | `chrome` | `"on"` or `"off"`; controls Cyclops-owned tmux border decoration. |
-| Delivery timing keys | ACK, receipt, held-delivery notification, and optional unclaimed-doorbell reminder settings. `delivery_retry_max` retries only failures proven before any payload bytes reach the pane. `unclaimed_reminder_ms` is disabled when absent or zero; a positive value permits one content-free reminder per exact unclaimed attempt through the ordinary composer-safety gate. `ambiguous_composer_settle_ms` bounds how long an idle pane may keep reading an ambiguous composer before its wake settles as a durable `composer_semantic_ambiguous` pre-write block instead of waiting invisibly; later write-ready evidence reopens the wake once. |
+| `ack_timeout_ms`, `delivery_retry_max`, `receipt_block_ms`, `gate_hold_notify_ms` | The hook ACK window after a doorbell is submitted, retries for failures proven before any bytes reach the pane, the cap on observing an immediately decidable receipt, and the one admin ping for a doorbell held that long. The 1.0 keys `ambiguous_composer_settle_ms`, `unclaimed_reminder_ms`, `force_notification_submit`, and `force_notification_submit_delay_ms` no longer exist; a file that names one boots with a warning. |
 
 The full-screen workspace maintains `[workspace]` preferences: the
 sidebar's visibility and width, how many rows its file panel gets
@@ -71,7 +69,7 @@ discover a palette.
 | --- | --- |
 | `$CYCLOPS_HOME/sock` | Unix socket used by the CLI and daemon. |
 | `$CYCLOPS_HOME/workspaces/<workspace-id>/messages.ndjson` | Canonical workspace mailbox journal. |
-| `$CYCLOPS_HOME/ledger/*.ndjson` | Pane state and legacy direct-delivery session records. |
+| `$CYCLOPS_HOME/ledger/*.ndjson` | Pane state and per-attempt session records. |
 | `$CYCLOPS_HOME/registry.json` | Durable pane names and adoption identity. |
 | `$CYCLOPS_HOME/workspaces/*.toml` | Saved workspace layouts. |
 | `$CYCLOPS_HOME/manifests/` | Per-CLI detection rules. |
@@ -105,10 +103,10 @@ before restarting the daemon. `cyclops daemon log` reads the daemon log.
 ## Agent hooks
 
 Detecting an agent and hearing from it are different things. Detection reads
-the pane; hooks are how a CLI reports its own turn edges, and they are what
-lets the legacy direct-delivery self-test use hook evidence instead of screen
-evidence. Standard mailbox receipts report durable acceptance and notification
-state separately.
+the pane; hooks are how a CLI reports its own turn edges, and the
+acknowledgement hook is how a doorbell earns a verified receipt instead of
+settling on screen evidence. Mailbox receipts report durable acceptance and
+notification state separately.
 
 The installer wires them, by passing `--wire-hooks` to its final
 `cyclops start --setup-only`. Where they land depends on how each CLI finds
@@ -120,6 +118,10 @@ them:
 | Codex | `$CODEX_HOME/hooks.json`, user level. Project-local `.codex/hooks.json` does not load until the directory is trusted, and that dialog cannot be answered in a non-interactive run, so hooks placed there silently never fire. |
 | Antigravity | `~/.agents/hooks.json`. |
 | Cursor | `~/.cursor/hooks.json`. |
+| Kimi Code | `~/.kimi-code/config.toml`. |
+| Gemini CLI | `~/.gemini/settings.json`; unverified. |
+| Qwen Code | `~/.qwen/settings.json`; unverified. |
+| goose | `~/.agents/plugins/cyclops/hooks/hooks.json`; unverified. |
 
 For the vendors that read a file of their own, Cyclops merges its entries
 around whatever is already there, copies the original to a sibling file named

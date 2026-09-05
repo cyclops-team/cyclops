@@ -546,12 +546,13 @@ fn a_ping_about_a_live_item_reaches_the_calm_view() {
     );
 }
 
-/// One ping over a BATCH: the daemon's restart closure ends every
-/// delivery a dead run left in flight and pings once about all of them
-/// (cyclopsd delivery.rs `close_limbo`). It claims a human is needed, so
-/// it is held to the register like any other ping, and it stands while ANY
-/// item it names does. Naming nothing put "⚠ action required" under a
-/// closed eye on every restart once the batch had been dealt with.
+/// One ping over a BATCH: the daemon's restart closure (cyclopsd
+/// `MessageStore::recover_notifications_after_restart`) ends every delivery
+/// a dead run left in flight and pings once about all of them. It claims a
+/// human is needed, so it is held to the register like any other ping, and
+/// it stands while ANY item it names does. Naming nothing put "⚠ action
+/// required" under a closed eye on every restart once the batch had been
+/// dealt with.
 ///
 /// The daemon side is driven end to end in cyclopsd's `restart_eye`; this
 /// pins the reader's half of the rule on its own.

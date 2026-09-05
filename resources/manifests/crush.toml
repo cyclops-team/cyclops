@@ -1,0 +1,50 @@
+# Cyclops detection manifest: Crush (Charm)
+# UNVERIFIED best effort from primary documentation. No Crush binary was
+# available on the evidence host. Sources:
+#   https://github.com/charmbracelet/crush/blob/main/docs/hooks/README.md
+#   https://github.com/charmbracelet/crush/blob/main/docs/config/README.md
+#   https://github.com/charmbracelet/crush/blob/main/README.md
+#
+# HOOKS NOT WIRED. Crush documents exactly one event, PreToolUse ("with
+# plans to support the full gamut"), so there is no prompt or turn edge to
+# report. Its current config is a Bash-like `crushrc`; the JSON `crush.json`
+# that Cyclops could merge into is deprecated, and a directory holding both
+# logs a warning at every start. Wire tool-activity liveness by hand when
+# you want it, in ~/.config/crush/crushrc:
+#   hook add PreToolUse --name cyclops --command "cyclops hook PreToolUse"
+# This manifest binds the pane and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  Crush is a native binary, so #{pane_current_command} is
+#            expected to read "crush" (inferred, not measured).
+#   title    UNMEASURED.
+#   screen   UNMEASURED. No idle or working rule ships, so deliveries fail
+#            closed (not write-ready) until someone measures the composer.
+
+[agent]
+id = "crush"
+display_name = "Crush"
+version_tested = "unverified"
+process_names = ["crush"]
+argv_basenames = ["crush"]
+launch = "crush"
+
+[hooks]
+config_mechanism = "hook add in ~/.config/crush/crushrc (PreToolUse only)"
+available = ["PreToolUse"]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Crush."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

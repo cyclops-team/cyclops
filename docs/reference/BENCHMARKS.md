@@ -1,25 +1,26 @@
 # How fast it is
 
-Every number on this page names where it came from: a source file, a test
-name, or a run on the machine described below. Nothing is estimated and
+Every number on this page names the harness in this repository that
+produced it, with the sample count beside it. Nothing is estimated and
 nothing is rounded up from a hope. Where a figure does not exist, this page
-says so instead of inventing one.
+says so instead of inventing one. Numbers whose source was a disposable rig,
+a shell shim, or a run whose data is not in this repository were removed
+rather than kept on trust.
 
-Two things get measured. Delivery, which the previous implementation also
-did, so it can be compared directly. And the workspace, which is new, so it
-is measured against itself.
+## The transport lanes
 
-## Current mailbox, socket, and raw tmux comparison
+Produced by `src/cyclopsd/tests/evidence/release_transport_benchmark.rs`, the opt-in
+harness that measures one frozen release candidate. Measured on 2026-08-22
+against frozen candidate `c108dea169241f8891e2bfdd3c0ff19280a11c45`. The rig
+used an isolated Cyclops home, daemon, tmux server, sender pane, and
+recipient pane. It did not launch a vendor CLI or touch the live daemon.
+Sampling was serial at a load average of 3.7 on the 18-core machine
+described below.
 
-Measured on 2026-08-22 against frozen candidate
-`c108dea169241f8891e2bfdd3c0ff19280a11c45`. The rig used an isolated
-Cyclops home, daemon, tmux server, sender pane, and recipient pane. It did not
-launch a vendor CLI or touch the live daemon. Sampling was serial at a load
-average of 3.7 on the 18-core machine described below.
-
-Latency is in milliseconds. CPU/op is client CPU time per operation.
-Processes/op counts child processes started by the client. Byte counts are
-combined request and response traffic where the harness measured them.
+Latency is in milliseconds. `n` is the sample count. CPU/op is client CPU
+time per operation. Processes/op counts child processes started by the
+client. Byte counts are combined request and response traffic where the
+harness measured them.
 
 | Lane | n | p50 | p95 | p99 | CPU/op | Processes/op | Bytes/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -32,53 +33,62 @@ combined request and response traffic where the harness measured them.
 | Peer CLI send until visible in inbox | 10 | 16.085 | 28.452 | 28.452 | 4.209 | 1 | 4,979.3 |
 | Claim over an open socket | 10 | 10.003 | 15.801 | 15.801 | 0.068 | 0 | 488.1 |
 | Peer CLI send through exact claim | 10 | 27.033 | 34.016 | 34.016 | 4.598 | 1 | 1,064.0 |
-| Cold `tmux capture-pane` floor | 50 | 3.953 | 4.436 | 4.720 | 3.605 | 1 | not recorded |
-| Raw `tmux send-keys`, fire and forget | 50 | 3.945 | 5.002 | 6.252 | 3.694 | 1 | not recorded |
-| Raw tmux write plus capture verification | 10 | 8.014 | 8.988 | 8.988 | 7.268 | 2 | not recorded |
 
-The open socket is the cheap path. A held socket ping is 206 times faster at
-the median than starting the Cyclops CLI. The CLI floor contributes 2.476ms
-before a message operation begins. Subtracting that floor from `cyclops send`
-leaves 8.515ms at p50 and 10.189ms at p95 for the command's remaining work.
+What each lane includes, and what it does not:
 
-Raw `tmux send-keys` and a no-op `capture-pane` cost the same at the median.
-The 3.945ms fire-and-forget result therefore measures a tmux client process
-starting and the tmux server accepting a command. It does not prove that the
-composer received intact text, that the submit key was accepted, or that a
-recipient read anything. Adding a capture check raises the median to 8.014ms
-and requires two child processes, but still provides no durable message,
-sender attestation, queue, exact claim, reply chain, or recovery record.
+- The socket lanes hold one connection open and time one request. They
+  include no process start and no journal write.
+- The cold CLI floor starts the `cyclops` binary and connects; it sends
+  nothing. Subtracting it from `cyclops send` leaves 8.515ms at p50 for the
+  command's remaining work, most of which is the daemon's synchronous
+  fsync of the workspace journal.
+- `msg.send` and `cyclops send` end when the daemon answers, which is after
+  the message is durable and before any doorbell is written. They include
+  no terminal write and no receipt.
+- The peer lanes run a real `cyclops send` inside the sender pane. "Until
+  visible in inbox" ends when the recipient's `inbox.list` shows the
+  message; "through exact claim" ends when the recipient's claim returns
+  the body. Neither includes a doorbell or a model turn: no vendor CLI ran
+  in the isolated panes.
+- The p95 and p99 values for the ten-sample lanes are both the
+  second-slowest sample and should be read only as a small-sample tail.
 
-The 27.033ms send-to-claim result is the closest complete messaging number in
-this run. It includes a real `cyclops send` started inside the peer pane, the
-durable mutation path, mailbox visibility, and an exact recipient claim. It
-does not include model turnaround because no vendor CLI ran in the isolated
-panes. The p95 and p99 values for the ten-sample lanes are both the
-second-slowest sample and should be read only as a small-sample tail.
-
-A corrected durability probe resolved the workspace journal before sending and
-read it in process immediately after each response. All 30 of 30 messages were
-present when `msg.send` returned. None appeared late or remained absent after
-five seconds. The earlier probe watched the session ledger and is invalid.
-This result proves that the measured send response includes the synchronous
+The same run resolved the workspace journal before sending and read it in
+process immediately after each response. All 30 of 30 messages were present
+when `msg.send` returned. None appeared late or remained absent after five
+seconds. The measured send response therefore includes the synchronous
 durable append rather than a promise to write later.
 
-The remaining measured lanes spawned 734 processes, moved 17,212 request bytes
-and 126,138 response bytes, and used 604ms of client CPU plus 1,498ms in child
-processes. These figures describe one host and one boot, not a cross-machine
-performance guarantee. Final audit corrections after `c108dea` changed
-documentation, a test fixture, a comment, and the Linux-only peer-credential
-implementation. They did not change the measured macOS paths.
+These figures describe one host and one boot, not a cross-machine
+performance guarantee.
 
-The measurements below this point are historical. They describe the legacy
-full-payload direct-delivery lane and the workspace renderer as measured on
-2026-08-08. That direct lane remains a compatibility fallback, but it is not
-the default mailbox and doorbell architecture measured above.
+**The doorbell itself is not measured by any retained harness.** No row on
+this page times a paste, a readback, an Enter, or a receipt. That lane is
+first on the queue in [NEXT.md](../development/NEXT.md).
 
-## Historical machine context
+### The deadlines the lanes run under
 
-Everything labeled "measured here" ran on this box on 2026-08-08, in the
-`release` profile.
+None of these is an interval; each is a one-shot bounded by a delivery in
+flight ([INVARIANTS.md](../development/INVARIANTS.md) rule 8). They are
+code constants, not measurements.
+
+| Deadline | Default | What it bounds | Source |
+|---|---|---|---|
+| `receipt_block_ms` | 2500ms | How long `msg.send` observes an immediately decidable receipt | `src/cyclopsd/src/config.rs`, `Config::defaults` |
+| `ack_timeout_ms` | 1500ms | How long a submitted doorbell waits for the hook ACK before screen evidence is accepted | `src/cyclopsd/src/config.rs`, `Config::defaults` |
+| `gate_hold_notify_ms` | 120000ms | One admin ping for a doorbell wedged in gating. The hold itself keeps waiting on events | `src/cyclopsd/src/config.rs`, `Config::defaults` |
+| `SCREEN_ACK_DEADLINE` | 5s | No receipt by then settles the attempt as `notified` with no verifier | `src/cyclopsd/src/delivery/mod.rs` |
+| `ACK_CHECKPOINTS_MS` | 250, 750, 1500, 3000, 5000 | One-shot screen-evidence checks after Enter. Events also wake the waiter; these cap the captures per attempt | `src/cyclopsd/src/delivery/mod.rs` |
+| `VERIFY_DELAYS_MS` | 0, 120, 240, 480 | Post-paste readback re-reads, because a repaint can lag a frame | `src/cyclopsd/src/delivery/mod.rs` |
+| `DECLINE_SPACING` | 250ms | Spacing between a manifest's modal decline keys | `src/cyclopsd/src/delivery/mod.rs` |
+| CLI connect / read | 2s / 5s | The `cyclops` client's own socket budget. The 5s read budget has to exceed `receipt_block_ms`, and does | `src/cyclops/src/client.rs` |
+| Workspace `IO_TIMEOUT` | 250ms | The full-screen workspace's budget for its small decoration, naming, and confirmation requests to the daemon | `src/cyclops-workspace/src/daemon.rs` |
+| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `agent.wait` | `src/cyclopsd/src/delivery/mod.rs` |
+
+## Machine context for the workspace and stream numbers
+
+Everything labeled "measured here" below ran on this box on 2026-08-08, in
+the `release` profile.
 
 ```
 $ sysctl -n machdep.cpu.brand_string
@@ -91,188 +101,13 @@ $ tmux -V
 tmux 3.6a
 $ rustc --version
 rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)
-$ cyclops --version
-cyclops 0.1.0 (08676d4)
 ```
 
 Read every wall-clock figure with two caveats. The working tree carried
 uncommitted edits under `src/cyclops-workspace` while these ran, so the
 commit alone does not reproduce the tree byte for byte. And the box was
-compiling in another checkout at the same time, which is the contention
-`.agents/planning/2026-08-03-cyclops-workspace-tui/implementation/baselines.md`
-already documents as worth 1.6x to 9x on some metrics. Trust shapes over
-absolute milliseconds, and rerun anything that matters.
-
-## Historical comparison: direct delivery and commPact v1
-
-Cyclops is the Rust implementation: `cyclopsd` holds one tmux control-mode
-connection per watched session, an append-only NDJSON ledger records every
-message and state change, and delivery ends in a named state with a receipt
-that says how it was verified.
-
-commPact v1 is the previous implementation, read-only at tag
-`v1-final`. It is a shell toolkit: `bin/commPact` at 890 lines plus nine
-sibling scripts, 86,101 bytes across that tree's bin directory in total.
-There is no daemon. Every verb is a process that starts, shells out to tmux
-one command at a time, and exits.
-
-What v1's `send` actually does, read from the tag:
-
-1. Resolve the target label, check the sender's session ACL, and read pane
-   state through a series of `display-message` calls.
-2. Take a `mkdir` lock on the target pane, retried every 100ms.
-3. Re-resolve the target and confirm it did not change under the lock.
-4. Decide the pane is ready by matching a prompt glyph (`READY>`, `>`, `›`,
-   `❯`) against the last eight lines, with a hardcoded allowlist for two
-   Claude placeholder strings, or by recognizing the pane's command as one
-   of six known agent names.
-5. `load-buffer`, `paste-buffer`, then poll `capture-pane` up to twenty
-   times at 100ms spacing looking for its own marker.
-6. `send-keys Enter` and return `SUBMITTED`.
-
-`SUBMITTED` is v1's terminal answer. Nothing confirms the recipient's model
-read the message. There is no ledger, no history, no threads, and no live
-state: `commPact-state-watchdog` is a manual file-age check whose own usage
-text says it does not create a watcher.
-
-That difference is the reason the two are not one benchmark. v1 answers "I
-pressed Enter". Cyclops answers "this ended in this state, verified this
-way". The tables below compare them at the one milestone they share and then
-report the work Cyclops does past it.
-
-## Historical direct-delivery latency
-
-### The deadlines, and what each one bounds
-
-Every one of these is a one-shot bounded by a delivery in flight. None is an
-interval. [INVARIANTS.md](../development/INVARIANTS.md) rule 9 is the rule
-they answer to.
-
-| Deadline | Default | What it bounds | Source |
-|---|---|---|---|
-| `receipt_block_ms` | 2500ms | How long `msg.send` blocks for a receipt on the idle path | `src/cyclopsd/src/config.rs`, `Config::defaults` |
-| `ack_timeout_ms` | 1500ms | The tier-1 window: how long a delivery waits for the manifest hook ACK before falling back to screen evidence | `src/cyclopsd/src/config.rs`, `Config::defaults` |
-| `gate_hold_notify_ms` | 120000ms | One admin ping for a delivery wedged in gating. The hold itself keeps waiting on events | `src/cyclopsd/src/config.rs`, `Config::defaults` |
-| `SCREEN_ACK_DEADLINE` | 5s | Neither ACK tier by then means `attention_required`, cause `ack_timeout` | `src/cyclopsd/src/delivery.rs` |
-| `ACK_CHECKPOINTS_MS` | 250, 750, 1500, 3000, 5000 | One-shot screen-evidence checks after submit. Events also wake the waiter; these cap the captures per delivery | `src/cyclopsd/src/delivery.rs` |
-| `VERIFY_DELAYS_MS` | 0, 120, 240, 480 | Post-paste composer re-reads, because paste rendering can lag a frame | `src/cyclopsd/src/delivery.rs` |
-| `DECLINE_SPACING` | 250ms | Spacing between a manifest's modal decline keys | `src/cyclopsd/src/delivery.rs` |
-| CLI connect / read | 2s / 5s | The `cyclops` client's own socket budget. The 5s read budget has to exceed `receipt_block_ms`, and does | `src/cyclops/src/client.rs` |
-| Workspace `IO_TIMEOUT` | 250ms | The full-screen workspace's budget for its small decoration, naming, and confirmation requests to the daemon. It never sends messages through this path | `src/cyclops-workspace/src/daemon.rs` |
-| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `agent.wait` | `src/cyclopsd/src/delivery.rs` |
-
-The tiers those deadlines serve, in full, are in
-[DELIVERY.md](../development/DELIVERY.md); the receipts a user sees are in
-[send.md](../guides/send.md).
-
-```mermaid
-sequenceDiagram
-    participant U as cyclops send
-    participant D as cyclopsd
-    participant P as target pane
-    U->>D: msg.send
-    Note over D: queued, then gate on fused state
-    D->>P: load-buffer + paste-buffer
-    Note over D,P: VERIFY_DELAYS_MS 0/120/240/480: composer must show the message id
-    D->>P: submit key
-    Note over D: tier 1: hook ACK carrying the id, within ack_timeout_ms 1500
-    Note over D: tier 2: screen evidence at ACK_CHECKPOINTS_MS 250/750/1500/3000/5000
-    D-->>U: receipt, or the receipt_block_ms 2500 cap, whichever comes first
-```
-
-### Measured here, on a fixture pane
-
-An isolated tmux server, one pane running `cat`, one manifest that reports
-the pane idle and verifies the message id in the composer before submit
-(the `CAT_MANIFEST` shape from `src/cyclopsd/tests/common`). No hooks, so
-every delivery resolves on screen evidence, which is exactly what a fresh
-install does before `cyclops hooks install`.
-
-Twelve sends, timing taken from the wall clock at process start and from the
-`kind=state` lines the daemon wrote to its own ledger:
-
-| Milestone | Min | Median | Max |
-|---|---|---|---|
-| `queued`, the daemon has the message | 4ms | 4.0ms | 5ms |
-| `gating`, the gate is evaluating | 7ms | 8.0ms | 11ms |
-| `pasting`, payload written to the pane | 14ms | 14.0ms | 19ms |
-| `staged`, composer verified to carry the message id | 18ms | 18.5ms | 141ms |
-| `submitted`, Enter sent | 21ms | 21.5ms | 144ms |
-| `delivered_unverified`, screen evidence accepted | 276ms | 276.5ms | 400ms |
-
-The `cyclops send` process itself returned at a median of 295ms across a
-separate run of twelve, about 18ms after the delivery resolved.
-
-The shape is worth reading. Everything up to and including Enter costs
-21.5ms. The remaining 255ms is not work, it is the wait for the first
-screen-evidence checkpoint at 250ms. A tier-1 recipient with hooks wired
-does not pay it: the hook ACK resolves the delivery when it arrives, and the
-soak below measures that at a p50 of 12ms for Claude Code.
-
-Against `DELIVERY.md`'s own budgets (send to paste under 1s, receipt under
-2s on the idle path), the measured figures are 14ms and 276.5ms.
-
-### The same milestone, in v1
-
-The same box, the same shape of rig: an isolated tmux server, a target pane
-that echoes instantly, a ready prompt in view, the marker verified before
-Enter. Ten sends through `bin/commPact` at tag `v1-final`.
-
-| | v1 `SUBMITTED` | Cyclops `submitted` |
-|---|---|---|
-| Median | 196ms | 21.5ms |
-| Range | 184 to 209ms | 21 to 144ms |
-| Verified before Enter | Yes, marker in a `capture-pane` poll | Yes, message id in the composer |
-| What happens after Enter | Nothing. `SUBMITTED` is the final word | Two ACK tiers, a receipt, and a ledger line per transition |
-
-Roughly nine times faster to the same milestone, and the milestone is not
-where Cyclops stops.
-
-Two honesty notes on that table. The v1 numbers are v1's best case: the
-target echoed the paste immediately, so its verification loop hit on the
-first attempt and none of its twenty 100ms polls were spent. A real agent
-TUI that renders a frame later costs v1 100ms per extra poll. And v1's
-readiness heuristic refused the third consecutive send in this rig with
-`PANE_UNKNOWN`, because the echoed payloads had pushed the prompt out of the
-eight-line window it reads; the ten timed runs above reset the prompt
-between sends so v1 was measured succeeding, not failing.
-
-### Measured against real agent CLIs
-
-`tests/e2e/m1_soak.py` drives Claude Code, Codex CLI, and Antigravity CLI in
-isolated tmux servers and reconciles every delivery against the ledger.
-
-The two runs below are **not in this repository**. `/tests/raw/` is
-gitignored: a run writes 1.9MB of daemon logs and pane captures from real
-vendor CLIs, which is neither reviewable in a diff nor safe to publish
-without scrubbing. The numbers here were read off a local run on the
-machine that produced them, and reproducing them means running the soak
-yourself. Timestamps in those ledgers put both on 2026-08-02.
-
-`tests/raw/m1-soak-2/summary.json`, verdict PASS, 251.9s wall, zero detach
-events, zero shutdown wedges:
-
-| CLI | Sent | Verified | Unverified | Lost | Retries | ACK p50 | ACK p95 | End-to-end p50 | End-to-end p95 |
-|---|---|---|---|---|---|---|---|---|---|
-| claude | 100 | 100 | 0 | 0 | 0 | 12ms | 1270ms | 447ms | 2422ms |
-| codex | 100 | 66 | 34 | 0 | 0 | 37ms | 3006ms | 176ms | 3145ms |
-| agy | 21 | 0 | 20 | 0 | 0 | 256ms | 257ms | 394ms | 408ms |
-
-ACK is the harness's own definition: last `submitted` to the first delivery
-evidence after it, hook tier or screen tier, whichever resolved. End-to-end
-is the first state line to the last. The agy leg stopped at 21 because the
-vendor quota parked it, which is the designed outcome, not a failure.
-
-`tests/raw/m1-soak/summary.json` is the earlier run, verdict FAIL: the
-Claude leg lost one delivery and stopped at seq 29. Both runs are reported
-because the pair is the evidence for the fixes listed under M1 in
-[CHANGELOG.md](../../CHANGELOG.md), and because a benchmarks page that
-publishes only the green run is advertising.
-
-The p95 columns show where the tiers separate. Codex's 3006ms is the 3000ms
-screen checkpoint: a third of its deliveries never produced a matching hook
-ACK and resolved on screen evidence instead. Claude's 12ms p50 is the hook
-tier working.
+compiling in another checkout at the same time. Trust shapes over absolute
+milliseconds, and rerun anything that matters.
 
 ## Throughput
 
@@ -282,7 +117,7 @@ interchangeable.
 **Pane bytes.** `baseline_pane_runtime_feed_and_grid_throughput` in
 `src/cyclops-workspace/tests/baseline.rs` feeds 1 MiB of mixed ASCII, SGR
 color, and CJK wide characters through a `PaneRuntime` in 4096-byte chunks,
-one frame per chunk. Measured here:
+one frame per chunk (one run per pane size). Measured here:
 
 | Pane size | Feed throughput | Grid build (test path) | Direct cell walk (production path) |
 |---|---|---|---|
@@ -291,14 +126,14 @@ one frame per chunk. Measured here:
 
 **Sustained output under a real tmux.**
 `sustained_output_backlog_drains_continuously` in
-`src/cyclops-workspace/tests/perf_contract.rs`, measured here: 7,000,074
-bytes drained in 93 batches at the 8ms render cadence, peak batch 87,388
-bytes, longest run of empty cycles while the stream was active: 5.
+`src/cyclops-workspace/tests/perf_contract.rs`, measured here, one run:
+7,000,074 bytes drained in 93 batches at the 8ms render cadence, peak batch
+87,388 bytes, longest run of empty cycles while the stream was active: 5.
 
 **Stream events.** `frame_build_stays_under_16ms_at_10k_entries` in
 `src/cyclops-ui/tests/perf.rs` fills the event ring to its 10,000-entry cap,
-adds a real attention backlog, and builds one frame at 80x60. The test
-asserts a 16ms budget, one 60Hz frame. Measured here:
+adds a real attention backlog, and builds one frame at 80x60 (one frame per
+row). The test asserts a 16ms budget, one 60Hz frame. Measured here:
 
 | Open attention items | Firehose view | Admin view |
 |---|---|---|
@@ -310,12 +145,12 @@ asserts a 16ms budget, one 60Hz frame. Measured here:
 The worst case is 0.285ms against a 16ms budget, at 10,000 entries with a
 thousand open items.
 
-**Message throughput is not measured, by anybody, including this page.** The
-soak paces itself: each leg sends, waits for a terminal delivery state, then
-sleeps a uniform 0.1 to 0.6s. That works out to 0.42 deliveries per second
-per leg in `m1-soak-2`, which is a property of the harness and of how long a
-vendor CLI takes to start a turn, not of the daemon. No saturation test
-exists. Do not quote a deliveries-per-second number from this repo.
+**Message throughput is not measured by any retained harness.**
+`src/cyclopsd/tests/evidence/concurrent_messaging_perf.rs` measures durable
+acceptance under four concurrent callers (three samples of 4 x 32 messages
+to the administrator mailbox, which has no pane route) and keeps the
+per-message timings as scheduled-lane evidence, not as a rate. No saturation
+test exists. Do not quote a deliveries-per-second number from this repo.
 
 ## The workspace
 
@@ -325,7 +160,7 @@ exists. Do not quote a deliveries-per-second number from this repo.
 `src/cyclops-workspace/src/render/canvas.rs` paints complete frames, tab bar
 plus every pane, into a real Ratatui buffer over 200 iterations. Each pane
 is 30 columns by 48 rows holding 8 KB of mixed content, so the 8-pane canvas
-is 256x51. Two runs on this box:
+is 256x51. Two runs on this box, n=200 each:
 
 | Panes | Canvas | Median, run 1 | Median, run 2 | p90, run 2 |
 |---|---|---|---|---|
@@ -360,8 +195,11 @@ A flooding pane costs roughly 23x the median of an idle one and stays under
 
 ### Reconciliation and hydration
 
-`baseline.rs` keeps the pre-refactor shapes alongside the current ones so
-the comparison survives. Measured here:
+`src/cyclops-workspace/tests/baseline.rs` keeps the pre-refactor shapes
+alongside the current ones so the comparison survives
+(`baseline_reconciliation_fan_out`, `baseline_reconciliation_workspace_snapshot`,
+`baseline_hydration_latency_serial`, `baseline_hydration_latency_concurrent`;
+one run per row). Measured here:
 
 | Windows | Old fan-out (`list-sessions` + membership + `list-windows` + `list-panes` per window) | Current `workspace_snapshot` |
 |---|---|---|
@@ -382,7 +220,10 @@ floor: there is nothing to overlap with a single pane.
 
 ### Coalescing and flow control
 
-Measured here, from `perf_contract.rs`:
+Measured here, from `src/cyclops-workspace/tests/perf_contract.rs`
+(`decoration_burst_coalesces_into_one_refresh`,
+`decoration_stream_refreshes_repeatedly_during_the_stream`,
+`flow_control_pause_and_resume`; one run each):
 
 - 100 decoration signals sent in 0.001ms produced exactly one refresh,
   35.03ms after the first signal. `DECORATION_DEBOUNCE` is 30ms and is armed
@@ -397,100 +238,59 @@ Measured here, from `perf_contract.rs`:
 
 ### Processes
 
-The mechanism difference is the whole cost story. Measured here against an
-isolated tmux server, n=100 each:
-
-| Operation | Cost |
-|---|---|
-| One-shot `tmux display-message` process | 4.51ms |
-| One-shot `tmux capture-pane -p -J -S -500` process | 4.26ms |
-| One command over the daemon's open control connection | about 0.09ms (`workspace_snapshot` issues 3 in 0.27ms) |
-
-A v1 send was instrumented here by putting a counting shim ahead of `tmux`
-on PATH. One successful send spawned **24 one-shot tmux processes**, and
-that is the shortest path: it assumes the target resolves first try, the
-lock is free, and post-paste verification hits on attempt one. Each extra
-verification attempt adds one `capture-pane` process and 100ms of sleep, so
-the worst successful path is 43 processes and about 1.9 additional seconds.
-
-A Cyclops send spawns **zero**. `cyclopsd` holds one long-lived
+A Cyclops send spawns no tmux process. `cyclopsd` holds one long-lived
 `tmux -u -L <socket> -f /dev/null -C attach-session` per watched session
 (`src/cyclops-tmux/src/control.rs`), and the delivery path writes through it:
-the `Injector` implementation in `src/cyclopsd/src/delivery.rs` calls
-`load_buffer`, `paste_buffer`, `send_keys` and `capture_pane` on the
-`ControlClient`, never a subprocess. Confirmed in `ps` during the timed
-sends: one control client, no new tmux processes.
+`TmuxInjector` in `src/cyclopsd/src/delivery/inject.rs` calls
+`load_buffer`, `paste_buffer`, `send_keys`, and `capture_pane` on the
+`ControlClient`, never a subprocess. The Processes/op column in the
+transport table above counts the same thing from the client side: the one
+process a CLI lane starts is the `cyclops` binary itself.
 
 ### Idle
 
-`cyclopsd` was left watching an idle session for 60 seconds with nothing
-happening. CPU time before: `0:00.03`. CPU time after: `0:00.03`. Resident
-set flat at 7,664 KB. The tmux control client it owns reported `0:00.00` and
-2,656 KB. At the 10ms resolution `ps` reports, an idle daemon consumed no
-measurable CPU, which is what rule 9 exists to produce.
+`src/cyclopsd/tests/evidence/idle_observation_perf.rs` first proves, on one isolated
+control fixture, that every application counter moves after visible output.
+It then starts a fresh isolated screen-tier fixture, resets its counters
+after attachment, and observes a fixed quiet window, counting watcher
+events, state-observation recompute starts, and state-observation
+`capture-pane` requests. A retained zero is therefore not a vacuous
+uninstrumented result. It does not count operating-system scheduler wakeups,
+tmux internals, client refreshes, or terminal-delivery captures, so it is
+not a replacement for a CPU or battery measurement. It runs in the scheduled
+and release lanes; this page quotes no number from it.
 
-This is a single 60-second observation on one machine, not a certified
-number. Scheduled and release evidence now also runs a fixed quiet-pane
-measurement that counts Cyclops application work: watcher events,
-state-observation recompute starts, and state-observation `capture-pane`
-requests after a reset. Before that reset, a literal line sent to the isolated
-`cat` control fixture must raise each counter. A fresh isolated fixture then
-measures the quiet window, so a retained zero is not a vacuous uninstrumented
-result or delayed control cleanup. It does not count operating-system scheduler
-wakeups, tmux internals, client refreshes, or terminal-delivery captures, so it
-is not a replacement for a CPU or battery measurement.
-
-### Record
-
-The ledger is the cost of having a record at all. `m1-soak-2` wrote 1,727
-lines and 513,773 bytes for 221 deliveries: 1,251 state lines, 248 gate
-lines, 221 message lines, 7 system lines. That is about 2.3 KB per delivery,
-retained forever, queryable by `cyclops history` and `cyclops thread`.
-
-v1 wrote nothing. Its cost here is zero bytes and no history.
-
-### Footprint
-
-| | Size |
-|---|---|
-| v1, ten shell scripts at tag `v1-final` | 86,101 bytes |
-| `cyclops` release binary, this build | 8,630,256 bytes |
-| `cyclopsd` release binary, this build | 7,255,584 bytes |
-
-The two binaries together are roughly 185 times v1's bytes. That is a real
-cost and it buys the ledger, the state machine, the control-mode reader,
-four detection manifests, seventeen themes, and the workspace UI.
+`src/cyclopsd/tests/evidence/cold_start_replay_perf.rs` boots a fresh in-process
+daemon over growing workspace journals and proves the replayed body-free
+snapshot still sees every seeded message. It measures in-process boot, not
+executable launch, client connection, or a doorbell. It also runs in the
+scheduled lanes and is quoted nowhere on this page.
 
 ## What is not fast, and what is not measured
 
 **Pane contrast re-grounding is the known open item.** `matched_ground` and
 `readable_fg` in `src/cyclops-workspace/src/render/mod.rs` run per cell on
 every pane frame with colors on: a luminance and WCAG contrast computation
-per cell, plus a color emit. The operator reports this path costing about
-662us per frame against a truecolor ground. **No committed test isolates
-that cost, and this page did not reproduce it.** The full-frame paint test
-above builds its theme with `Paint::for_test()`, which is `Theme::default()`
-with `truecolor: false`, so its 543us at eight panes measures the
-256-color path, not the truecolor one. Treat the 662us figure as an
-operator report awaiting a benchmark, not as a measurement from this repo.
+per cell, plus a color emit. The operator reports this path as noticeably
+expensive against a truecolor ground. **No committed test isolates that
+cost.** The full-frame paint test above builds its theme with
+`Paint::for_test()`, which is `Theme::default()` with `truecolor: false`,
+so its 543us at eight panes measures the 256-color path, not the truecolor
+one. Treat it as an operator report awaiting a benchmark.
 
 **Resize on a runtime holding scrollback is the most expensive single
 workspace operation measured.** 50 alternating 80x24 to 120x40 resizes on a
 runtime holding 2000 lines of history: 22.91ms total, 457.74us average,
-1045us maximum, measured here by `baseline_resize_cost_with_scrollback`.
-One average resize costs about 0.84x an entire 8-pane frame paint, and the
-worst one costs 1.9x. Resize coalescing (at most one tmux resize per render
-deadline) exists to stop paying that once per mouse-move during a drag.
-
-**`DELIVERY.md`'s tier-1 ACK claim does not match the committed soak data.**
-That page says the hook ACK's "measured p95 is under 40ms". The committed
-summaries do not show that: in `m1-soak-2` Claude's ACK p95 was 1270ms and
-Codex's was 3006ms. The p50s are the figures in that range (12ms and 37ms).
-Either the claim means p50, or it comes from a measurement outside this
-repo. It should be corrected or sourced.
+1045us maximum, measured here by `baseline_resize_cost_with_scrollback` in
+`src/cyclops-workspace/tests/baseline.rs` (n=50). One average resize costs
+about 0.84x an entire 8-pane frame paint, and the worst one costs 1.9x.
+Resize coalescing (at most one tmux resize per render deadline) exists to
+stop paying that once per mouse-move during a drag.
 
 **Not yet measured by a retained, comparable workload:**
 
+- The doorbell lane: paste, readback, Enter, and receipt against a real
+  vendor CLI.
 - Operating-system scheduler wakeups, idle CPU time, battery use, and memory
   growth over a long session. The quiet-pane workload counts only Cyclops
   application-level observation work during one bounded window.
@@ -498,13 +298,12 @@ repo. It should be corrected or sourced.
   durable mailbox acceptance, not route selection, notification, or injection.
 - Comparable Linux and macOS timing. The scheduled runner currently retains
   performance artifacts on Linux; the macOS matrix is correctness evidence.
-- v1 under any condition except its best one. The comparison above gave v1
-  an instantly-echoing target and a fresh prompt before every send.
 
-**Known slow by design, and correctly so:** a delivery held in gating waits
-as long as the recipient is working, a human is typing in the composer, or a
-modal needs a person. Those are unbounded on purpose. The only clock on them
-is `gate_hold_notify_ms`, and all it does is tell the admin the hold exists.
+**Known slow by design, and correctly so:** a doorbell held in gating waits
+as long as a human draft is visible in the composer, a modal needs a person,
+or a quota screen is up. Those are unbounded on purpose. The only clock on
+them is `gate_hold_notify_ms`, and all it does is tell the admin the hold
+exists.
 
 ## Reproducing every number
 
@@ -513,6 +312,14 @@ Machine context:
 ```bash
 sysctl -n machdep.cpu.brand_string; sysctl -n hw.ncpu
 sw_vers -productVersion; tmux -V; rustc --version
+```
+
+The transport lanes, against a frozen candidate pair built from a clean
+checkout (the harness refuses a dirty tree or a mismatched version):
+
+```bash
+CYC_RELEASE_SHA=<sha> CYC_RELEASE_CYCLOPS=<path> CYC_RELEASE_CYCLOPSD=<path> \
+  cargo test --release -p cyclopsd --test evidence -- --ignored frozen_candidate
 ```
 
 Render, throughput, hydration, reconciliation, resize:
@@ -528,27 +335,5 @@ CARGO_INCREMENTAL=0 cargo test --release -p cyclops-workspace \
 CARGO_INCREMENTAL=0 cargo test --release -p cyclops-ui --test perf -- --nocapture
 ```
 
-The soak numbers are read, not rerun: `tests/raw/m1-soak/summary.json` and
-`tests/raw/m1-soak-2/summary.json`. Rerunning `tests/e2e/m1_soak.py` needs
-Claude Code, Codex CLI, and Antigravity CLI installed and takes about four
-minutes; it writes a fresh `summary.json` and per-CLI ledgers into
-`tests/raw/`.
-
-The delivery milestone table came from a disposable rig: an isolated tmux
-server (`tmux -L <name> -f /dev/null -u`), a `CYCLOPS_HOME` pointed at a
-scratch directory with a `config.toml` naming that socket and a manifest of
-the `CAT_MANIFEST` shape from `src/cyclopsd/tests/common`, `cyclopsd`
-started against it, one pane named with `cyclops name`, then twelve
-`cyclops send` runs with the wall clock recorded at process start and the
-milestones read back out of the session ledger under
-`$CYCLOPS_HOME/ledger/`.
-
-The v1 figures came from the same shape of rig, built from the script that
-`git show v1-final:bin/commPact` prints, with `COMMPACT_SOCKET` pointed at
-an isolated tmux server, a target pane whose last line is a `READY>`
-prompt, and `@commPact_agent_roles` set on the session. The process count
-came from putting a shim named `tmux` ahead of the real one on PATH,
-logging each invocation and exec'ing through.
-
-Both rigs used their own tmux servers and their own home directories, and
-both were torn down afterwards. Never point either at a live session.
+Every rig uses its own tmux server and its own home directory, and tears
+both down afterwards. Never point one at a live session.

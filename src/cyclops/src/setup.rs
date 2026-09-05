@@ -122,7 +122,6 @@ struct ManifestCheck {
     path: PathBuf,
     state: FileState,
     ack_capable: bool,
-    mailbox_capability_file: Option<PathBuf>,
 }
 
 struct ConsumerCheck {
@@ -138,8 +137,6 @@ struct ConsumerCheck {
     skill_path: PathBuf,
     skill_state: &'static str,
     skill_ready: bool,
-    mailbox_capability_path: Option<PathBuf>,
-    mailbox_capability_ready: Option<bool>,
 }
 
 /// One setup-owned seed target, rendered without its file body.
@@ -206,7 +203,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::Missing,
                 ack_capable: false,
-                mailbox_capability_file: None,
             };
         }
         AssetRead::Unreadable => {
@@ -214,7 +210,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::Unreadable,
                 ack_capable: false,
-                mailbox_capability_file: None,
             };
         }
         AssetRead::ManualReview => {
@@ -222,7 +217,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::ManualReview,
                 ack_capable: false,
-                mailbox_capability_file: None,
             };
         }
         AssetRead::Bytes(body) => body,
@@ -232,7 +226,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
             path,
             state: FileState::Invalid,
             ack_capable: false,
-            mailbox_capability_file: None,
         };
     };
     let parsed = match cyclops_manifest::Manifest::parse(body, &path) {
@@ -242,7 +235,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
                 path,
                 state: FileState::Invalid,
                 ack_capable: false,
-                mailbox_capability_file: None,
             };
         }
     };
@@ -255,7 +247,6 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
         path,
         state,
         ack_capable: parsed.hooks.ack.is_some(),
-        mailbox_capability_file: parsed.messaging.mailbox_capability_file,
     }
 }
 
@@ -277,13 +268,6 @@ fn skill_state(installation: Installation, asset: AssetRead) -> (&'static str, b
             }
         },
     }
-}
-
-/// Runtime doorbell capability and managed-skill ownership answer different
-/// questions. The daemon validates exact regular bytes without following the
-/// final link; managed writes additionally require a private, stable parent.
-fn mailbox_capability_ready(installed: bool, capability_path: Option<&Path>) -> Option<bool> {
-    installed.then(|| capability_path.is_some_and(cyclops_manifest::mailbox_capability::is_current))
 }
 
 fn hook_state(
@@ -335,12 +319,6 @@ fn consumer_check(
             AssetRead::Missing
         },
     );
-    let mailbox_capability_path = manifest
-        .mailbox_capability_file
-        .as_deref()
-        .and_then(|path| cyclops_manifest::mailbox_capability::resolve_path(path, user_home));
-    let mailbox_capability_ready =
-        mailbox_capability_ready(installed, mailbox_capability_path.as_deref());
     ConsumerCheck {
         id: spec.id,
         name: spec.name,
@@ -354,8 +332,6 @@ fn consumer_check(
         skill_path,
         skill_state,
         skill_ready,
-        mailbox_capability_path,
-        mailbox_capability_ready,
     }
 }
 
@@ -400,11 +376,6 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
                     "skill": {
                         "path": check.skill_path.display().to_string(),
                         "state": check.skill_state,
-                    },
-                    "mailbox": {
-                        "capability_path": check.mailbox_capability_path.as_ref().map(|path| path.display().to_string()),
-                        "doorbell_ready": check.mailbox_capability_ready,
-                        "transport": check.mailbox_capability_ready.map(|ready| if ready { "doorbell" } else { "direct_payload" }),
                     },
                 })).collect::<Vec<_>>(),
             })
@@ -454,23 +425,6 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
             "    skill     {:<13} {}",
             human_state(check.skill_state),
             style.dim(&check.skill_path.display().to_string())
-        );
-        let (mailbox_state, mailbox_detail) = match check.mailbox_capability_ready {
-            Some(true) => ("doorbell", "exact claim skill".to_string()),
-            Some(false) => (
-                "direct payload",
-                check
-                    .mailbox_capability_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "manifest has no capability path".to_string()),
-            ),
-            None => ("not installed", "no target".to_string()),
-        };
-        println!(
-            "    mailbox   {:<13} {}",
-            mailbox_state,
-            style.dim(&mailbox_detail)
         );
     }
     if !complete {
@@ -552,26 +506,6 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
-    fn a_current_doorbell_skill_in_an_owner_controlled_parent_reports_runtime_capability() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("skills/cyclops");
-        std::fs::create_dir_all(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let skill = parent.join("SKILL.md");
-        std::fs::write(&skill, crate::skillseed::SHIPPED).unwrap();
-        let location = crate::consumer::AssetLocation {
-            root: root.path().to_path_buf(),
-            relative: PathBuf::from("skills/cyclops/SKILL.md"),
-        };
-
-        assert!(matches!(read_skill_asset(&location), AssetRead::Bytes(_)));
-        assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
-        assert_eq!(mailbox_capability_ready(true, Some(&skill)), Some(true));
-    }
-
     #[test]
     fn only_current_or_edited_owned_files_are_ready() {
         assert!(!FileState::Missing.ready());

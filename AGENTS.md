@@ -7,15 +7,15 @@ to trip.
 
 Cyclops coordinates terminal coding agents already running in tmux: a Rust
 daemon (`cyclopsd`) watches panes, fuses sensors into an agent state,
-delivers messages between agents with verified receipts, and appends every
-fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
-`.agents/summary/index.md`.
+accepts messages into durable mailboxes, writes one doorbell line per
+message with a recorded receipt, and appends every fact to an NDJSON
+journal.
 
 ## Where things live
 
 | Path | What | The rule that matters |
 |---|---|---|
-| `src/cyclops-proto` | Wire + ledger types, delivery state machine, attention rule | Shared *rules* live here once; no IO, no tmux, no rendering |
+| `src/cyclops-proto` | Wire + journal types, the notification state machine, attention rule | Shared *rules* live here once; no IO, no tmux, no rendering |
 | `src/cyclops-tmux` | The tmux adapter | **Every tmux invocation in the product is in this crate** (one exception: the daemon's boot-time `tmux -V`) |
 | `src/cyclops-manifest` | Detection-manifest schema and evaluation | Vendor CLI behavior is TOML data in `resources/manifests/`, never Rust |
 | `src/cyclops-ledger` | Append-only NDJSON writer/reader | Never rewritten; corrections are new lines |
@@ -44,6 +44,10 @@ starts and asserts a real daemon. `workspace_boot_sizing`'s sizing assertion
 does not require a daemon and tolerates daemon-start failure.
 
 ```bash
+# ./scripts/check.sh --quick runs only this one-to-two-minute subset:
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo nextest run --workspace -E 'kind(lib) | kind(bin)' --no-fail-fast
 ./tests/e2e/messaging-docs-parity.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -87,7 +91,7 @@ cargo doc --workspace --no-deps
    `std::env::temp_dir()` (F24). Guard tests enforce both; shell goes
    through `tests/e2e/lib/lib.sh`.
 4. **No polling.** If you are reaching for an interval timer, you have not
-   found the event yet (`docs/development/INVARIANTS.md`, rule 9).
+   found the event yet (`docs/development/INVARIANTS.md`, rule 8).
 5. **Wire changes are additive.** New fields optional; unknown fields
    ignored in both directions; version mismatch warns, never rejects.
 6. **The pane title is a sensor. Never write it.** Adoption decoration goes
@@ -98,34 +102,33 @@ cargo doc --workspace --no-deps
    docs. Write for a tired engineer who has never seen this repo.
 9. **Record what you measured.** A learned fact about tmux, a vendor CLI, or
    a platform goes in `findings.md` with the probe that proved it.
-10. **Before touching delivery, the ledger, or anything that renders**, read
+10. **Before touching delivery, the journals, or anything that renders**, read
     [docs/development/INVARIANTS.md](docs/development/INVARIANTS.md). The delivery spec is
     [docs/development/DELIVERY.md](docs/development/DELIVERY.md); the legal transitions are
-    `DeliveryState::can_transition_to` in
-    `src/cyclops-proto/src/ledger.rs`.
+    `NotificationState::can_transition_to` in
+    `src/cyclops-proto/src/notification.rs`.
 
 ## Fast navigation
 
-- How a message becomes a verified receipt: [docs/development/DELIVERY.md](docs/development/DELIVERY.md),
-  then `src/cyclopsd/src/messaging.rs` for current mailbox acceptance. Retained
-  direct delivery first crosses `src/cyclopsd/src/compatibility.rs`, then
-  `src/cyclopsd/src/delivery.rs` in call order
-  (`msg_send` → `worker_loop` → `process` → `gate` → `attempt_delivery`).
+- How a message becomes a doorbell and a receipt: [docs/development/DELIVERY.md](docs/development/DELIVERY.md),
+  then `src/cyclopsd/src/messaging.rs` for acceptance and
+  `src/cyclopsd/src/delivery/gate.rs` for the pipeline in call order
+  (`gate` → `admit` → `attempt_delivery`, or `attempt_raw_delivery` for
+  `--raw`).
 - What state a pane is in and why: `src/cyclopsd/src/fusion.rs`;
   per-sensor readings via `cyclops read <agent> --source detection`.
 - "What needs a human" (the eye): one owner,
   `src/cyclops-proto/src/attention.rs`. Never recompute it elsewhere.
-- Debugging a stuck delivery: the ledger is the debugger; every gate
+- Debugging a stuck doorbell: the journals are the debugger; every gate
   decision is a line with a cause. See the cause table in
   [docs/development/HANDOFF.md](docs/development/HANDOFF.md).
 - Adding an agent CLI: one TOML file, no code.
   [docs/reference/MANIFESTS.md](docs/reference/MANIFESTS.md), fixtures in
   `src/cyclops-manifest/tests/fixtures/`.
 - What is built vs. planned: [STATUS.md](STATUS.md). Two non-bugs to know:
-  a legacy direct-delivery quota park has no requeue verb, while a mailbox
-  quota hold requires observed reset plus explicit admin requeue; and
-  `cyclops start` cannot tell two same-shaped layouts apart until one pane is
-  named.
+  a quota screen is a gate hold that waits for the pane to change and never
+  retries on a clock, and `cyclops start` cannot tell two same-shaped layouts
+  apart until one pane is named.
 
 ## Custom Instructions
 

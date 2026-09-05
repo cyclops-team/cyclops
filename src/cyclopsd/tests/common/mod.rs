@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use cyclops_proto::{DeliveryState, Kind, LedgerLine};
+use cyclops_proto::{DeliveryState, Kind, LedgerLine, NotificationAttemptId};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -161,8 +161,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -253,8 +253,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -300,10 +300,8 @@ composer_continuation_regex = '^(?P<content>.*)$'
 /// lifecycle-evidence idle rule at all. A clean composer proves only that
 /// the composer is clean; runtime idle needs an admitting hook edge from
 /// the current daemon boot. Panes under this manifest start as `unknown`
-/// with the `hook_admission_unproven` write block until a `SessionStart`
-/// (or a configured `UserPromptSubmit` start) is reported for the current
-/// occupant, which is exactly the recovery path the hook admission tests
-/// exercise.
+/// until a `SessionStart` (or a configured `UserPromptSubmit` start) is
+/// reported for the current occupant.
 pub const LIVENESS_MANIFEST: &str = r#"
 [agent]
 id = "fix"
@@ -413,8 +411,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -500,8 +498,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -587,8 +585,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -801,6 +799,32 @@ impl TestClient {
             }
         }
     }
+
+    /// Block until a new event matching `pred` arrives, keeping every line
+    /// read for later waits; `false` when `within` elapses first.
+    ///
+    /// A wake, not a consumer: the caller re-asks the authority (status,
+    /// the ledger, the journal) after it returns. A `wait_event` that runs
+    /// later still finds everything this read, and an event that arrived
+    /// before the caller's last check cannot wake it falsely because that
+    /// check already saw its effect.
+    pub async fn wake_on<F: Fn(&Value) -> bool>(&mut self, within: Duration, pred: F) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = tokio::time::timeout(remaining, self.next_line()).await else {
+                return false;
+            };
+            if line.get("event").is_none() {
+                continue;
+            }
+            let matched = pred(&line);
+            self.pending_events.push_back(line);
+            if matched {
+                return true;
+            }
+        }
+    }
 }
 
 /// One booted rig: isolated tmux server, scratch home, in-process daemon,
@@ -823,42 +847,12 @@ impl Rig {
         Rig::new_multi(tag, manifest, &[("main", pane_cmd)], cfg_extra).await
     }
 
-    /// Boot without installed mailbox capability evidence.
-    pub async fn new_without_mailbox_capability(
-        tag: &str,
-        manifest: &str,
-        pane_cmd: &str,
-        cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, &[("main", pane_cmd)], cfg_extra, false).await
-    }
-
-    /// Boot multiple sessions without installed mailbox capability evidence.
-    pub async fn new_multi_without_mailbox_capability(
-        tag: &str,
-        manifest: &str,
-        sessions: &[(&str, &str)],
-        cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, false).await
-    }
-
     /// Boot with several watched sessions, each with one starting pane.
     pub async fn new_multi(
         tag: &str,
         manifest: &str,
         sessions: &[(&str, &str)],
         cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, true).await
-    }
-
-    async fn new_multi_inner(
-        tag: &str,
-        manifest: &str,
-        sessions: &[(&str, &str)],
-        cfg_extra: &str,
-        install_mailbox_capability: bool,
     ) -> Rig {
         // A rig owns a tmux server, daemon, ledgers, and socket clients.
         // Bound per-process concurrency so the suite also passes with the
@@ -883,20 +877,6 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
         let home_guard = HomeGuard(home.clone());
-        let manifest = if install_mailbox_capability && !manifest.contains("[messaging]") {
-            let capability = home.join("cyclops-skill.md");
-            std::fs::write(
-                &capability,
-                include_bytes!("../../../../skills/cyclops/SKILL.md"),
-            )
-            .expect("write mailbox capability evidence");
-            format!(
-                "{manifest}\n[messaging]\nmailbox_capability_file = {:?}\n",
-                capability.display().to_string()
-            )
-        } else {
-            manifest.to_string()
-        };
         std::fs::write(home.join("manifests/fix.toml"), manifest).expect("write manifest");
         let names: Vec<String> = sessions.iter().map(|(n, _)| n.to_string()).collect();
         write_config(&home, socket, &names, cfg_extra);
@@ -1014,6 +994,10 @@ impl Rig {
                 Instant::now() < deadline,
                 "daemon never attached with {panes} panes in session {idx}: {resp}"
             );
+            // No event names this answer: attach publishes `session`, but a
+            // pane arriving with an unknown verdict publishes nothing (fusion
+            // skips the first unknown), so the pane count has to be asked
+            // for. Status does not mask `attached` or the pane list.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -1040,25 +1024,15 @@ impl Rig {
         assert_eq!(resp["result"]["label"], label, "{resp}");
     }
 
-    /// msg.send with the sender already resolved, for tests about
-    /// DELIVERY rather than about who sent it.
-    ///
-    /// Deliberately not the socket path. Socket sends resolve the sender
-    /// from the calling process's ancestry, and a test runner's ancestry
-    /// is not the daemon's business: a suite run from inside an agent CLI
-    /// is a vendor descendant outside every watched pane, which the
-    /// daemon correctly refuses to call the operator. Routing delivery
-    /// tests through that would make them pass or fail on where the suite
-    /// happened to be started.
-    ///
-    /// This is the documented embedding entry point, not a test-only
-    /// door, and it resolves nothing. Attribution has its own tests,
-    /// over the real socket with real process trees, in
-    /// `tests/sender_identity.rs`.
+    /// Send as the operator through the durable mailbox, the same entry the
+    /// socket `msg.send` uses once the caller is resolved. The sender is
+    /// pre-resolved to `admin` because these tests are about notification
+    /// and delivery; attribution has its own tests over the real socket in
+    /// `tests/identity/sender_identity.rs`.
     pub async fn send(&mut self, params: Value) -> (Value, Duration) {
         let params = serde_json::from_value(params).expect("msg.send params");
         let t = Instant::now();
-        let result = self.daemon.deliver_payload("admin", params).await;
+        let result = self.daemon.msg_send("admin", params).await;
         let elapsed = t.elapsed();
         let result = result.unwrap_or_else(|e| panic!("msg.send failed: {}", e.message));
         (result, elapsed)
@@ -1215,23 +1189,57 @@ fn write_config(home: &Path, socket: &str, sessions: &[String], cfg_extra: &str)
     .expect("write config");
 }
 
-/// Poll daemon status until the first pane reports `want`.
+/// Wait until the daemon reports the first pane of session 0 in state `want`.
 ///
 /// Status is the daemon's own view, which is the one that matters: tmux
-/// can already be in a state the watcher table has not consumed yet.
+/// can already be in a state the watcher table has not consumed yet. Every
+/// change to a fused verdict publishes one `state` event
+/// (`Inner::emit_state`), so that is the wake and status is asked again
+/// after it. Two answers have no event and are re-asked after a short
+/// bounded wake instead: no pane row yet (a respawned pane leaves the table
+/// and comes back), and `status_refresh_incomplete`, status refusing to
+/// answer for the pane inside its own live-refresh budget, which reads as
+/// `unknown` and must not be believed.
 pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
+    wait_pane_matching(rig, want, |panes| panes.first()).await;
+}
+
+/// [`wait_pane_state`] for one pane of session 0 by id.
+pub async fn wait_pane_id_state(rig: &mut Rig, pane_id: &str, want: &str) {
+    wait_pane_matching(rig, want, |panes| {
+        panes.iter().find(|row| row["pane_id"] == pane_id)
+    })
+    .await;
+}
+
+async fn wait_pane_matching(
+    rig: &mut Rig,
+    want: &str,
+    select: impl for<'a> Fn(&'a [Value]) -> Option<&'a Value>,
+) {
+    // How long to wait for the two answers that no event follows.
+    const UNANSWERED: Duration = Duration::from_millis(50);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let resp = rig.ctl.request("status", json!({})).await;
-        let state = resp["result"]["sessions"][0]["panes"][0]["state"].clone();
-        if state == json!(want) {
+        let row = resp["result"]["sessions"][0]["panes"]
+            .as_array()
+            .and_then(|panes| select(panes));
+        let answered = row.is_some_and(|row| row["write_block"] != "status_refresh_incomplete");
+        if answered && row.is_some_and(|row| row["state"] == json!(want)) {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "pane never reached state {want}: {resp}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let within = if answered {
+            remaining
+        } else {
+            remaining.min(UNANSWERED)
+        };
+        rig.ev.wake_on(within, |e| e["event"] == "state").await;
     }
 }
 
@@ -1253,4 +1261,149 @@ pub fn hold_script(marker: &str) -> String {
 pub fn hold_then_manual_lifecycle_script(marker: &str) -> String {
     let tail = format!("{} --manual-lifecycle", composer_tail());
     format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace journal helpers (the durable mailbox record)
+// ---------------------------------------------------------------------------
+
+/// Every complete line of the workspace message journal.
+pub fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
+    workspace_lines_in(&rig.home)
+}
+
+/// [`workspace_lines`] for a caller holding only the scratch home, such as
+/// a wait that has borrowed the rig's event client separately.
+pub fn workspace_lines_in(home: &Path) -> Vec<LedgerLine> {
+    let workspace = std::fs::read_dir(home.join("workspaces"))
+        .expect("workspace directory")
+        .next()
+        .expect("one workspace")
+        .expect("workspace entry")
+        .path();
+    let raw = std::fs::read_to_string(workspace.join("messages.ndjson"))
+        .expect("workspace journal readable");
+    // Ignore only a final line that a concurrent writer has not terminated yet.
+    let complete = if raw.ends_with('\n') {
+        raw.as_str()
+    } else {
+        raw.rsplit_once('\n').map_or("", |(lines, _)| lines)
+    };
+    complete
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("workspace journal line parses"))
+        .collect()
+}
+
+/// Notification transition states recorded for one message, in journal order.
+pub fn notification_states(rig: &Rig, message_id: &str) -> Vec<String> {
+    notification_states_in(&rig.home, message_id)
+}
+
+pub fn notification_states_in(home: &Path, message_id: &str) -> Vec<String> {
+    workspace_lines_in(home)
+        .into_iter()
+        .filter(|line| line.id == message_id)
+        .filter_map(|line| {
+            let data = line.data?;
+            (data["type"] == "notification_transition")
+                .then(|| data["state"].as_str().unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// The latest recorded notification state for one message, if any.
+pub fn notification_state(rig: &Rig, message_id: &str) -> Option<String> {
+    notification_states(rig, message_id).pop()
+}
+
+/// The attempt currently owning one message's notification.
+pub fn notification_attempt(rig: &Rig, message_id: &str) -> Option<NotificationAttemptId> {
+    workspace_lines(rig)
+        .into_iter()
+        .filter(|line| line.id == message_id)
+        .filter_map(|line| {
+            let data = line.data?;
+            (data["type"] == "notification_transition")
+                .then(|| NotificationAttemptId::parse(data["attempt_id"].as_str()?).ok())
+                .flatten()
+        })
+        .next_back()
+}
+
+/// The exact row the daemon pastes for one message: the sender label, the
+/// sender-authored or derived summary, and the current attempt's claim
+/// command (Format 4). Rebuilt from the durable record the way the daemon
+/// rebuilds it, so a hook prompt or a screen capture can be compared byte
+/// for byte.
+pub fn doorbell_for(rig: &Rig, message_id: &str) -> String {
+    let message = workspace_lines(rig)
+        .into_iter()
+        .find(|line| line.id == message_id && matches!(line.kind, Kind::Msg | Kind::Fyi))
+        .expect("message line");
+    let data = message.data.as_ref().expect("message metadata");
+    // The line's `from` is the sender's presentation label, the same value
+    // the daemon writes into the row.
+    let sender_label = message.from.as_str();
+    let summary = data["summary"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            cyclops_proto::derive_message_summary(
+                message.body.as_deref().unwrap_or_default(),
+                message.subject.as_deref().unwrap_or_default(),
+            )
+        })
+        .expect("a summary derives from the body or subject");
+    let attempt = notification_attempt(rig, message_id).expect("notification attempt");
+    cyclops_proto::render_doorbell_v4(sender_label, &summary, attempt)
+}
+
+/// Wait until one message's notification records any of `states`.
+///
+/// Every journal append publishes one `messages.changed` event
+/// (`MessageChangePublisher::publish`), so that is the wake; the journal
+/// stays the authority because the transition may predate the wait.
+pub async fn wait_notification_state(rig: &mut Rig, message_id: &str, states: &[&str]) -> String {
+    let Rig { ev, home, .. } = rig;
+    wait_notification_state_on(ev, home, message_id, states).await
+}
+
+/// [`wait_notification_state`] for a caller that holds another part of the
+/// rig, such as a self-test running on `rig.daemon` inside the same join.
+pub async fn wait_notification_state_on(
+    ev: &mut TestClient,
+    home: &Path,
+    message_id: &str,
+    states: &[&str],
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let recorded = notification_states_in(home, message_id);
+        if let Some(state) = recorded
+            .iter()
+            .find(|state| states.contains(&state.as_str()))
+        {
+            return state.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} never reached {states:?}: {recorded:?}"
+        );
+        ev.wake_on(deadline.saturating_duration_since(Instant::now()), |e| {
+            e["event"] == "messages.changed"
+        })
+        .await;
+    }
+}
+
+/// Claim one message as `recipient`, the way the agent's `cyclops inbox
+/// claim` does. A doorbell leaves the mailbox entry pending until this
+/// claim, and the next notification for the same recipient is scheduled
+/// only after it.
+pub fn claim(rig: &Rig, recipient: &str, message_id: &str) {
+    rig.daemon
+        .claim_message_for_test(recipient, message_id)
+        .unwrap_or_else(|e| panic!("claim {message_id} as {recipient} failed: {}", e.message));
 }

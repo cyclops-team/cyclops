@@ -234,7 +234,6 @@ mod tests {
             active_pane: active_pane.to_string(),
             zoomed: false,
             minimized: HashMap::new(),
-            minimization_provenance: HashMap::new(),
         }
     }
 
