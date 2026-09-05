@@ -25,6 +25,13 @@ fn shipped_composer_semantics_match_measured_rules_only() {
             "composer_completed_terminal_suffix_2_1_246",
             Clean,
         ),
+        // Same completed frame, composer holding a human draft: it ends the
+        // turn, and it still declares human input so delivery keeps holding.
+        (
+            "claude",
+            "composer_completed_terminal_suffix_with_input",
+            HumanInput,
+        ),
         ("claude", "composer_has_staged_input", HumanInput),
         ("claude", "composer_styled_input", HumanInput),
         ("claude", "composer_unstyled_input", HumanInput),
@@ -1066,6 +1073,50 @@ fn claude_idle_2_1_221() {
     let r = claude.evaluate("mac", grid).unwrap();
     assert_eq!(r.id, "composer_empty");
     assert_eq!(r.state, AgentState::Idle);
+}
+
+/// MEASURED 2026-09-05 (Claude Code 2.1.261): a finished turn whose
+/// composer holds one stray keystroke. Claude has no turn-end hook, so a
+/// screen rule marked `lifecycle_evidence` is the only thing that can end
+/// the turn a `UserPromptSubmit` opened. The completed-frame rule used to
+/// require a clean composer, so a single typed character left the pane
+/// reading `working` for as long as it sat there, and held every delivery
+/// behind a human draft nothing was going to clear.
+#[test]
+fn claude_completed_turn_ends_even_with_a_typed_composer() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let grid = include_str!("fixtures/claude_completed_with_typed_composer_2_1_261.txt");
+    let esc = include_str!("fixtures/claude_completed_with_typed_composer_2_1_261.esc.txt");
+
+    let r = claude
+        .evaluate_esc(
+            "\u{2733} Synthesizer recommendations for production",
+            grid,
+            Some(esc),
+        )
+        .unwrap();
+    assert_eq!(r.id, "composer_completed_terminal_suffix_with_input");
+    assert_eq!(r.state, AgentState::IdleWithInput);
+    assert!(
+        r.lifecycle_evidence,
+        "a finished turn must be able to end the hook candidate"
+    );
+
+    // A turn still running must not be read as finished.
+    let running = grid.replace(
+        "\u{273b} Brewed for 13s \u{b7} done 4:48 AM",
+        "\u{273b} Brewing\u{2026} (13s \u{b7} esc to interrupt)",
+    );
+    let running_esc = esc.replace(
+        "\u{1b}[38;5;246m\u{273b}\u{1b}[39m \u{1b}[38;5;246mBrewed for 13s \u{b7} done 4:48 AM\u{1b}[39m",
+        "\u{1b}[38;5;215m\u{273b}\u{1b}[39m Brewing\u{2026} (13s \u{b7} esc to interrupt)",
+    );
+    let r = claude
+        .evaluate_esc("mac", &running, Some(&running_esc))
+        .unwrap();
+    assert_ne!(r.id, "composer_completed_terminal_suffix_with_input");
+    assert_eq!(r.state, AgentState::Working);
 }
 
 /// MEASURED 2026-08-06 (Claude Code 2.1.221): the trust dialog's wording

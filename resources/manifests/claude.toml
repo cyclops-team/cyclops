@@ -182,6 +182,24 @@ evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled ac
 # so the escaped suffix accepts the otherwise identical completed row without
 # its trailing reset.
 
+
+[[rule]]
+# The same completed frame, but with something typed in the composer. The
+# turn is over either way: Claude prints the "done" suffix when it stops,
+# and a human typing afterwards does not restart it. Without this rule the
+# only lifecycle evidence Claude carries requires a clean composer, so one
+# stray keystroke left the pane reading "working" for as long as it sat
+# there, and held every delivery behind a draft that would never clear.
+id = "composer_completed_terminal_suffix_with_input"
+state = "idle_with_input"
+composer_semantic = "human_input"
+lifecycle_evidence = true
+active_start_terminal = true
+priority = 1147
+region = "bottom_non_empty_lines(40)"
+regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯[^\n]*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?(?:\s+/rc)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
+regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)(?:\x1b\[39m)?[ \t]*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*(?:\x1b\[(?:38;5;246|39)m)*❯[^\n]*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*(?:\n[^\n]*)?\z']
+evidence = "MEASURED live capture on Claude Code 2.1.261 (2026-09-05): completed frame with a typed composer"
 [[rule]]
 id = "composer_working_spinner_status_no_color"
 state = "working"
