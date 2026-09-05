@@ -576,6 +576,7 @@ impl MailboxService {
                     recipient,
                     label,
                     attempt_id: record.map(|record| record.attempt_id),
+                    transport: record.map(|record| record.transport),
                     notification_state_raw,
                     notification_state,
                     quota_state,

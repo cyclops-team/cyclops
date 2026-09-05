@@ -125,7 +125,7 @@ fn blocked() -> QueueRow {
     r.pre_write_cause = Some(NotificationPreWriteCause::BindingUnprovable);
     r.current_route = Some(MessageRecipientRoute {
         label: "reviewer-now".into(),
-        pane_id: "%1".parse().unwrap(),
+        pane_id: Some("%1".parse().unwrap()),
     });
     r
 }

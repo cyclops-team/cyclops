@@ -432,6 +432,145 @@ async fn a_vendor_outside_every_watched_pane_is_refused() {
     rig.shutdown().await;
 }
 
+/// A headless registration is one more root the walk can stop at. A helper
+/// the registered agent started descends from that root and sends as the
+/// label; the request names nothing, and no pane is involved anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_started_by_a_headless_agent_is_that_agent() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let bin = named_bin("sendheadless");
+    let pane_cmd = format!("{}/cycagent {}", bin.display(), faketui_path());
+    let mut rig = Rig::new("sendheadless", NAMED_MANIFEST, &pane_cmd, "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "hooky").await;
+    let socket = rig.daemon.socket_path();
+
+    // The agent fixture, started by this test in no pane at all.
+    let fifo = rig.home.join("headless-agent.fifo");
+    create_fifo(&fifo);
+    let mut child = Command::new(agent_binary())
+        .arg(&fifo)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the headless agent fixture");
+    let mut commands = open_fifo_writer(fifo).await;
+
+    let registered_out = rig.home.join("headless-register.json");
+    agent_request(
+        &mut commands,
+        Path::new(&client_path()),
+        &socket,
+        &registered_out,
+        "headless.register",
+        &json!({"label": "worker"}),
+    );
+    let registered = response(&registered_out).await;
+    assert!(
+        registered["error"].is_null(),
+        "the registration must be accepted: {registered}"
+    );
+
+    // The helper is the python client the fixture runs: a child of the
+    // agent, not an agent itself.
+    let out = rig.home.join("headless-send.json");
+    agent_request(
+        &mut commands,
+        Path::new(&client_path()),
+        &socket,
+        &out,
+        "msg.send",
+        &json!({"to": ["hooky"], "subject": "from a headless helper", "body": "b"}),
+    );
+    let resp = response(&out).await;
+    assert!(resp["error"].is_null(), "the send must be accepted: {resp}");
+    let from = workspace_lines(&rig.home)
+        .into_iter()
+        .find(|l| l["kind"] == "msg" && l["subject"] == "from a headless helper")
+        .expect("the message reached the workspace journal")["from"]
+        .clone();
+    assert_eq!(
+        from, "worker",
+        "the sender is the registered headless label"
+    );
+
+    let _ = writeln!(commands, "exit");
+    let _ = child.wait();
+    rig.shutdown().await;
+}
+
+/// A vendor process that does not descend from the registered root is
+/// still a vendor outside every pane: refused, and never the headless
+/// label. The registration binds one process generation, not a name.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_vendor_process_cannot_resolve_to_a_headless_label() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let bin = named_bin("sendotherheadless");
+    let pane_cmd = format!("{}/cycagent {}", bin.display(), faketui_path());
+    let mut rig = Rig::new("sendotherheadless", NAMED_MANIFEST, &pane_cmd, "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "hooky").await;
+    let socket = rig.daemon.socket_path();
+
+    let fifo = rig.home.join("headless-agent.fifo");
+    create_fifo(&fifo);
+    let mut child = Command::new(agent_binary())
+        .arg(&fifo)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the headless agent fixture");
+    let mut commands = open_fifo_writer(fifo).await;
+    let registered_out = rig.home.join("headless-register.json");
+    agent_request(
+        &mut commands,
+        Path::new(&client_path()),
+        &socket,
+        &registered_out,
+        "headless.register",
+        &json!({"label": "worker"}),
+    );
+    let registered = response(&registered_out).await;
+    assert!(registered["error"].is_null(), "{registered}");
+    let before = workspace_lines(&rig.home);
+
+    // A different vendor-named shell, sibling to the registered agent.
+    let out = rig.home.join("other-vendor.json");
+    let script = format!(
+        "{}/cycclient {} {} {} msg.send '{}'; :",
+        bin.display(),
+        client_path(),
+        socket.display(),
+        out.display(),
+        json!({"to": ["hooky"], "subject": "impostor", "body": "b"})
+    );
+    let mut other = Command::new("/bin/sh")
+        .arg0("cycvendor")
+        .arg("-c")
+        .arg(&script)
+        .spawn()
+        .expect("spawn the other vendor-named shell");
+    let resp = response(&out).await;
+    assert_eq!(
+        resp["error"]["code"], "denied",
+        "a vendor outside the registered tree must be refused: {resp}"
+    );
+    let _ = other.wait();
+    assert_eq!(
+        workspace_lines(&rig.home),
+        before,
+        "a refused sender must not move the workspace journal by one line"
+    );
+
+    let _ = writeln!(commands, "exit");
+    let _ = child.wait();
+    rig.shutdown().await;
+}
+
 /// "me" is resolved the same way a sender is, from the caller's process
 /// tree, so it has to be asked from a process whose tree says something.
 ///

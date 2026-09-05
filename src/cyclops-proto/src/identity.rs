@@ -19,7 +19,7 @@ pub enum IdentityError {
     #[error("{0} must use canonical {1}<decimal> form")]
     InvalidTmuxId(&'static str, char),
     #[error(
-        "recipient key must use canonical admin:<workspace-id> or agent:<workspace-id>/<session-instance-id>/%<pane> form"
+        "recipient key must use canonical admin:<workspace-id>, agent:<workspace-id>/<session-instance-id>/%<pane>, or headless:<workspace-id>/<agent-instance-id> form"
     )]
     InvalidRecipientKey,
 }
@@ -116,6 +116,11 @@ durable_id!(
     SessionInstanceId,
     "session instance id",
     "One concrete tmux-session incarnation inside a workspace."
+);
+durable_id!(
+    AgentInstanceId,
+    "agent instance id",
+    "One headless registration: an agent process with no pane, minted when it registers and never reused."
 );
 
 /// An operating-system boot token, normalized by the platform reader.
@@ -375,6 +380,12 @@ enum Recipient {
         session_instance_id: SessionInstanceId,
         pane_id: TmuxPaneId,
     },
+    /// An agent process the daemon proved from its process tree and that
+    /// sits in no watched pane. Delivery is mailbox-only: nothing is ever
+    /// written to a terminal for it.
+    Headless {
+        agent_instance_id: AgentInstanceId,
+    },
 }
 
 /// A logical mailbox recipient independent of mutable display labels.
@@ -406,13 +417,20 @@ impl RecipientKey {
         }
     }
 
+    pub fn headless(workspace_id: WorkspaceId, agent_instance_id: AgentInstanceId) -> Self {
+        Self {
+            workspace_id,
+            recipient: Recipient::Headless { agent_instance_id },
+        }
+    }
+
     pub fn workspace_id(self) -> WorkspaceId {
         self.workspace_id
     }
 
     pub fn session_instance_id(self) -> Option<SessionInstanceId> {
         match self.recipient {
-            Recipient::Admin => None,
+            Recipient::Admin | Recipient::Headless { .. } => None,
             Recipient::Agent {
                 session_instance_id,
                 ..
@@ -422,13 +440,27 @@ impl RecipientKey {
 
     pub fn pane_id(self) -> Option<TmuxPaneId> {
         match self.recipient {
-            Recipient::Admin => None,
+            Recipient::Admin | Recipient::Headless { .. } => None,
             Recipient::Agent { pane_id, .. } => Some(pane_id),
+        }
+    }
+
+    /// The registration id of a headless recipient; None for admin and
+    /// for a pane agent.
+    pub fn agent_instance_id(self) -> Option<AgentInstanceId> {
+        match self.recipient {
+            Recipient::Headless { agent_instance_id } => Some(agent_instance_id),
+            Recipient::Admin | Recipient::Agent { .. } => None,
         }
     }
 
     pub fn is_admin(self) -> bool {
         matches!(self.recipient, Recipient::Admin)
+    }
+
+    /// An agent with no pane: reachable over the socket only.
+    pub fn is_headless(self) -> bool {
+        matches!(self.recipient, Recipient::Headless { .. })
     }
 }
 
@@ -442,6 +474,18 @@ impl FromStr for RecipientKey {
                 .parse::<WorkspaceId>()
                 .map(Self::admin)
                 .map_err(|_| invalid());
+        }
+        if let Some(parts) = value.strip_prefix("headless:") {
+            let mut parts = parts.split('/');
+            let workspace = parts.next().ok_or_else(invalid)?;
+            let instance = parts.next().ok_or_else(invalid)?;
+            if parts.next().is_some() {
+                return Err(invalid());
+            }
+            return Ok(Self::headless(
+                workspace.parse().map_err(|_| invalid())?,
+                instance.parse().map_err(|_| invalid())?,
+            ));
         }
         let Some(parts) = value.strip_prefix("agent:") else {
             return Err(invalid());
@@ -472,6 +516,10 @@ enum RecipientWire {
         session_instance_id: SessionInstanceId,
         pane_id: TmuxPaneId,
     },
+    Headless {
+        workspace_id: WorkspaceId,
+        agent_instance_id: AgentInstanceId,
+    },
 }
 
 impl Serialize for RecipientKey {
@@ -491,6 +539,10 @@ impl Serialize for RecipientKey {
                 session_instance_id,
                 pane_id,
             },
+            Recipient::Headless { agent_instance_id } => RecipientWire::Headless {
+                workspace_id: self.workspace_id,
+                agent_instance_id,
+            },
         }
         .serialize(serializer)
     }
@@ -508,6 +560,10 @@ impl<'de> Deserialize<'de> for RecipientKey {
                 session_instance_id,
                 pane_id,
             } => Self::agent(workspace_id, session_instance_id, pane_id),
+            RecipientWire::Headless {
+                workspace_id,
+                agent_instance_id,
+            } => Self::headless(workspace_id, agent_instance_id),
         })
     }
 }
@@ -524,6 +580,9 @@ impl fmt::Display for RecipientKey {
                 "agent:{}/{}/{}",
                 self.workspace_id, session_instance_id, pane_id
             ),
+            Recipient::Headless { agent_instance_id } => {
+                write!(f, "headless:{}/{}", self.workspace_id, agent_instance_id)
+            }
         }
     }
 }
@@ -552,6 +611,50 @@ mod tests {
             assert_eq!(
                 value.parse::<RecipientKey>(),
                 Err(IdentityError::InvalidRecipientKey)
+            );
+        }
+    }
+
+    /// A headless key names a registration, not a pane: the display form
+    /// and the tagged wire form both round-trip, and every pane accessor
+    /// answers None so no reader mistakes it for a pane route.
+    #[test]
+    fn headless_recipient_key_round_trips_display_and_wire() {
+        let workspace = "00000000-0000-4000-8000-000000000001";
+        let instance = "00000000-0000-4000-8000-000000000003";
+        let text = format!("headless:{workspace}/{instance}");
+        let key: RecipientKey = text.parse().expect("canonical headless key");
+        assert_eq!(key.to_string(), text);
+        assert!(key.is_headless());
+        assert!(!key.is_admin());
+        assert_eq!(key.pane_id(), None);
+        assert_eq!(key.session_instance_id(), None);
+        assert_eq!(
+            key.agent_instance_id().map(|id| id.to_string()),
+            Some(instance.to_string())
+        );
+
+        let wire = serde_json::to_value(key).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "kind": "headless",
+                "workspace_id": workspace,
+                "agent_instance_id": instance,
+            })
+        );
+        let back: RecipientKey = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back, key);
+
+        for value in [
+            format!("headless:{workspace}"),
+            format!("headless:{workspace}/{instance}/%1"),
+            format!("headless:{workspace}/not-a-uuid"),
+        ] {
+            assert_eq!(
+                value.parse::<RecipientKey>(),
+                Err(IdentityError::InvalidRecipientKey),
+                "{value}"
             );
         }
     }

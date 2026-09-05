@@ -324,13 +324,48 @@ For one sender, copy the canonical `sender` key from `cyclops inbox list
 label. Exit `1` with `claim_outcome_unknown` means the claim was sent but its
 answer missed the deadline. Inspect the message id before retrying.
 
+### Headless agents: no pane, socket only
+
+If you run in no tmux pane at all (a script, a service, a sub-agent started
+without a terminal), register yourself once at startup from that process:
+
+```bash
+cyclops name <label> --self
+```
+
+Outside tmux, `--self` registers you headless. The daemon proves who you are
+from your process tree, the same way it proves a pane agent: the label binds
+to the nearest agent process above the command, and nothing you send names a
+process. There is no token to keep or pass along. The receipt line reads
+`named <label> · headless, no pane`. From inside a watched pane the same
+command is refused with `use_pane`; a pane agent is named from its pane.
+
+A message sent to you closes its notification as `notified` with transport
+`mailbox`: the message is in your mailbox and no pane was written. The
+sender's receipt reads `accepted · in mailbox, no pane`. Read your mailbox
+with a wait that has no deadline:
+
+```bash
+cyclops inbox next --wait
+```
+
+It subscribes first, claims the oldest pending message when one arrives, and
+prints it exactly like a bounded `inbox next`. It ends without a message only
+when cyclopsd closes the connection, which exits `1` as `daemon_gone`; start
+the daemon again and rerun it. `--wait` and `--timeout` cannot be combined.
+Every helper you start inherits your identity, so run `inbox next --wait`
+from your own process or a child of it. Exiting releases your label: the
+daemon learns of the exit from the kernel and takes the name back, and a
+later registration is a new mailbox, not the old one.
+
 `admin` is a valid durable mailbox address even though no pane may use that
 label. Send to it with `cyclops send admin ...`. Admin gets no pane wake; the
 operator sees the pending count in `cyclops status`. A same-user shell with no
 agent-vendor ancestor has the `admin` inbox identity, including a shell inside
 a watched pane. A vendor process gets an agent identity only through its
-current watched pane. `--all` targets agent panes only, so address admin
-explicitly.
+current watched pane, or through a headless registration made from its own
+process tree. `--all` targets every agent, pane or headless, and never admin,
+so address admin explicitly.
 
 `cyclops messages` shows body-free inbox, outbound, and notification state.
 `cyclops history --with <agent>` and `cyclops thread <id>` reconstruct the
@@ -458,6 +493,7 @@ and the proof).
   (e.g., an alarm followed later by a clearance). If you are parsing the
   ledger yourself, read forward and let the last line for an id win;
   never assume you can edit or delete one.
+- **If you are in a tmux pane the daemon watches, you use the normal Cyclops system.** Headless (socket-only) delivery is for a process that has no pane at all. Do not register `--self` from inside tmux, and do not wait in `inbox next --wait` from a watched pane.
 
 ## Read more
 

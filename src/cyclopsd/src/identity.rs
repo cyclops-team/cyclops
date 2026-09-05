@@ -459,6 +459,103 @@ where
     PeerOrigin::Unprovable
 }
 
+/// Where a headless registration is rooted, or why it cannot be.
+///
+/// The root is a process, never a token: the peer that registers proves
+/// its identity the same way every mailbox caller does, by the process
+/// tree the kernel reports, and later callers descending from that root
+/// resolve to the registration without presenting anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessRoot {
+    /// The nearest vendor process at or above the peer. Every hop from the
+    /// peer to the top of the tree was read and is current.
+    Vendor(ProcId),
+    /// The peer sits inside a watched pane. A pane agent is named with
+    /// `cyclops name --self` from that pane; a headless registration is
+    /// for a process that has no pane at all.
+    InsidePane { pane_id: String },
+    /// Every hop was read and none is an agent this daemon ships rules
+    /// for. The operator's own scripts cannot register: a label answered
+    /// by a plain shell would be a sender nobody can place.
+    NoVendor,
+    /// The tree could not be walked to an answer.
+    Unprovable,
+}
+
+/// The root a headless registration would bind to, for a peer at `pid`.
+///
+/// Walks from the peer to the top of the tree. Meeting a watched pane
+/// root on the way refuses (the peer has a pane); otherwise the answer is
+/// the nearest vendor on a path proven current to the top, and no vendor
+/// at all is the operator, who is refused too. Every hop is classified
+/// live, and an unreadable hop is doubt rather than an answer, exactly as
+/// the sender walk treats it.
+pub fn headless_root<V: Fn(i32) -> Vendorship>(
+    pid: i32,
+    pane_roots: &[(String, ProcId)],
+    is_vendor: V,
+) -> HeadlessRoot {
+    let Some(start) = ProcId::of(pid) else {
+        return HeadlessRoot::Unprovable;
+    };
+    headless_root_with(
+        start,
+        pane_roots,
+        |process| is_vendor(process.pid),
+        origin_parent_ident,
+        ProcId::still_live,
+    )
+}
+
+fn headless_root_with<V, P, L>(
+    start: ProcId,
+    pane_roots: &[(String, ProcId)],
+    is_vendor: V,
+    parent: P,
+    is_live: L,
+) -> HeadlessRoot
+where
+    V: Fn(ProcId) -> Vendorship,
+    P: Fn(ProcId) -> Option<OriginParent>,
+    L: Fn(&ProcId) -> bool,
+{
+    let mut current = start;
+    let mut path = Vec::new();
+    let mut nearest_vendor = None;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if current.pid <= 0 || path.contains(&current) {
+            return HeadlessRoot::Unprovable;
+        }
+        path.push(current);
+        if let Some((pane_id, _)) = pane_roots.iter().find(|(_, root)| *root == current) {
+            return HeadlessRoot::InsidePane {
+                pane_id: pane_id.clone(),
+            };
+        }
+        match is_vendor(current) {
+            Vendorship::Vendor => {
+                nearest_vendor.get_or_insert(current);
+            }
+            Vendorship::NotVendor => {}
+            Vendorship::Unprovable => return HeadlessRoot::Unprovable,
+        }
+        match parent(current) {
+            Some(OriginParent::Process(next)) => current = next,
+            Some(OriginParent::Top) => {
+                if !path_is_current_to_top(&path, &parent, &is_live) {
+                    return HeadlessRoot::Unprovable;
+                }
+                return match nearest_vendor {
+                    Some(root) => HeadlessRoot::Vendor(root),
+                    None => HeadlessRoot::NoVendor,
+                };
+            }
+            None => return HeadlessRoot::Unprovable,
+        }
+    }
+    HeadlessRoot::Unprovable
+}
+
 fn path_is_current<P, L>(path: &[ProcId], parent: &P, is_live: &L) -> bool
 where
     P: Fn(ProcId) -> Option<OriginParent>,
@@ -1709,6 +1806,79 @@ mod tests {
     /// and is reparented to init. The walk out then looks exactly like a
     /// shell the operator is typing in, and the message would be minted
     /// under the operator's name.
+    /// A headless root is the nearest agent on a chain that reaches the top
+    /// of the tree without crossing a watched pane. A chain with no agent
+    /// on it is the operator, who is refused; a chain through a pane root
+    /// is that pane's, and is refused with the pane named; and a link
+    /// nobody could read is doubt, never a root.
+    #[test]
+    fn a_headless_root_is_the_nearest_vendor_outside_every_pane() {
+        let pane_roots = vec![("%1".to_string(), id(200))];
+        // 950 (helper) -> 940 (the agent) -> 930 (a shell) -> 1 -> 0.
+        let outside = origin_tree(&[(950, 940), (940, 930), (930, 1), (1, 0)]);
+        let agent_at = |pid: i32| {
+            move |p: ProcId| {
+                if p.pid == pid {
+                    Vendorship::Vendor
+                } else {
+                    Vendorship::NotVendor
+                }
+            }
+        };
+        assert_eq!(
+            headless_root_with(id(950), &pane_roots, agent_at(940), &outside, |_| true),
+            HeadlessRoot::Vendor(id(940))
+        );
+        // Two agents on the chain: the nearest one is the root, so a
+        // sub-agent a headless agent starts can register on its own.
+        let nested = |p: ProcId| {
+            if p.pid == 940 || p.pid == 930 {
+                Vendorship::Vendor
+            } else {
+                Vendorship::NotVendor
+            }
+        };
+        assert_eq!(
+            headless_root_with(id(950), &pane_roots, nested, &outside, |_| true),
+            HeadlessRoot::Vendor(id(940))
+        );
+        assert_eq!(
+            headless_root_with(
+                id(950),
+                &pane_roots,
+                |_| Vendorship::NotVendor,
+                &outside,
+                |_| true
+            ),
+            HeadlessRoot::NoVendor
+        );
+        // One unreadable hop above the agent: the chain is not proven.
+        let doubtful = |p: ProcId| match p.pid {
+            940 => Vendorship::Vendor,
+            930 => Vendorship::Unprovable,
+            _ => Vendorship::NotVendor,
+        };
+        assert_eq!(
+            headless_root_with(id(950), &pane_roots, doubtful, &outside, |_| true),
+            HeadlessRoot::Unprovable
+        );
+        // A chain whose first link is no longer live is not current.
+        assert_eq!(
+            headless_root_with(id(950), &pane_roots, agent_at(940), &outside, |_| false),
+            HeadlessRoot::Unprovable
+        );
+
+        // Inside a watched pane: the pane row wins before anything else,
+        // and the answer names the pane so the refusal can say where.
+        let inside = origin_tree(&[(500, 400), (400, 200), (200, 1), (1, 0)]);
+        assert_eq!(
+            headless_root_with(id(500), &pane_roots, agent_at(400), &inside, |_| true),
+            HeadlessRoot::InsidePane {
+                pane_id: "%1".to_string()
+            }
+        );
+    }
+
     #[test]
     fn an_orphaned_agent_is_not_the_operator() {
         // 950 (helper) -> 940 (the agent) -> 1 -> 0. The pane root that

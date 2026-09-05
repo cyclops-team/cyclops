@@ -432,7 +432,8 @@ impl SessionFilter {
                 && row
                     .current_route
                     .as_ref()
-                    .is_some_and(|route| self.panes.contains(&route.pane_id.to_string()))
+                    .and_then(|route| route.pane_id)
+                    .is_some_and(|pane_id| self.panes.contains(&pane_id.to_string()))
         };
         self.holds(row.sender) || self.holds(row.recipient) || routed_here()
     }

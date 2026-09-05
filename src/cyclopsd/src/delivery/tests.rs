@@ -1532,6 +1532,7 @@ fn unwritten_test_inner(path: &Path) -> Arc<Inner> {
         shutdown_request: watch::channel(false).0,
         stop: watch::channel(false).1,
         extra_tasks: StdMutex::new(Vec::new()),
+        self_handle: std::sync::OnceLock::new(),
     })
 }
 

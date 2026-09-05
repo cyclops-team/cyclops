@@ -60,6 +60,11 @@ pub(crate) enum RecipientScheduleOutcome {
         head: ScheduledHead,
         block: MessageWakeBlock,
     },
+    /// A headless recipient: the attempt closed `notified` with transport
+    /// `mailbox` under the publication lock, and no worker owns anything.
+    MailboxOnly {
+        head: ScheduledHead,
+    },
 }
 
 /// Build one receipt only from the exact current mailbox projection.
@@ -67,6 +72,10 @@ fn receipt_from_disposition(
     disposition: crate::mailbox::MessageDisposition,
     pane: Option<String>,
 ) -> DeliveryReceipt {
+    // A mailbox-only delivery says so on the receipt, in the daemon's own
+    // words, so a reader never mistakes `notified` for a pane wake.
+    let note = (disposition.transport == Some(cyclops_proto::NotificationTransport::Mailbox))
+        .then(|| cyclops_proto::MAILBOX_ONLY_NOTE.to_string());
     DeliveryReceipt {
         to: disposition.label,
         state: DeliveryState::Queued,
@@ -77,7 +86,7 @@ fn receipt_from_disposition(
         wake_block: disposition.wake_block,
         position: disposition.position_ahead,
         held_by: None,
-        note: None,
+        note,
         pane,
     }
 }

@@ -186,7 +186,7 @@ cleanup() {
   # The nested rigs run their own daemon and their own tmux server in their
   # own directories. All of them die here even when a check above exited
   # early.
-  for pid in "${DUO_PID:-}" "${STOCK_PID:-}" "${INST_DAEMON_PID:-}"; do
+  for pid in "${DUO_PID:-}" "${STOCK_PID:-}" "${INST_DAEMON_PID:-}" "${HEADLESS_PID:-}"; do
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -885,6 +885,79 @@ jq -r --arg id "$ADMIN_ID" '
 cp "$ROOT/admin-state" "$OUT"
 cat "$OUT"
 check "the admin mailbox stays pending without a wake" '^pending not_started$'
+
+echo
+echo "#### Headless agents: no pane, socket only"
+
+# An agent with no pane at all: the same fixture, started from this script
+# rather than from tmux. Its Cyclops commands run as its children, so
+# `name --self` binds the label to this process tree exactly the way a
+# pane agent's commands bind to the pane, and nothing in any request names
+# a process.
+HEADLESS_CONTROL="$ROOT/control.headless"
+rm -f "$HEADLESS_CONTROL" "$ROOT/ready.headless"
+mkfifo "$HEADLESS_CONTROL"
+"$ROOT/cycagent" "$HEADLESS_CONTROL" "$ROOT/ready.headless" >"$ROOT/headless.log" 2>&1 &
+HEADLESS_PID=$!
+wait_for "the headless fixture agent" 100 standin_reading headless
+
+# Like agent_command, split in two: a wait with no deadline has to be
+# started before the message it waits for is sent.
+headless_command_start() {
+  local command="$1" line
+  rm -f "$ROOT/result.headless" "$ROOT/exit.headless" "$ROOT/done.headless"
+  printf '\n$ (run by the headless worker agent) cyclops %s\n' "$command"
+  line="\"$CYC\" $command > \"$ROOT/result.headless\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/exit.headless\"; : > \"$ROOT/done.headless\""
+  printf 'run\t%s\n' "$line" > "$HEADLESS_CONTROL"
+}
+headless_command_finish() {
+  wait_for "the headless agent command" 100 pane_command_done headless
+  cp "$ROOT/result.headless" "$OUT"
+  cp "$ROOT/exit.headless" "$ROOT/exit"
+  cat "$OUT"
+}
+headless_command() {
+  headless_command_start "$1"
+  headless_command_finish
+}
+
+headless_command 'name worker --self --plain'
+check "a process with no pane registers headless" '^✔ named worker · headless, no pane, detects as demo$'
+check_exit "headless registration exits 0" 0
+
+# The wait first, then the message: the claim is event-driven, not a poll
+# that happened to find the message already there.
+headless_command_start 'inbox next --wait --plain'
+
+agent_command implementer "$N1" 'send worker --subject "Headless handoff" --summary "Read this over the socket. No pane is involved." --body "Socket only." --client-key parity-headless --plain'
+check "a headless recipient accepts durably" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
+check "and the receipt says the message is in the mailbox with no pane" '^✓ accepted · in mailbox, no pane$'
+check_exit "the headless send exits 0" 0
+HEADLESS_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+
+headless_command_finish
+check "the waiting headless agent claims it over the socket" "^\[cyclops $HEADLESS_ID\] TO: worker  FROM: implementer  SUBJECT: Headless handoff\$"
+check "and reads the body through the claim alone" '^Socket only\.$'
+check_exit "inbox next --wait exits 0 with the message" 0
+
+agent_command implementer "$N1" 'messages --plain'
+check "cyclops messages names the headless recipient by label" 'worker \[claimed; in mailbox, no pane att-[0-9a-f-]+\]'
+
+# Exiting releases the label: the daemon learns of the exit from the
+# kernel, and the next send to the name is refused.
+printf 'exit\n' > "$HEADLESS_CONTROL"
+wait "$HEADLESS_PID" 2>/dev/null || true
+HEADLESS_PID=""
+headless_released() {
+  rm -f "$ROOT/result.probe" "$ROOT/done.probe"
+  printf 'run\t%s\n' "\"$CYC\" send worker --subject probe --summary \"Probe the worker. Expect a refusal.\" --body b --plain > \"$ROOT/result.probe\" 2>&1; : > \"$ROOT/done.probe\"" > "$ROOT/control.main.implementer"
+  wait_for "the probe" 50 pane_command_done probe || return 1
+  grep -q 'no agent or pane called "worker"' "$ROOT/result.probe"
+}
+wait_for "the headless label to be released" 25 headless_released
+agent_command implementer "$N1" 'send worker --subject "After exit" --summary "The worker is gone. Nobody answers." --body b --client-key parity-headless-gone --plain'
+check "after the exit the label answers to nobody" '^no agent or pane called "worker"\.'
+check_exit "a send to a released label exits 1" 1
 
 echo
 echo "#### docs/guides/sizing.md: handing a session's window sizing back"

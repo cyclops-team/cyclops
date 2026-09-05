@@ -538,7 +538,7 @@ pub(crate) fn uses_legacy_notification_write_contract(record: &NotificationRecor
             None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
         ),
         NotificationTransport::DirectPayload => record.doorbell_format.is_none(),
-        NotificationTransport::Raw => false,
+        NotificationTransport::Raw | NotificationTransport::Mailbox => false,
     };
     legacy_transport
         && record
@@ -638,6 +638,10 @@ pub(crate) struct MessageDisposition {
     pub recipient: RecipientKey,
     pub label: String,
     pub attempt_id: Option<NotificationAttemptId>,
+    /// The transport the current attempt fixed, when it fixed one: the
+    /// mailbox-only close for a headless recipient is the case a receipt
+    /// has to name.
+    pub transport: Option<NotificationTransport>,
     pub notification_state_raw: Option<NotificationState>,
     pub notification_state: MessageNotificationState,
     pub quota_state: Option<MessageQuotaState>,
@@ -1377,7 +1381,28 @@ impl MailboxProjection {
                     to: state,
                 });
             }
+            // Queued -> Notified is the mailbox-only close for a headless
+            // recipient, and only the mailbox transport may take it: any
+            // other transport crossing from queued straight to notified
+            // would be a write nobody recorded.
+            Some(current)
+                if current.state == NotificationState::Queued
+                    && state == NotificationState::Notified
+                    && transport != Some(NotificationTransport::Mailbox) =>
+            {
+                return Err(MailboxError::InvalidNotificationTransition {
+                    from: current.state,
+                    to: state,
+                });
+            }
             _ => {}
+        }
+        let mailbox_close = state == NotificationState::Notified
+            && transport == Some(NotificationTransport::Mailbox);
+        if mailbox_close
+            && current.is_some_and(|current| current.state != NotificationState::Queued)
+        {
+            return Err(MailboxError::NotificationTransportForbidden);
         }
 
         // A raw write proves nothing about the occupant, so it is the one
@@ -1396,7 +1421,11 @@ impl MailboxProjection {
         if verified_by.is_some() && state != NotificationState::Notified {
             return Err(MailboxError::NotificationVerifiedByForbidden);
         }
-        if state != NotificationState::Writing && transport.is_some() {
+        // The mailbox close carries no verifier: nothing consumed anything.
+        if mailbox_close && verified_by.is_some() {
+            return Err(MailboxError::NotificationVerifiedByForbidden);
+        }
+        if state != NotificationState::Writing && transport.is_some() && !mailbox_close {
             return Err(MailboxError::NotificationTransportForbidden);
         }
         if state != NotificationState::Writing && doorbell_format.is_some() {
@@ -1537,7 +1566,7 @@ impl MailboxProjection {
                     } else {
                         current.binding.clone()
                     },
-                    transport: if state == NotificationState::Writing {
+                    transport: if state == NotificationState::Writing || mailbox_close {
                         transport.unwrap_or_default()
                     } else {
                         current.transport

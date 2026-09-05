@@ -51,6 +51,7 @@ pub mod config;
 mod deadlock;
 mod delivery;
 mod fusion;
+mod headless;
 mod history;
 mod hook_lifecycle;
 pub mod identity;
@@ -299,7 +300,7 @@ fn apply_route_evidence_observation(
 }
 
 /// Publish a route-directory or lifecycle availability change.
-fn apply_messaging_availability_change(inner: &Arc<Inner>) {
+pub(crate) fn apply_messaging_availability_change(inner: &Arc<Inner>) {
     if let Some(messaging) = inner.workspace_messaging() {
         messaging.availability_changed();
     }
@@ -661,6 +662,16 @@ pub(crate) struct Inner {
     /// alongside `Daemon.tasks` so a session added at runtime shuts down
     /// exactly as cleanly as one that was configured.
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// A handle back to the Arc this Inner lives in, for the few sync
+    /// paths that observe something worth a task of its own (a headless
+    /// root found dead during a resolution). Set once by whoever builds
+    /// the Arc; absent in unit fixtures that never spawn.
+    pub(crate) self_handle: OnceLock<Weak<Inner>>,
+}
+
+/// The Arc behind an `&Inner`, when its builder registered one.
+pub(crate) fn inner_handle(inner: &Inner) -> Option<Arc<Inner>> {
+    inner.self_handle.get().and_then(Weak::upgrade)
 }
 
 /// Composition-root adapter for the post-commit capabilities requested by
@@ -1969,6 +1980,17 @@ fn publish_mailbox_directory(
         };
         agents.push(mailbox::MailboxIdentity { key, label });
     }
+    for adoption in inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .headless_adoptions()
+    {
+        agents.push(mailbox::MailboxIdentity {
+            key: adoption.recipient,
+            label: adoption.label,
+        });
+    }
     let directory = mailbox::MailboxDirectory::new(inner.workspace_id, agents)
         .map_err(|error| error.to_string())?;
     messaging
@@ -1979,7 +2001,7 @@ fn publish_mailbox_directory(
 /// Run one route-state transition against the same participant publication
 /// seen by authenticated messaging callers. A daemon without durable
 /// messaging still performs the physical transition.
-fn with_messaging_publication<T>(
+pub(crate) fn with_messaging_publication<T>(
     inner: &Arc<Inner>,
     operation: impl FnOnce(Option<&messaging::WorkspaceMessaging>) -> T,
 ) -> T {
@@ -2003,7 +2025,7 @@ fn publish_mailbox_transition(
     })
 }
 
-fn refresh_mailbox_directory_published(
+pub(crate) fn refresh_mailbox_directory_published(
     inner: &Inner,
     messaging: &messaging::WorkspaceMessaging,
 ) -> bool {
@@ -2873,7 +2895,7 @@ pub(crate) async fn label_pane(
         };
         let holder = conflicting_label_holder(inner, l, *recipient);
         if let Some(holder) = holder {
-            return Err(bad_request(label_taken_words(inner, l, &holder)));
+            return Err(bad_request(label_holder_words(inner, l, &holder)));
         }
     }
 
@@ -2987,7 +3009,7 @@ async fn reconcile_raw_pane_for_naming(inner: &Arc<Inner>, target: &str) -> Resu
 /// Why a name cannot be claimed: who wears it now, where, and the way
 /// out. "already taken" alone once had an operator staring at an empty
 /// roster and a refused name at the same time, with nothing to act on.
-fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
+pub(crate) fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
     let session_idx = inner.session_index(&holder.session).or_else(|| {
         let instance_id = holder.recipient?.session_instance_id()?;
         inner
@@ -3036,14 +3058,24 @@ fn conflicting_label_holder(
     inner: &Inner,
     label: &str,
     recipient: RecipientKey,
-) -> Option<registry::Adoption> {
+) -> Option<registry::LabelHolder> {
     inner
         .registry
         .lock()
         .expect("registry lock")
-        .for_label(label)
-        .filter(|holder| holder.recipient != Some(recipient))
-        .cloned()
+        .label_holder(label, Some(recipient))
+}
+
+/// The refusal for a name somebody already answers to, pane or headless.
+fn label_holder_words(inner: &Inner, label: &str, holder: &registry::LabelHolder) -> String {
+    match holder {
+        registry::LabelHolder::Pane(holder) => label_taken_words(inner, label, holder),
+        registry::LabelHolder::Headless(holder) => format!(
+            "label {label:?} is already taken by a headless agent (pid {}). Pick another \
+             name; the label frees itself when that process exits.",
+            holder.root.pid()
+        ),
+    }
 }
 
 /// Persist one adoption during an atomic messaging publication.
@@ -3061,7 +3093,7 @@ fn commit_adoption_during_publication(
         .recipient
         .expect("new adoptions carry an exact recipient");
     if let Some(holder) = conflicting_label_holder(inner, &adoption.label, recipient) {
-        return Err(bad_request(label_taken_words(
+        return Err(bad_request(label_holder_words(
             inner,
             &adoption.label,
             &holder,
@@ -3974,7 +4006,14 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         shutdown_request,
         stop: stop_rx,
         extra_tasks: StdMutex::new(Vec::new()),
+        self_handle: OnceLock::new(),
     });
+    let _ = inner.self_handle.set(Arc::downgrade(&inner));
+
+    // Headless registrations from the previous run: kept only for the
+    // same OS boot and a root process still alive at the same birth, and
+    // each survivor gets its exit watcher armed again.
+    headless::reverify_at_boot(&inner);
 
     // Boot fact on every session ledger: which daemon run, which tmux,
     // which manifest set. watch_session appends the same line to a
@@ -4020,6 +4059,17 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inner.stop.clone(),
     )));
     let unread_projection_task = tokio::spawn(unread_projection_task(Arc::clone(&inner)));
+    // A surviving headless registration is a route with no session to
+    // attach and publish it, so it is published here, once.
+    if !inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .headless_adoptions()
+        .is_empty()
+    {
+        refresh_mailbox_and_schedule(&inner);
+    }
     info!(
         boot_id = %inner.boot_id,
         sessions = inner.session_count(),
@@ -6885,6 +6935,7 @@ mod tests {
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,
             extra_tasks: StdMutex::new(Vec::new()),
+            self_handle: std::sync::OnceLock::new(),
         })
     }
 

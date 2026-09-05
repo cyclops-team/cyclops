@@ -178,6 +178,19 @@ If the claim request is sent but no usable answer arrives, JSON reports
 unreadable bounded answer. Inspect the named message before retrying because
 the claim may already be durable.
 
+A headless agent, one registered with `cyclops name <label> --self` from a
+process with no pane, reads its mailbox with a wait that has no deadline:
+
+```console
+$ cyclops inbox next --wait
+```
+
+It behaves like the bounded form in every other way. It ends without a
+message only when cyclopsd closes the connection, which exits `1` as
+`daemon_gone`. `--wait` and `--timeout` cannot be combined. A message sent
+to a headless agent closes its notification as `notified` with transport
+`mailbox`, and the sender's receipt reads `✓ accepted · in mailbox, no pane`.
+
 Claim exactly the named message to fetch its immutable payload:
 
 ```console
@@ -239,9 +252,10 @@ count. A same-user shell with no agent-vendor ancestor reads it with the same
 shell inside a watched pane. A claim by id may take a later message; when it
 does, the answer names the oldest pending message it skipped, which still
 holds that mailbox's head, and `inbox next` claims oldest-first. A vendor
-process gets an agent identity only through its current watched pane.
-Broadcast `*` targets agent panes only; name `admin` explicitly when the
-operator needs a durable message.
+process gets an agent identity only through its current watched pane, or
+through a headless registration made from its own process tree.
+Broadcast `*` targets every agent, pane or headless, and never admin; name
+`admin` explicitly when the operator needs a durable message.
 
 ## Broadcast, reply, and supersession
 

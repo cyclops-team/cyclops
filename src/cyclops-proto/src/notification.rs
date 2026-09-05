@@ -178,7 +178,12 @@ impl NotificationState {
     pub fn can_transition_to(self, next: NotificationState) -> bool {
         use NotificationState::*;
         match self {
-            Queued => matches!(next, Gating | WithdrawnByOperator),
+            // Queued -> Notified is the mailbox-only edge: a headless
+            // recipient has no pane, so nothing is gated, written, or
+            // submitted, and the message is announced by being in the
+            // mailbox. The projection admits that edge only with
+            // `transport: mailbox`.
+            Queued => matches!(next, Gating | WithdrawnByOperator | Notified),
             Gating => matches!(
                 next,
                 BlockedPreWrite | Writing | QuotaHeld | WithdrawnByOperator
@@ -556,6 +561,11 @@ pub enum NotificationTransport {
     /// check and no receipt. The sender asked for it (`--raw`); the journal
     /// records it as an unverified write.
     Raw,
+    /// No terminal at all. The recipient is a headless agent, and the
+    /// message is announced by being in its mailbox: the attempt moves
+    /// `queued -> notified` with no binding, no doorbell format, and no
+    /// verifier, and the agent reads it over the socket.
+    Mailbox,
 }
 
 /// Replay only: no longer written since 1.1.0. Compact claim-command
@@ -1329,6 +1339,9 @@ mod tests {
         let legal = [
             (Queued, Gating),
             (Queued, WithdrawnByOperator),
+            // The mailbox-only edge for a headless recipient; the
+            // projection admits it only with `transport: mailbox`.
+            (Queued, Notified),
             (Gating, BlockedPreWrite),
             (Gating, WithdrawnByOperator),
             (BlockedPreWrite, Gating),

@@ -641,6 +641,178 @@ fn self_name_retries_a_new_pane_until_the_watcher_publishes_it() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// `--self` with no pane in the environment is a headless registration:
+/// the client asks `headless.register` with the label and the pin, sends
+/// nothing that names a process, and reports the pane-less route.
+#[test]
+fn name_self_outside_tmux_sends_headless_register() {
+    let home = scratch_home("name-headless");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "headless.register");
+        assert_eq!(req["params"]["label"], json!("worker"));
+        assert_eq!(req["params"]["manifest"], json!("claude"));
+        assert!(req["params"].get("pid").is_none(), "{req}");
+        (
+            vec![json!({"id": req["id"], "result": {
+                "label": "worker",
+                "recipient": {
+                    "kind": "headless",
+                    "workspace_id": "00000000-0000-4000-8000-000000000001",
+                    "agent_instance_id": "00000000-0000-4000-8000-000000000009"
+                },
+                "agent_instance_id": "00000000-0000-4000-8000-000000000009",
+                "manifest": "claude",
+                "detects_as": "claude",
+                "headless": true,
+                "pid": 4242
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    // run_cyclops scrubs TMUX and TMUX_PANE: this is a shell in no pane.
+    let out = run_cyclops(
+        &home,
+        &[
+            "name",
+            "worker",
+            "--self",
+            "--manifest",
+            "claude",
+            "--plain",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ named worker · headless, no pane, detects as claude\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A headless recipient's `notified` is the mailbox close, and both the
+/// receipt and `cyclops messages` say so in the daemon's words rather
+/// than calling it a pane wake.
+#[test]
+fn messages_renders_transport_mailbox_as_in_mailbox_no_pane() {
+    let home = scratch_home("msgs-headless");
+    let workspace = "00000000-0000-4000-8000-000000000001";
+    let worker = json!({
+        "kind": "headless",
+        "workspace_id": workspace,
+        "agent_instance_id": "00000000-0000-4000-8000-000000000009"
+    });
+    let mut step = 0_u8;
+    serve_conns(&home, hello(1), 2, move |req| {
+        step += 1;
+        match req["method"].as_str() {
+            Some("msg.send") => (
+                vec![json!({"id": req["id"], "result": {
+                    "msg_id": "cyc-1a2b3c4d-5e6f7a8b",
+                    "seq": 8,
+                    "inserted": true,
+                    "thread_root": "cyc-1a2b3c4d-5e6f7a8b",
+                    "deliveries": [{
+                        "to": "worker",
+                        "state": "queued",
+                        "notification_state": "notified",
+                        "note": "in mailbox, no pane"
+                    }]
+                }})
+                .to_string()],
+                false,
+            ),
+            Some("messages.snapshot") => (
+                vec![json!({"id": req["id"], "result": {
+                    "workspace_id": workspace,
+                    "caller": {"kind": "admin", "workspace_id": workspace},
+                    "workspace_seq": 9,
+                    "counts": {
+                        "visible_messages": 1, "returned_messages": 1,
+                        "inbox_messages": 0, "outbound_messages": 1,
+                        "work_messages": 0, "active_messages": 1,
+                        "settled_messages": 0, "pending_entries": 1,
+                        "claimed_entries": 0, "open_attention_entries": 0
+                    },
+                    "rows": [{
+                        "message_id": "cyc-1a2b3c4d-5e6f7a8b",
+                        "seq": 8, "ts": 8, "kind": "msg",
+                        "direction": "outbound",
+                        "sender": {"kind": "admin", "workspace_id": workspace},
+                        "sender_label": "admin",
+                        "recipients": [{
+                            "recipient": worker,
+                            "label": "worker",
+                            "direction": "outbound",
+                            "needs_action": false,
+                            "can_manage_attention": false,
+                            "can_withdraw_notification": false,
+                            "current_route": {"label": "worker"},
+                            "available": true,
+                            "mailbox": {"status": "pending"},
+                            "fifo_position": 1,
+                            "notification": {"state": "notified"}
+                        }],
+                        "subject": "Mailbox only",
+                        "thread_root": "cyc-1a2b3c4d-5e6f7a8b",
+                        "thread_message_count": 1,
+                        "active": true,
+                        "needs_action": false
+                    }]
+                }})
+                .to_string()],
+                false,
+            ),
+            other => panic!("unexpected method {other:?} at step {step}"),
+        }
+    });
+
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "worker",
+            "--subject",
+            "Mailbox only",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "b",
+            "--plain",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "accepted cyc-1a2b3c4d-5e6f7a8b\n✓ accepted · in mailbox, no pane\n"
+    );
+
+    let out = run_cyclops(&home, &["messages", "--plain"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("cyc-1a2b3c4d-5e6f7a8b"))
+        .unwrap_or_else(|| panic!("no message row in {stdout}"));
+    assert!(
+        row.contains("worker [pending · oldest; in mailbox, no pane]"),
+        "the recipient cell names the mailbox close: {row}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// A name is required unless it is being taken back, and the two cannot
 /// be asked for at once. Usage mistakes never reach the daemon.
 #[test]
@@ -1223,6 +1395,151 @@ fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// `--wait` clears the read deadline: a message that arrives after the
+/// default five-second budget is still claimed. The canned daemon holds
+/// the stream silent for longer than that before it announces anything.
+#[test]
+fn inbox_next_wait_outlives_the_default_deadline() {
+    let home = scratch_home("inw");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => {
+                assert_eq!(req["method"], "events.subscribe");
+                (
+                    vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                    false,
+                )
+            }
+            2 => {
+                assert_eq!(req["method"], "inbox.list");
+                // Longer than the default `--timeout 5s`.
+                thread::sleep(std::time::Duration::from_millis(6_500));
+                let changed = json!({
+                    "event": "messages.changed",
+                    "data": {
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "workspace_seq": 8,
+                        "changed": ["mailboxes"]
+                    },
+                    "seq": 8
+                })
+                .to_string();
+                (
+                    vec![
+                        json!({"id": req["id"], "result": {"entries": []}}).to_string(),
+                        changed,
+                    ],
+                    false,
+                )
+            }
+            3 => {
+                assert_eq!(req["method"], "inbox.list");
+                (
+                    vec![json!({"id": req["id"], "result": {"entries": [{
+                        "message_id": "m-headless-wait",
+                        "sender": {
+                            "kind": "admin",
+                            "workspace_id": "00000000-0000-4000-8000-000000000001"
+                        },
+                        "sender_label": "admin",
+                        "subject": "Late arrival",
+                        "ts": 8,
+                        "thread_root": "m-headless-wait"
+                    }]}})
+                    .to_string()],
+                    false,
+                )
+            }
+            4 => {
+                assert_eq!(req["method"], "inbox.claim");
+                assert_eq!(req["params"]["message_id"], "m-headless-wait");
+                (
+                    vec![json!({"id": req["id"], "result": {
+                        "disposition": "claimed",
+                        "message": {
+                            "message_id": "m-headless-wait",
+                            "kind": "msg",
+                            "sender": {
+                                "kind": "admin",
+                                "workspace_id": "00000000-0000-4000-8000-000000000001"
+                            },
+                            "recipient_label": "worker",
+                            "sender_label": "admin",
+                            "subject": "Late arrival",
+                            "summary": "It took a while. Read it anyway.",
+                            "body": "Six seconds later.",
+                            "thread_root": "m-headless-wait"
+                        }
+                    }})
+                    .to_string()],
+                    true,
+                )
+            }
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--wait", "--plain"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[cyclops m-headless-wait] TO: worker  FROM: admin  SUBJECT: Late arrival\n\
+         Summary: It took a while. Read it anyway.\n\
+         Six seconds later.\n\
+         Reply: cyclops reply m-headless-wait --summary \"First sentence. Second sentence.\" --body \"...\"\n\
+         [cyclops:end m-headless-wait]\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A wait with no deadline has exactly one way to end without a message:
+/// the daemon closing the connection, and that exit has a name.
+#[test]
+fn inbox_next_wait_exits_named_when_the_daemon_closes() {
+    let home = scratch_home("inwg");
+    let mut step = 0_u8;
+    serve_once(&home, hello(1), move |req| {
+        step += 1;
+        match step {
+            1 => (
+                vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
+                false,
+            ),
+            2 => (
+                vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+                true,
+            ),
+            _ => panic!("unexpected request {req}"),
+        }
+    });
+
+    let out = run_cyclops(&home, &["inbox", "next", "--wait", "--json"]);
+    assert_json_failure(
+        &out,
+        1,
+        json!({
+            "code": "daemon_gone",
+            "message": "cyclopsd closed the connection while this command was waiting; nothing was claimed. Start the daemon again and rerun cyclops inbox next --wait.",
+            "data": {"pending": false}
+        }),
+    );
+
+    // The two budgets cannot be asked for together.
+    let out = run_cyclops(&home, &["inbox", "next", "--wait", "--timeout", "3s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--wait conflicts with --timeout"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn inbox_next_relists_when_the_selected_message_was_superseded() {
     let home = scratch_home("ins");
@@ -1785,7 +2102,7 @@ fn inbox_next_json_reports_an_invalid_sender_as_one_object() {
         2,
         json!({
             "code": "invalid_recipient_key",
-            "message": "recipient key must use canonical admin:<workspace-id> or agent:<workspace-id>/<session-instance-id>/%<pane> form",
+            "message": "recipient key must use canonical admin:<workspace-id>, agent:<workspace-id>/<session-instance-id>/%<pane>, or headless:<workspace-id>/<agent-instance-id> form",
             "data": {"value": "gemini-test"}
         }),
     );
@@ -3492,13 +3809,28 @@ fn a_reserved_name_is_refused_without_a_daemon() {
 fn self_names_the_calling_pane_and_says_so_when_there_is_none() {
     let home = scratch_home("name-self");
 
-    // Outside tmux there is no pane to name. The refusal carries the way
-    // to do it anyway, with the name the operator already typed.
+    // Outside tmux there is no pane to name, so --self is a headless
+    // registration: the name the operator typed goes to the daemon as the
+    // label, and the request names no process. A daemon that refuses it
+    // (this one is inside a watched pane after all) is passed through.
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "headless.register");
+        assert_eq!(req["params"]["label"], json!("picked"));
+        (
+            vec![json!({"id": req["id"], "error": {
+                "code": "use_pane",
+                "message": "this process is inside watched pane %3; a pane agent is named with `cyclops name picked --self` from that pane, and a headless registration is only for a process that has no pane at all"
+            }})
+            .to_string()],
+            false,
+        )
+    });
     let out = run_cyclops_io(&home, &[], &["name", "picked", "--self", "--plain"], None);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not in one"), "{err}");
-    assert!(err.contains("cyclops name %0 picked"), "{err}");
+    assert!(err.contains("inside watched pane %3"), "{err}");
+    assert!(err.contains("cyclops name picked --self"), "{err}");
+    let _ = fs::remove_file(home.join("sock"));
 
     // Inside one, the pane id comes from the environment tmux sets, and
     // the positional is the name. With no daemon this gets as far as the

@@ -229,6 +229,17 @@ when its ancestry reaches that current pane generation. Unprovable ancestry,
 a vendor outside every watched pane, and a uid other than the daemon's are
 denied before request handling.
 
+A headless agent is one more root the walk can stop at, and it is proven
+the same way. `headless.register` names nothing: the daemon walks the
+registering peer's tree, refuses it if a watched pane root is on the way,
+and otherwise binds the label to the nearest agent process it ships a
+manifest for, on a path proven current to the top of the tree. The
+operator's own shell, having no agent above it, cannot register. From then
+on a caller resolves to that label only by descending from that exact
+process generation, and the label is released when the process exits.
+There is no token: a bearer credential would sit in `ps e` and shell
+history, and would have no retirement edge.
+
 `agent.state.report` needs one more thing, because being in the pane is
 weaker than it sounds. An adopted pane keeps its label, its adoption and
 its manifest pin while its agent is not running, so anyone at that pane's
@@ -246,8 +257,9 @@ same proven pid and manifest are what the ACK path re-derives, so both
 ends of a report speak about the same process.
 
 - Enforced at: `src/cyclopsd/src/identity.rs`, `peer_of`,
-  `resolve_sender` and `vendor_ancestor`; `src/cyclopsd/src/server.rs`,
-  `verify_report_origin`; `src/cyclopsd/src/fusion.rs`,
+  `resolve_sender`, `vendor_ancestor` and `headless_root`;
+  `src/cyclopsd/src/server.rs`, `verify_report_origin`;
+  `src/cyclopsd/src/headless.rs`, `register`; `src/cyclopsd/src/fusion.rs`,
   `vendor_between` and `admitted_vendor`.
 - Proven by: `src/cyclopsd/src/server.rs`,
   `msg_send_fails_closed_without_peer_credentials`;
@@ -255,7 +267,12 @@ ends of a report speak about the same process.
   `forged_report_over_the_socket_is_denied_and_ingests_nothing`;
   `src/cyclopsd/src/identity.rs`,
   `a_helper_nobody_started_from_an_agent_is_not_admitted` and
-  `a_helper_the_agent_started_is_admitted_as_that_agent`.
+  `a_helper_the_agent_started_is_admitted_as_that_agent`;
+  `src/cyclopsd/tests/messaging/headless.rs`,
+  `a_shell_with_no_vendor_ancestor_cannot_register_headless` and
+  `registering_from_inside_a_watched_pane_is_refused`;
+  `src/cyclopsd/tests/identity/sender_identity.rs`,
+  `another_vendor_process_cannot_resolve_to_a_headless_label`.
 
 ## 6. Secrets never enter the journals
 
@@ -362,6 +379,16 @@ fires:
   deadline is armed by the edge and consumed by the next observation.
 - **The eye's animation tick**, one shot per state change
   (`src/cyclops-ui`).
+- **One exit event per headless registration.** A headless agent's label
+  is released when its process exits, and the daemon learns that from the
+  kernel, once: `kqueue` `EVFILT_PROC NOTE_EXIT` on macOS, `pidfd_open` on
+  Linux, awaited through an `AsyncFd` in
+  `src/cyclopsd/src/headless.rs`. Armed by the registration, consumed by
+  the exit, never re-asked. On a platform with neither event the daemon
+  arms nothing and says so in the log; the label is then released when a
+  resolution next reads the root's process entry and finds it gone, and by
+  the reverification every boot performs. That fallback rides observations
+  other work already paid for; it adds no timer.
 
 A hold waits on an event, not on a clock. If you are about to add an
 `interval` or a `loop { sleep }` to product code, the answer is an event

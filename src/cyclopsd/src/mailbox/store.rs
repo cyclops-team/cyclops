@@ -665,6 +665,27 @@ impl MessageStore {
         )
     }
 
+    /// The mailbox-only close for a headless recipient: `queued -> notified`
+    /// with `transport: mailbox`, no binding, no format, no verifier.
+    pub(crate) fn advance_notification_mailbox_notified(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        self.append_notification_transition_with_transport_at(
+            message_id,
+            recipient,
+            attempt_id,
+            NotificationState::Notified,
+            None,
+            Some(NotificationTransport::Mailbox),
+            None,
+            None,
+            now_ms(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_notification_transition_at(
         &mut self,

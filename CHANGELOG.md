@@ -10,8 +10,12 @@ versions are unreleased until admin cuts a tag.
 - `msg.read`: the operator reads one message, body included, without claiming it. Served only to the admin origin; an agent caller gets `forbidden` (`bodies reach an agent only through a claim`).
 - `msg.send` and `msg.reply` results carry `thread_root`; the CLI receipt names the thread a reply joined (`accepted <id> · thread <root>`).
 - `cyclops thread <id>` is an everyday command and prints a thread index above the grid: the root id and each message's `<message>` part in order.
+- Headless agents: `cyclops name <label> --self` from a process with no pane registers it over the socket (`headless.register`). The daemon binds the label to the nearest agent process in the caller's tree, proven the way a pane is, with no token; from inside a watched pane it is refused with `use_pane`. Delivery is mailbox-only: the attempt closes `queued -> notified` with `transport: mailbox` and the receipt reads `accepted · in mailbox, no pane`. The label is released by the process exit (`kqueue` `EVFILT_PROC` on macOS, `pidfd_open` on Linux), and `headless.clear` takes it back early. Recipient keys gain a third kind, `headless`, displayed as the `headless:` prefix followed by the workspace id and the agent instance id; `*` reaches headless agents too.
+- `cyclops inbox next --wait`: no deadline, for a headless agent reading its mailbox; exits `daemon_gone` when cyclopsd closes the connection. Conflicts with `--timeout`.
 
 ### Changed
+- One-way journal upgrade: a workspace journal that carries a headless recipient row or a `transport: mailbox` transition cannot be replayed by an older daemon (strict replay refuses the unknown recipient kind), and an older CLI prints its unreadable-answer copy for a headless key. Upgrade the daemon and the CLI together.
+- `MessageRecipientRoute.pane_id` is optional on the wire (absent for a headless recipient); `cyclops messages` and the UI render such a route by label.
 - The doorbell header names the recipients: `[cyclops from <sender> to <recipients>] <summary> | cyclops inbox claim m-att_...`. Up to three names joined by `, `, then `<first>, <second>, +N`; a broadcast reads `to all`. Format number stays 4.
 - A claim over the socket while the doorbell is `queued`, `gating`, or `blocked_pre_write` withdraws it (cause `claimed_before_write`) and nothing is written to the pane; a claim after Enter still settles the attempt as `notified`.
 - Summaries have no length cap; the rule is one non-empty line. The CLI warns once on stderr above 160 characters.

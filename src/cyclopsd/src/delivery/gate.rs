@@ -233,6 +233,9 @@ pub(crate) fn expected_notification_payload(
             Some(render_canonical_message_payload(message))
         }
         (NotificationTransport::DirectPayload | NotificationTransport::Raw, Some(_)) => None,
+        // Nothing was ever written for a mailbox-only delivery, so there
+        // is no payload to recognize on any screen.
+        (NotificationTransport::Mailbox, _) => None,
     }
 }
 

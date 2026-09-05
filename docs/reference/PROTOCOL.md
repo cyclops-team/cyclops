@@ -408,7 +408,11 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
 root for a `reply_to` send, a `msg.reply`, or a replacement. A message inside
 a thread shares the root's `<thread>` run and mints a fresh `<message>` run.
 
-`to` takes several labels, or `"*"` for every named pane. Interactive clients
+`to` takes several labels, or `"*"` for every agent on the roster, pane or
+headless (never admin). A recipient key has one of three kinds: `admin`,
+`agent` (a pane: `workspace_id`, `session_instance_id`, `pane_id`), or
+`headless` (`workspace_id`, `agent_instance_id`; see `headless.register`).
+Interactive clients
 may instead send `to: []` with `recipient_keys`, an array of exact durable
 recipient identities returned by `messages.snapshot`. The two selectors cannot
 be combined. Exact keys must still be present in the current mailbox directory,
@@ -550,7 +554,12 @@ remains in the durable admin inbox without a notification attempt.
 
 The `writing` transition carries `transport: "doorbell"` or `"raw"` beside
 `binding`; a raw write has no binding because nothing about the occupant was
-proven. A doorbell carries `doorbell_format: 4`, which fixes the summary and
+proven. A headless recipient has no pane, so its attempt never reaches
+`writing`: it moves `queued -> notified` in one fact carrying
+`transport: "mailbox"`, no binding, no doorbell format, and no `verified_by`.
+That edge is admitted only with the mailbox transport. The receipt for such a
+delivery reads `notification_state: "notified"` with
+`note: "in mailbox, no pane"` and no `pane`. A doorbell carries `doorbell_format: 4`, which fixes the summary and
 attempt-locator bytes for replay. Binding records contain the recipient,
 pane-root generation, foreground leader generation, admitted agent generation,
 and manifest. Journals an older daemon wrote carry `direct_payload` transports
@@ -689,7 +698,8 @@ so a rename cannot strand or retarget a watch.
 
 A recipient with no notification attempt reports `not_started`; the read model
 never invents a queued attempt. Per-recipient `available` comes from the current
-durable route directory keyed by recipient identity. It is current route
+durable route directory keyed by recipient identity. `current_route.pane_id`
+is absent for a headless recipient, which has a label and no pane. It is current route
 metadata and is not covered by `workspace_seq`. Mailbox state can be `pending`,
 `claimed`, or `superseded`; `delivered_direct` appears only when reading a
 journal an older daemon wrote. A replacement process or session cannot inherit
@@ -847,6 +857,62 @@ starting with `%` (a tmux pane id), and a name another pane already
 answers to. A control character is refused too, because it cannot survive
 onto a tmux command line and the border would then wear a different name
 than the record.
+
+### headless.register and headless.clear
+
+An agent that runs in no tmux pane registers itself over the socket. Nothing
+in the request names a process: the daemon walks the caller's process tree,
+refuses it if a watched pane root is on the way (`use_pane`, with the pane
+named in the message), and otherwise binds the label to the nearest agent
+process it ships a manifest for, on a path proven current to the top of the
+tree. A same-user shell with no agent above it is the operator and is refused
+(`denied`). The CLI verb is `cyclops name <label> --self` from a shell with no
+`TMUX_PANE`.
+
+```
+-> {"id":11,"method":"headless.register","params":{"label":"worker","manifest":null}}
+<- {"id":11,"result":{"agent_instance_id":"5a4d0c02-7d2e-4a4b-9a6a-0c9d7d6b2e11",
+    "detects_as":"claude","headless":true,"label":"worker","manifest":null,"pid":48213,
+    "recipient":{"kind":"headless","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a",
+    "agent_instance_id":"5a4d0c02-7d2e-4a4b-9a6a-0c9d7d6b2e11"}}}
+```
+
+`recipient` is the durable key every later surface uses; its display form is
+
+```text
+headless:<workspace-id>/<agent-instance-id>
+```
+
+Registering again from the same process keeps the same key. `manifest` echoes the pin and `detects_as` is the
+manifest the root process classifies under; nothing is gated on either,
+because nothing is ever written to a terminal for this recipient. The same
+four labels `pane.label` refuses are refused here, plus a name a pane already
+answers to; and a pane cannot take a headless label.
+
+Every request a descendant of the registered process makes is attributed to
+the label, exactly as a pane agent's helpers are attributed to the pane.
+Delivery is mailbox-only (`transport: "mailbox"` above) and the agent reads
+with `inbox.list` and `inbox.claim`, or `cyclops inbox next --wait`. Hook
+reports from a headless process are refused: it has no pane to report about.
+
+The label is released when the process exits. The daemon holds one named,
+one-shot exit event per registration (`kqueue` `EVFILT_PROC NOTE_EXIT` on
+macOS, `pidfd_open` on Linux) and emits `messages.route_changed` when it
+fires. After that the label is unaddressable (`no_such_target`), the recipient
+key is no longer served, and `messages.snapshot` reports the recipient
+`available: false` with its `notified` attempt; pending entries stay pending
+and the operator reads them with `msg.read`. A later registration mints a new
+key. At boot every stored registration is re-verified by OS boot id and
+process birth, and anything that does not match is dropped.
+
+`headless.clear` takes the registration back early. With no params it clears
+the caller's own registration; with `{"label": ...}` it clears a named one and
+is served to the admin origin only.
+
+```
+-> {"id":12,"method":"headless.clear","params":{}}
+<- {"id":12,"result":{"cleared":true,"label":"worker"}}
+```
 
 ### session.watch
 

@@ -56,7 +56,7 @@ fn routes(
                 recipient,
                 MessageRecipientRoute {
                     label: recipient.pane_id()?.to_string(),
-                    pane_id: recipient.pane_id()?,
+                    pane_id: recipient.pane_id(),
                 },
             ))
         })

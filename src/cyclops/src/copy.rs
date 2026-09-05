@@ -495,14 +495,16 @@ pub fn no_daemon_log(log: &std::path::Path) -> String {
 }
 
 /// `cyclops name --self` outside tmux. The flag reads $TMUX_PANE, so a
-/// shell with none set cannot mean any pane; the sentence hands over the
-/// by-id spelling instead.
-pub fn self_outside_tmux(name: &str) -> String {
-    format!(
-        "--self names the pane this command is running in, and this shell is not in one. \
-         Run it inside tmux, or name the pane by id: cyclops name %0 {name}."
-    )
-}
+/// shell with none set is a headless agent, and the daemon says so on the
+/// receipt line: no pane, socket only.
+pub const HEADLESS_NAMED: &str = "headless, no pane";
+
+/// `inbox next --wait` ended because cyclopsd closed the connection. The
+/// wait had no deadline, so this is the one exit without a message, and
+/// it is named rather than folded into a generic connection loss.
+pub const INBOX_NEXT_DAEMON_GONE: &str =
+    "cyclopsd closed the connection while this command was waiting; nothing was claimed. \
+     Start the daemon again and rerun cyclops inbox next --wait.";
 
 /// `--raw` beside a non-detection source. The other sources ARE the raw
 /// capture, so the flag there is a misunderstanding worth a sentence

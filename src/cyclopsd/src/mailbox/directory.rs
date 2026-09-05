@@ -71,14 +71,16 @@ impl MailboxDirectory {
             if identity.key.workspace_id() != workspace_id {
                 return Err(MailboxDirectoryError::ForeignWorkspace);
             }
-            let pane = identity
-                .key
-                .pane_id()
-                .ok_or(MailboxDirectoryError::AdminEntry)?;
+            if identity.key.is_admin() {
+                return Err(MailboxDirectoryError::AdminEntry);
+            }
             if identity.label.is_empty() || identity.label.chars().any(char::is_control) {
                 return Err(MailboxDirectoryError::InvalidLabel);
             }
-            if identity.label != pane.to_string() {
+            // A headless agent is an agent entry with no pane: addressed by
+            // its label alone, never by a pane id, and never the admin.
+            let pane = identity.key.pane_id();
+            if pane.is_none_or(|pane| identity.label != pane.to_string()) {
                 let address = identity.label.clone();
                 if directory
                     .by_address
@@ -93,9 +95,14 @@ impl MailboxDirectory {
                 .insert(identity.key, identity.clone())
                 .is_some()
             {
-                return Err(MailboxDirectoryError::DuplicateAddress(pane.to_string()));
+                return Err(MailboxDirectoryError::DuplicateAddress(
+                    pane.map(|pane| pane.to_string())
+                        .unwrap_or_else(|| identity.key.to_string()),
+                ));
             }
-            pane_candidates.entry(pane).or_default().push(identity);
+            if let Some(pane) = pane {
+                pane_candidates.entry(pane).or_default().push(identity);
+            }
         }
         for (pane, candidates) in pane_candidates {
             let [identity] = candidates.as_slice() else {
@@ -148,14 +155,14 @@ impl MailboxDirectory {
     pub(crate) fn current_routes(&self) -> HashMap<RecipientKey, MessageRecipientRoute> {
         self.by_recipient
             .iter()
-            .filter_map(|(recipient, identity)| {
-                Some((
+            .map(|(recipient, identity)| {
+                (
                     *recipient,
                     MessageRecipientRoute {
                         label: identity.label.clone(),
-                        pane_id: recipient.pane_id()?,
+                        pane_id: recipient.pane_id(),
                     },
-                ))
+                )
             })
             .collect()
     }

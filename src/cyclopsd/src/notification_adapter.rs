@@ -317,6 +317,52 @@ impl NotificationContext {
         Ok(record)
     }
 
+    /// The mailbox-only delivery for a headless recipient. Nothing is
+    /// gated and nothing is written: the attempt goes from `queued` to
+    /// `notified` with `transport: mailbox`, and the recipient reads the
+    /// message over the socket. Refused, without a fact, when the entry is
+    /// no longer pending (a claim already settled it) or the attempt moved.
+    pub(crate) fn record_mailbox_notified(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        let current = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
+        if !self.owns(&current) {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        if current.state == NotificationState::Notified
+            && current.transport == NotificationTransport::Mailbox
+        {
+            return Ok(current);
+        }
+        if current.state != NotificationState::Queued {
+            return Err(NotificationAdapterError::TerminalConflict(current.state));
+        }
+        let pending = store
+            .projection()
+            .get_entry(self.recipient, &self.message_id)
+            .is_some_and(|entry| {
+                entry_allows_notification(&entry.state, NotificationTransport::Mailbox)
+            });
+        if !pending {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        let record = store.advance_notification_mailbox_notified(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
     /// Settle a successfully submitted doorbell when its exact mailbox entry
     /// has already been claimed.
     ///
