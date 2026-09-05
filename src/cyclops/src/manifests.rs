@@ -30,6 +30,10 @@ use crate::hash::fnv64;
 /// Every manifest the binary carries, by file name.
 const SHIPPED: &[(&str, &str)] = &[
     (
+        "adal.toml",
+        include_str!("../../../resources/manifests/adal.toml"),
+    ),
+    (
         "agy.toml",
         include_str!("../../../resources/manifests/agy.toml"),
     ),
@@ -42,12 +46,52 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/manifests/amp.toml"),
     ),
     (
+        "auggie.toml",
+        include_str!("../../../resources/manifests/auggie.toml"),
+    ),
+    (
+        "autohand.toml",
+        include_str!("../../../resources/manifests/autohand.toml"),
+    ),
+    (
+        "bob.toml",
+        include_str!("../../../resources/manifests/bob.toml"),
+    ),
+    (
         "claude.toml",
         include_str!("../../../resources/manifests/claude.toml"),
     ),
     (
+        "cline.toml",
+        include_str!("../../../resources/manifests/cline.toml"),
+    ),
+    (
+        "codearts.toml",
+        include_str!("../../../resources/manifests/codearts.toml"),
+    ),
+    (
+        "codebuddy.toml",
+        include_str!("../../../resources/manifests/codebuddy.toml"),
+    ),
+    (
         "codex.toml",
         include_str!("../../../resources/manifests/codex.toml"),
+    ),
+    (
+        "commandcode.toml",
+        include_str!("../../../resources/manifests/commandcode.toml"),
+    ),
+    (
+        "continue.toml",
+        include_str!("../../../resources/manifests/continue.toml"),
+    ),
+    (
+        "copilot.toml",
+        include_str!("../../../resources/manifests/copilot.toml"),
+    ),
+    (
+        "cortex.toml",
+        include_str!("../../../resources/manifests/cortex.toml"),
     ),
     (
         "crush.toml",
@@ -58,6 +102,26 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/manifests/cursor.toml"),
     ),
     (
+        "dcode.toml",
+        include_str!("../../../resources/manifests/dcode.toml"),
+    ),
+    (
+        "devin.toml",
+        include_str!("../../../resources/manifests/devin.toml"),
+    ),
+    (
+        "dexto.toml",
+        include_str!("../../../resources/manifests/dexto.toml"),
+    ),
+    (
+        "droid.toml",
+        include_str!("../../../resources/manifests/droid.toml"),
+    ),
+    (
+        "forge.toml",
+        include_str!("../../../resources/manifests/forge.toml"),
+    ),
+    (
         "gemini.toml",
         include_str!("../../../resources/manifests/gemini.toml"),
     ),
@@ -66,16 +130,112 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/manifests/goose.toml"),
     ),
     (
+        "grok.toml",
+        include_str!("../../../resources/manifests/grok.toml"),
+    ),
+    (
+        "hermes.toml",
+        include_str!("../../../resources/manifests/hermes.toml"),
+    ),
+    (
+        "iflow.toml",
+        include_str!("../../../resources/manifests/iflow.toml"),
+    ),
+    (
+        "jazz.toml",
+        include_str!("../../../resources/manifests/jazz.toml"),
+    ),
+    (
+        "junie.toml",
+        include_str!("../../../resources/manifests/junie.toml"),
+    ),
+    (
+        "kilo.toml",
+        include_str!("../../../resources/manifests/kilo.toml"),
+    ),
+    (
+        "kimchi.toml",
+        include_str!("../../../resources/manifests/kimchi.toml"),
+    ),
+    (
         "kimi.toml",
         include_str!("../../../resources/manifests/kimi.toml"),
+    ),
+    (
+        "kiro.toml",
+        include_str!("../../../resources/manifests/kiro.toml"),
+    ),
+    (
+        "kode.toml",
+        include_str!("../../../resources/manifests/kode.toml"),
+    ),
+    (
+        "loaf.toml",
+        include_str!("../../../resources/manifests/loaf.toml"),
+    ),
+    (
+        "mcode.toml",
+        include_str!("../../../resources/manifests/mcode.toml"),
+    ),
+    (
+        "neovate.toml",
+        include_str!("../../../resources/manifests/neovate.toml"),
+    ),
+    (
+        "openclaw.toml",
+        include_str!("../../../resources/manifests/openclaw.toml"),
     ),
     (
         "opencode.toml",
         include_str!("../../../resources/manifests/opencode.toml"),
     ),
     (
+        "openhands.toml",
+        include_str!("../../../resources/manifests/openhands.toml"),
+    ),
+    (
+        "pa.toml",
+        include_str!("../../../resources/manifests/pa.toml"),
+    ),
+    (
+        "pi.toml",
+        include_str!("../../../resources/manifests/pi.toml"),
+    ),
+    (
+        "qoder.toml",
+        include_str!("../../../resources/manifests/qoder.toml"),
+    ),
+    (
+        "qodercn.toml",
+        include_str!("../../../resources/manifests/qodercn.toml"),
+    ),
+    (
         "qwen.toml",
         include_str!("../../../resources/manifests/qwen.toml"),
+    ),
+    (
+        "reasonix.toml",
+        include_str!("../../../resources/manifests/reasonix.toml"),
+    ),
+    (
+        "rovodev.toml",
+        include_str!("../../../resources/manifests/rovodev.toml"),
+    ),
+    (
+        "tabnine.toml",
+        include_str!("../../../resources/manifests/tabnine.toml"),
+    ),
+    (
+        "traecli.toml",
+        include_str!("../../../resources/manifests/traecli.toml"),
+    ),
+    (
+        "vibe.toml",
+        include_str!("../../../resources/manifests/vibe.toml"),
+    ),
+    (
+        "warp.toml",
+        include_str!("../../../resources/manifests/warp.toml"),
     ),
 ];
 
@@ -115,25 +275,37 @@ pub fn dir(home: &Path) -> PathBuf {
 /// skill body's hash landing here would misclassify an edited manifest.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "000da241c916d3cb",
+    "07e6faf978ea2598",
     "0a90724a6ccb9c0a",
     "0d86f7b98bf8baa1",
     "0e7c902fb67d702a",
+    "0ea59360ef2c838f",
+    "0f1165768798c296",
     "11524da667efff46",
     "12765e334728f40b",
     "16f1cc714b44548c",
     "192c1584efd10f6f",
+    "1bc8d26b815b93e0",
     "21a94a206aefa357",
     "22fc7137a759b208",
+    "28390246d6b96f16",
     "2893de300e4fc944",
     "2949a1d316e76d5b",
     "2a8c5b29dff89435",
     "2ab0cdc3cc03647b",
     "2d760e8dbff7a191",
+    "3136ad89b6b415f1",
     "316b4c51088fc315",
+    "327573d09f05ed65",
     "3292eae226f54f79",
     "32cbf16f4ecde8e9",
+    "36135e553251b3d9",
+    "3718f2ac011587c4",
+    "3860125b31455235",
     "38c8d60f54914523",
     "39e895dafb8bedb7",
+    "3a7c5a91fee57051",
+    "3af7a3dfe7e971f7",
     "3e1f2f2587609500",
     "3e966f9f7049d206",
     "3ec9936975418c27",
@@ -142,15 +314,22 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "447ac3d6d4fb9127",
     "44c3c94fe03c18c9",
     "4af4029b9d2910e3",
+    "4b643cdbc4b91014",
     "4cc9bf79e99d7d25",
+    "4f222235de989aea",
+    "535f5df99678a1bb",
     "57c2bf8d8b894ce0",
     "5be3ed83f3683522",
     "5fb9fab4521686ad",
     "645013f86f1bcb41",
     "6680bd20b0f93e56",
+    "68b6a34d1a938aa0",
     "69c853cdcc84e970",
     "6a4f11941f4c78be",
+    "6acd399933dc8d62",
+    "6dd87d7438712329",
     "6f824b54f50c63b5",
+    "70c53961fd4a59d1",
     "75f3c5daed1304f1",
     "76f7d149eba23837",
     "7a9754b750109c5e",
@@ -158,11 +337,14 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "7fc779fefde1e467",
     "81e7e3ad63748a7f",
     "821ec0a1af0f8cc1",
+    "83b76b1edc0bcde7",
     "84b0dfa8ce699bb0",
     "84c43e4255939728",
     "85f276e9afffc42d",
     "86f0219077c6bae3",
     "884a6e869dbdea99",
+    "8e524693400048f8",
+    "8ffc2859ff8be0c4",
     "92e40157e2ad9b86",
     "970aabc764b3acd4",
     "97778c580f34b125",
@@ -172,27 +354,45 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "9a67be48357ff9e0",
     "9be123836a9dac67",
     "9e4d60c2da88e88e",
+    "9ebb59d89922a438",
     "9eee760afa8f5ead",
+    "ae6a3ab16e540024",
+    "b08adf7a1bf1d116",
     "b327aa8824a51b94",
     "b4ef7ddba83f94a1",
+    "b689983b65dadf94",
+    "b762e1138fd599c7",
+    "b92c9f9c63314d16",
     "baa8b17e1e28dc2c",
     "bc4bc371b40e71ca",
     "bf50a35c755a593c",
     "bf66db73f5d56a8f",
+    "c5c15fada96a238f",
     "c60d4aff7fe2a5d2",
+    "c74b7d8b4e445057",
     "c86ba6c35e662ee6",
+    "ca76bd51cbb6ff12",
     "cd2508367907b954",
     "cdc9378b2adb994e",
     "d184c3a8a39327f5",
     "d4a0c49fff22fe23",
+    "d4c5172af411c75f",
+    "d97156863fecc950",
+    "da723b27c017b7a5",
     "dc0b06781eb5a812",
     "dcf8e732f46b397c",
     "df257d8320645462",
     "e2a3e259f46c4dfc",
     "e49a078f35012c20",
+    "e75a04594790f80a",
+    "e8f09401778d50a0",
+    "e9b09acc9f7a0390",
     "eba911263fbb7fed",
     "ed6a0d16eff01e23",
     "ee41a0a36c59c466",
+    "f0cbb861e241aae1",
+    "f10521646e776817",
+    "f30d5c96c302f04b",
     "f519b6f9f9a6cbb4",
     "f6c7c7aaa830babb",
     "f7e41c33373cd344",
@@ -205,6 +405,12 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
 /// report an outdated seed without calling it an operator edit.
 pub(crate) fn unedited_seed(body: &[u8]) -> bool {
     EVER_SHIPPED_FNV64.contains(&fnv64(body).as_str())
+}
+
+/// Every compiled-in manifest as (file name, body), in shipped order. The
+/// vendor catalog (`crate::wiring`) parses these once per process.
+pub(crate) fn shipped() -> impl Iterator<Item = (&'static str, &'static str)> {
+    SHIPPED.iter().copied()
 }
 
 pub(crate) fn shipped_body(id: &str) -> Option<&'static str> {

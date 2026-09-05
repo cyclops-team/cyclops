@@ -129,6 +129,13 @@ consumer skill directory or duplicate vendor copy. A vendor directory that
 does not exist is never created, your own entries are merged around rather
 than replaced, and the original file is copied aside before the first edit.
 
+Every other vendor with a documented shell hook file is wired the same way
+from its manifest's `[hooks.wiring]` table
+([MANIFESTS.md](MANIFESTS.md#hookswiring-how-cyclops-writes-the-hook-file)):
+the file it names, once the vendor's directory exists, merged around your
+entries and copied aside before the first edit. [install.md](../guides/install.md)
+lists each vendor's file.
+
 The consent is recorded at `~/.cyclops/vendor-wiring-consented`, so an
 agent CLI installed after cyclops is not stranded: the next `cyclops` or
 `cyclops start` finds it, wires its hooks, and adds its skill only if the

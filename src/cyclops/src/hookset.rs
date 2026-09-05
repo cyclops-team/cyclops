@@ -30,6 +30,7 @@ use crate::client::Client;
 use crate::hash::fnv64;
 use crate::render::{display_width, human_duration, pad, receipt_badge};
 use crate::style::Style;
+use crate::wiring::is_cyclops_hook_command;
 use crate::{copy, EXIT_USAGE};
 
 /// Templates ship inside the binary; the files under resources/hooks/ in
@@ -187,203 +188,19 @@ fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
     Some(crate::consumer::spec(kind).locations(&home).hook.path())
 }
 
-/// True for a hook entry this project wrote.
-///
-/// Identified by what the command runs rather than by a marker key: a
-/// marker would have to survive the vendor rewriting its own config, and
-/// some do. Any command that invokes a cyclops binary's `hook` receiver is
-/// ours to replace; everything else in the file is the operator's and is
-/// carried through untouched.
-/// Is this one command hook exactly a Cyclops hook command?
-///
-/// Exactly the two rendered forms are ours: `<bin> hook <Event>` and
-/// `<bin> hook <Event> --agent <label>`, where the event and the label are
-/// plain words and `<bin>` is either one of the bin paths our own rendering
-/// uses right now (`own_bins`, which covers a test binary or any install
-/// prefix) or a path whose basename is exactly `cyclops` (an older install
-/// at another prefix). Any other trailing token, shell operator, wrapper, or
-/// suffix makes the command the operator's, and it must survive a merge:
-/// `cyclops hook Stop && echo mine` is not ours.
-fn is_cyclops_hook_command(command: &str, own_bins: &[&str]) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let (bin, event, label) = match tokens.as_slice() {
-        [bin, "hook", event] => (*bin, *event, None),
-        [bin, "hook", event, "--agent", label] => (*bin, *event, Some(*label)),
-        _ => return false,
-    };
-    let plain_word = |word: &str| {
-        !word.is_empty()
-            && word
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    };
-    if !plain_word(event) || label.is_some_and(|label| !plain_word(label)) {
-        return false;
-    }
-    let basename = bin.rsplit('/').next().unwrap_or(bin);
-    own_bins.contains(&bin) || basename == "cyclops"
-}
-
-/// The bin paths our own rendering (`src`) uses for its hook commands.
-fn own_hook_bins(src: &[serde_json::Value]) -> Vec<&str> {
-    let mut bins = Vec::new();
-    for entry in src {
-        let direct = std::iter::once(entry);
-        let nested = entry
-            .get("hooks")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten();
-        for bin in direct
-            .chain(nested)
-            .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
-            .filter_map(|command| command.split_whitespace().next())
-        {
-            if !bins.contains(&bin) {
-                bins.push(bin);
-            }
-        }
-    }
-    bins
-}
-
-/// The outer object of a hook group with its `hooks` removed: the matcher
-/// and whatever metadata the author put around the commands.
-fn group_shell(entry: &serde_json::Value) -> serde_json::Value {
-    let mut shell = entry.clone();
-    if let Some(object) = shell.as_object_mut() {
-        object.remove("hooks");
-    }
-    shell
-}
-
-/// The group shells our own rendering (`src`) uses right now.
-fn own_group_shells(src: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    src.iter()
-        .filter(|entry| {
-            entry
-                .get("hooks")
-                .and_then(serde_json::Value::as_array)
-                .is_some()
-        })
-        .map(group_shell)
-        .collect()
-}
-
-/// Strip only this project's own command hooks out of one event entry.
-///
-/// Lifecycle and Cursor entries are direct command objects. Tool hooks use a
-/// group with a nested `hooks` array. An unrelated direct object is cloned
-/// whole; a mixed group keeps its matcher and every operator-owned sibling.
-/// Only exact Cyclops command objects are ever removed: an object none of
-/// whose hooks are ours (an empty array included) is untouched, and a group
-/// whose hooks were all ours goes whole only when its outer object is
-/// exactly a shell we render; an operator's outer object (its matcher, its
-/// metadata) survives with the Cyclops commands removed, even emptied.
-fn without_cyclops_hooks(
-    entry: &serde_json::Value,
-    own_bins: &[&str],
-    own_shells: &[serde_json::Value],
-) -> Option<serde_json::Value> {
-    use serde_json::Value;
-    if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
-        let kept: Vec<Value> = hooks
-            .iter()
-            .filter(|hook| {
-                !hook
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| is_cyclops_hook_command(command, own_bins))
-            })
-            .cloned()
-            .collect();
-        if kept.len() == hooks.len() {
-            return Some(entry.clone());
-        }
-        if kept.is_empty() && own_shells.contains(&group_shell(entry)) {
-            return None;
-        }
-        let mut stripped = entry.clone();
-        stripped["hooks"] = Value::Array(kept);
-        return Some(stripped);
-    }
-    let own_direct = entry
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| is_cyclops_hook_command(command, own_bins));
-    (!own_direct).then(|| entry.clone())
-}
-
 /// Merge `src` into `dst`, replacing only this project's own entries.
 ///
-/// Objects recurse so an unrelated sibling key is never visited. Arrays are
-/// the case that matters: a vendor's event list holds the operator's
-/// handlers next to ours, so ours are filtered out and re-appended while
-/// theirs keep their order. That is what makes a second run a no-op instead
-/// of a file that grows a duplicate handler every update.
+/// The generic writer in `crate::wiring` does the work for every vendor;
+/// the template vendors keep their command under `command`.
 fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
-    use serde_json::Value;
-    match (dst, src) {
-        (Value::Object(d), Value::Object(s)) => {
-            for (k, sv) in s {
-                merge_into(d.entry(k.clone()).or_insert(Value::Null), sv);
-            }
-        }
-        (d @ Value::Array(_), Value::Array(s)) => {
-            // Vendor arrays contain direct command objects, nested hook
-            // groups, or both. Only exact Cyclops commands are replaced; an
-            // unrelated direct object stays whole, a mixed group keeps its
-            // matcher and operator hooks, and the current source is appended
-            // once. Running this twice is a no-op.
-            let own_bins = own_hook_bins(s);
-            let own_shells = own_group_shells(s);
-            let kept: Vec<Value> = d
-                .as_array()
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .filter_map(|entry| without_cyclops_hooks(entry, &own_bins, &own_shells))
-                        .collect()
-                })
-                .unwrap_or_default();
-            *d = Value::Array(kept.into_iter().chain(s.iter().cloned()).collect());
-        }
-        (d, s) => *d = s.clone(),
-    }
+    crate::wiring::merge_json(dst, src, "command");
 }
 
 /// Remove this project's entries from a vendor document without changing any
 /// sibling configuration. This is the inverse of [`merge_into`] for the
 /// arrays Cyclops owns; scalar configuration is never reset on uninstall.
 fn remove_from(dst: &mut serde_json::Value, src: &serde_json::Value) -> bool {
-    use serde_json::Value;
-    match (dst, src) {
-        (Value::Object(d), Value::Object(s)) => {
-            let mut changed = false;
-            for (key, source_value) in s {
-                if let Some(destination_value) = d.get_mut(key) {
-                    changed |= remove_from(destination_value, source_value);
-                }
-            }
-            changed
-        }
-        (destination @ Value::Array(_), Value::Array(source)) => {
-            let own_bins = own_hook_bins(source);
-            let own_shells = own_group_shells(source);
-            let original = destination.as_array().expect("array matched above");
-            let kept: Vec<Value> = original
-                .iter()
-                .filter_map(|entry| without_cyclops_hooks(entry, &own_bins, &own_shells))
-                .collect();
-            if kept.len() == original.len() && kept == *original {
-                false
-            } else {
-                *destination = Value::Array(kept);
-                true
-            }
-        }
-        _ => false,
-    }
+    crate::wiring::remove_json(dst, src, "command")
 }
 
 fn is_cyclops_hook_toml(hook: &toml::Value, own_bins: &[&str]) -> bool {
@@ -504,6 +321,7 @@ pub(crate) fn inspect_wiring_bytes(kind: CliKind, bytes: &[u8]) -> WiringState {
 }
 
 /// What one vendor's wiring did, for the line `cyclops start` prints.
+#[derive(Debug)]
 pub struct WiredVendor {
     pub vendor: &'static str,
     pub path: PathBuf,
@@ -514,6 +332,7 @@ pub struct WiredVendor {
 }
 
 /// What explicit uninstall did to one vendor's shared hook file.
+#[derive(Debug)]
 pub struct UnwiredVendor {
     pub vendor: &'static str,
     pub path: PathBuf,
@@ -871,7 +690,7 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
 /// The temporary file is created beside the destination and renamed only after
 /// its contents have been flushed to disk. An existing destination is replaced
 /// by the single rename operation, so readers see either complete version.
-fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -1010,7 +829,7 @@ fn inside_vendor_dir(dest: &Path) -> bool {
 
 /// The path of this cyclops binary, for hook commands that must work from
 /// any vendor CLI's environment without PATH assumptions.
-fn cyclops_bin() -> String {
+pub(crate) fn cyclops_bin() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))

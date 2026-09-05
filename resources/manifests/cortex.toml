@@ -1,0 +1,71 @@
+# Cyclops detection manifest: Cortex Code (Snowflake, "CoCo")
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No cortex binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://docs.snowflake.com/en/user-guide/cortex-code/extensibility
+#   https://docs.snowflake.com/en/user-guide/cortex-code/cli-reference
+#   https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code
+#
+# Skills directory (skills.sh catalog key cortex): ~/.snowflake/cortex/skills
+#
+# Sensor summary for this CLI:
+#   process  cortex is a native install (~/.local/bin/cortex via curl), so
+#            #{pane_current_command} is expected to read "cortex" (inferred).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: ~/.snowflake/cortex/hooks.json
+#            (global) holds {"hooks":{"Event":[{"matcher","hooks":[{"type":
+#            "command","command","timeout"}]}]}}; .cortex/settings.json and
+#            the .claude/settings*.json family are read too (Cyclops never
+#            writes under ~/.claude). The docs give one generic stdin sample
+#            (session_id, transcript_path, cwd, permission_mode,
+#            hook_event_name, tool_name, tool_input) and no per-event fields,
+#            so the UserPromptSubmit prompt field is undocumented: no ACK
+#            field and no candidate start is declared, and the events are
+#            wired for liveness only.
+#   screen   UNMEASURED. The CLI reference says prompts are typed "at the
+#            `>` prompt", which is too weak to anchor alone, so no idle rule
+#            ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "cortex"
+display_name = "Cortex Code"
+version_tested = "unverified"
+process_names = ["cortex"]
+argv_basenames = ["cortex"]
+launch = "cortex"
+
+[hooks]
+config_mechanism = "hooks object in ~/.snowflake/cortex/hooks.json"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "PermissionRequest", "UserPromptSubmit",
+  "SessionStart", "SessionEnd", "PreCompact", "Stop", "SubagentStop",
+  "Notification", "Setup",
+]
+
+[hooks.wiring]
+shape = "claude-hooks-file"
+file = "~/.snowflake/cortex/hooks.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Cortex Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

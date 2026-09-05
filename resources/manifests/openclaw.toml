@@ -1,0 +1,51 @@
+# Cyclops detection manifest: OpenClaw
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No openclaw binary was run and nothing was measured: this file binds the
+# pane and nothing more. Sources:
+#   https://github.com/openclaw/openclaw
+#   https://docs.openclaw.ai/
+#
+# Skills directory (skills.sh catalog key openclaw): resolved by the
+# catalog's getOpenClawGlobalSkillsDir(); the docs place it under
+# ~/.openclaw/skills.
+#
+# NO HOOK CONFIG. OpenClaw's hooks under ~/.openclaw/hooks/ are JS/TS
+# handler modules loaded into the process, not shell commands, so no
+# [hooks] table and no wiring ships (the same policy as opencode.toml).
+# OpenClaw is primarily a daemon; `openclaw tui` (or `openclaw chat`) is
+# the interactive terminal front end this manifest binds.
+#
+# Sensor summary for this CLI:
+#   process  #{pane_current_command} is expected to read "openclaw"
+#            (inferred, not measured; an npm install may read "node", which
+#            is not listed because it would claim every Node process). If
+#            the pane does not bind, pin it: cyclops name %N <label>
+#            --manifest openclaw.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The docs describe a status line cycling
+#            connecting/running/streaming/idle/error but quote no row, so
+#            no idle or working rule ships and deliveries fail closed.
+
+[agent]
+id = "openclaw"
+display_name = "OpenClaw"
+version_tested = "unverified"
+process_names = ["openclaw"]
+argv_basenames = ["openclaw"]
+launch = "openclaw tui"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for OpenClaw."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

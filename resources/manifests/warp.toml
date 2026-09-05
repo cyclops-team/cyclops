@@ -1,0 +1,52 @@
+# Cyclops detection manifest: Warp Agent CLI (Warp)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no warp binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://docs.warp.dev/agents/cli/                 overview; `>` agent mode, `!` shell mode
+#   https://docs.warp.dev/agents/cli/quickstart/      brew cask warp-agent-cli; curl app.warp.dev/download/agent-cli
+#   https://docs.warp.dev/agents/cli/configuration/   settings.toml, /statusline, rules, skills, MCP
+#   skills.sh catalog row `warp`: skills directory ~/.agents/skills
+#
+# Sensor summary for this CLI:
+#   process  the Agent CLI installs as `warp` (a Homebrew cask or a
+#            download); whether it is a native binary is unmeasured. If
+#            binding fails, pin the pane: cyclops name %N <label> --manifest warp.
+#   title    UNMEASURED.
+#   hooks    NONE DOCUMENTED. The configuration page covers settings.toml
+#            (macOS ~/.warp_cli/settings.toml, Linux
+#            ~/.config/warp-terminal/cli/settings.toml), rules, skills, MCP
+#            servers and themes, but no shell-command hook file or event
+#            list, so no [hooks] or [hooks.wiring] table is declared: a
+#            warp pane has no hook lifecycle and runs on screen evidence
+#            only.
+#   screen   UNMEASURED. The docs name `>` as the agent-mode marker and
+#            `!` for shell mode, describe a status row below the input
+#            (model, cwd, branch, context) without quoting it, and quote
+#            "ctrl-c again to exit", which is an exit confirmation and not
+#            an idle proof. A bare `>` is too weak on its own, so no idle
+#            or working rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+
+[agent]
+id = "warp"
+display_name = "Warp Agent CLI"
+version_tested = "unverified"
+process_names = ["warp"]
+argv_basenames = ["warp"]
+launch = "warp"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Warp Agent CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

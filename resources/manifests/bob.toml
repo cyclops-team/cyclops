@@ -1,0 +1,81 @@
+# Cyclops detection manifest: IBM Bob Shell (IBM)
+# UNVERIFIED best effort from primary documentation, written 2026-09-05.
+# No bob binary was run and nothing was measured: this file binds the pane
+# and declares the documented hook contract and nothing more. Sources:
+#   https://bob.ibm.com/download/bobshell.sh        installer; `bob` executable
+#   IBM Bob Shell docs: hooks (settings/settings.json), interactive `bob chat`
+#
+# Sensor summary for this CLI:
+#   process  the installer places a `bob` executable; whether it is a native
+#            binary or an interpreter script is unmeasured. If binding
+#            fails, pin the pane: cyclops name %N <label> --manifest bob.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.bob/settings/settings.json (user) or <project>/.bob/
+#            settings.json, commands run via sh -c. Events are
+#            SessionStart, UserPromptSubmit, PreToolUse, PostToolUse and
+#            Stop. UserPromptSubmit is the candidate start and the dispatch
+#            ACK; the field carrying the prompt on UserPromptSubmit is not
+#            documented, so no ACK payload field is declared. Stop is the
+#            candidate end; no turn id ties Stop to its UserPromptSubmit.
+#            There is no Notification event, so no attention edge.
+#   screen   UNMEASURED. The docs describe a footer showing the mode
+#            (`Agent Mode`, with an optional `(auto-approve)` suffix),
+#            Context tokens with a percentage, and Cost. Only the mode
+#            label is quoted verbatim, so the rule below anchors on it
+#            alone; it is not lifecycle evidence because whether the footer
+#            changes mid-turn is unmeasured. No composer glyph is quoted,
+#            so no composer rule ships.
+
+[agent]
+id = "bob"
+display_name = "IBM Bob Shell"
+version_tested = "unverified"
+process_names = ["bob"]
+argv_basenames = ["bob"]
+launch = "bob chat"
+
+[hooks]
+config_mechanism = "hooks object in ~/.bob/settings/settings.json"
+available = [
+  "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.bob/settings/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for IBM Bob Shell."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "footer_agent_mode"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(8)"
+lifecycle_evidence = false
+line_regex = ['Agent Mode(\s*\(auto-approve\))?']
+note = """The documented footer names the mode as `Agent Mode`, optionally
+suffixed `(auto-approve)`. The Context and Cost cells are described but not
+quoted, so they are not anchored. UNMEASURED: whether the footer persists
+or changes mid-turn is unknown, which is why this is not lifecycle evidence
+and can neither confirm idle nor end a turn."""
+evidence = "DOCUMENTED only (IBM Bob Shell docs): footer mode label `Agent Mode` / `(auto-approve)`"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

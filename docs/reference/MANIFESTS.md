@@ -4,19 +4,21 @@ Everything cyclops knows about an agent CLI is one TOML file: which
 processes it runs as, how to tell working from idle by looking at the pane,
 and how to type into it. No code, no plugin, no wrapper around the CLI.
 
-Twelve ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
-on your first `cyclops start`. Five are measured against a live CLI:
-`claude.toml`, `codex.toml`, `agy.toml`, `cursor.toml`, `kimi.toml`. Seven
-are written from vendor documentation alone and say so with
-`version_tested = "unverified"`: `gemini.toml`, `qwen.toml`, `goose.toml`,
-`opencode.toml`, `amp.toml`, `crush.toml`, `aider.toml`. An unverified file
-binds the pane, declares the hook events the vendor documents, and carries
-no idle, working, or composer rule, so a doorbell to that pane never detects
-a human draft: it is written and submitted like a raw write with a receipt,
-until someone measures the composer and edits the file.
-Each header names its sources and what was and was not observed. Their
-source is [`resources/manifests/`](../../resources/manifests/). A
-thirteenth is three steps away.
+The shipped manifests are compiled into the `cyclops` binary and land in
+`~/.cyclops/manifests` on your first `cyclops start`. Five are measured
+against a live CLI: `claude.toml`, `codex.toml`, `agy.toml`, `cursor.toml`,
+`kimi.toml`. The rest are written from vendor documentation alone and say so
+with `version_tested = "unverified"`. An unverified file binds the pane,
+declares the hook events the vendor documents, and carries no measured
+composer rule, so a doorbell to that pane never detects a human draft: it is
+written and submitted like a raw write with a receipt, until someone
+measures the composer and edits the file. Each header names its sources and
+what was and was not observed. Their source is
+[`resources/manifests/`](../../resources/manifests/); the full list by tier
+is in [install.md](../guides/install.md). The next one is three steps away,
+and if the vendor documents a shell hook file, a `[hooks.wiring]` table in
+the same file is all it takes for `cyclops start --setup-only --wire-hooks`
+to wire it: no Rust names the vendor.
 
 ## Add one
 
@@ -224,6 +226,125 @@ inside it. Without them a doorbell settles on screen evidence, or on nothing
 at all, and the journal says which.
 
 Wiring the hooks on the CLI side is [hooks.md](hooks.md).
+
+## `[hooks.wiring]`: how Cyclops writes the hook file
+
+Optional. With it, `cyclops start --setup-only --wire-hooks` (and every
+later boot under that consent) writes the vendor's hook file itself, and
+`cyclops setup check`, `cyclops update`, and uninstall know the vendor.
+Without it, the manifest binds the pane and seeds the skill only. The eight
+vendors with a template under `resources/hooks/` carry no table; the loader
+refuses one there.
+
+| Key | What it does |
+|---|---|
+| `shape` | Required. The file format, one of the nine below. An unknown shape fails validation and the error names it and every known shape |
+| `file` | Required. `~/...` for a file in the home, or a relative path for a file in the project the CLI is started in. Never absolute: a manifest is shared between machines. The first directory under the home is what proves the vendor is installed (`~/.copilot/hooks/cyclops.json` needs `~/.copilot`; under `~/.config`, the vendor's own directory) |
+| `events` | Required table. Keys from `session_start`, `prompt_submit`, `stop`, `notification`, `permission_request`; each value is the vendor's own event name. Only the keys present are wired, and an unknown key is refused: a misspelled key would silently drop an edge |
+| `payload_prompt_field` | Optional. The field on the `prompt_submit` payload that carries the prompt text; needs `prompt_submit`. With it, and a matching `ack` and `ack_payload_field` in `[hooks]`, the vendor earns the exact hook receipt; without it the receipt floor is screen evidence |
+
+Every entry registers the same command, `cyclops hook <vendor event>`,
+with the binary's own path filled in at wire time. A second wire is a
+no-op, the operator's other keys and handlers survive, the original file is
+copied aside as `<file>.before-cyclops` before the first edit, and uninstall
+removes only Cyclops's entries (a file that held nothing else goes with
+them). A file that does not parse is left alone and the reason is printed.
+
+One example per shape, each as the file it produces for
+`prompt_submit = "UserPromptSubmit"` and `stop = "Stop"` (event names are
+the vendor's; Copilot's are camel-case, Hermes's are snake_case):
+
+`claude-settings`: a `hooks` object merged into a JSON settings file, Claude
+Code style. `file = "~/.adal/settings.json"`.
+
+```json
+{ "hooks": { "UserPromptSubmit": [ { "matcher": "", "hooks": [ { "type": "command", "command": "cyclops hook UserPromptSubmit", "timeout": 10 } ] } ],
+             "Stop": [ { "matcher": "", "hooks": [ { "type": "command", "command": "cyclops hook Stop", "timeout": 10 } ] } ] } }
+```
+
+`claude-hooks-file`: the same object as a file of its own.
+`file = "~/.grok/hooks/cyclops.json"`.
+
+`copilot`: GitHub Copilot CLI's versioned form, the command under `bash`.
+`file = "~/.copilot/hooks/cyclops.json"`.
+
+```json
+{ "version": 1, "hooks": { "userPromptSubmitted": [ { "type": "command", "bash": "cyclops hook userPromptSubmitted", "timeoutSec": 10 } ],
+                           "agentStop": [ { "type": "command", "bash": "cyclops hook agentStop", "timeoutSec": 10 } ] } }
+```
+
+`hermes-yaml`: a `hooks:` block in a YAML config, appended inside a
+`# cyclops:begin` / `# cyclops:end` fence, or placed under an existing
+bare `hooks:` key. `file = "~/.hermes/config.yaml"`.
+
+```yaml
+# cyclops:begin
+hooks:
+  on_session_start:
+    - command: "cyclops hook on_session_start"
+      timeout: 5
+# cyclops:end
+```
+
+`vibe-toml`: `[[hooks]]` tables in a TOML file, edited in place so the
+operator's comments and layout stay. `file = "~/.vibe/hooks.toml"`.
+
+```toml
+[[hooks]]
+name = "cyclops-post_agent"
+type = "post_agent"
+command = "cyclops hook post_agent"
+```
+
+`autohand`: entries in `hooks.hooks[]` of `config.json`.
+`file = "~/.autohand/config.json"`.
+
+```json
+{ "hooks": { "hooks": [ { "event": "pre-prompt", "command": "cyclops hook pre-prompt", "description": "Cyclops", "enabled": true },
+                        { "event": "stop", "command": "cyclops hook stop", "description": "Cyclops", "enabled": true } ] } }
+```
+
+`kiro-agent`: a `hooks` object in a Kiro agent JSON.
+`file = "~/.kiro/agents/cyclops.json"`.
+
+```json
+{ "hooks": { "userPromptSubmit": [ { "command": "cyclops hook userPromptSubmit" } ],
+             "stop": [ { "command": "cyclops hook stop" } ] } }
+```
+
+`tabnine`: Tabnine CLI's named command hooks.
+`file = "~/.tabnine/agent/settings.json"`.
+
+```json
+{ "hooks": { "BeforeAgent": [ { "hooks": [ { "type": "command", "command": "cyclops hook BeforeAgent", "name": "cyclops" } ] } ],
+             "AfterAgent": [ { "hooks": [ { "type": "command", "command": "cyclops hook AfterAgent", "name": "cyclops" } ] } ] } }
+```
+
+`openhands`: OpenHands' flat command entries. Its only documented file is
+repository-level, so a manifest using it names a relative `file`
+(`<project>/.openhands/hooks.json`), and setup leaves a project file to the
+operator.
+
+```json
+{ "hooks": { "UserPromptSubmit": [ { "command": "cyclops hook UserPromptSubmit", "timeout": 10 } ],
+             "Stop": [ { "command": "cyclops hook Stop", "timeout": 10 } ] } }
+```
+
+A complete table, from `copilot.toml`:
+
+```toml
+[hooks.wiring]
+shape = "copilot"
+file = "~/.copilot/hooks/cyclops.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "sessionStart"
+prompt_submit = "userPromptSubmitted"
+stop = "agentStop"
+notification = "notification"
+permission_request = "permissionRequest"
+```
 
 ## `[injection]`: how to type into it
 

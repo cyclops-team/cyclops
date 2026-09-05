@@ -1,0 +1,80 @@
+# Cyclops detection manifest: GitHub Copilot CLI
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No Copilot CLI was run and nothing was measured: this file binds the pane
+# and declares the documented hook contract and nothing more. Sources:
+#   https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks
+#   https://docs.github.com/en/copilot/reference/hooks-reference
+#   https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference
+#
+# Skills directory (skills.sh catalog key github-copilot): ~/.copilot/skills
+#
+# Sensor summary for this CLI:
+#   process  Copilot CLI ships as npm @github/copilot and as a Homebrew cask,
+#            so an npm install may leave "node" as the pane's foreground
+#            command (MEASURED for gemini, inferred here). "node" is not
+#            listed: it would claim every Node process. If the pane does not
+#            bind, pin it: cyclops name %N <label> --manifest copilot.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED: JSON files in ~/.copilot/hooks/ (or $COPILOT_HOME/
+#            hooks/), shape {"version":1,"hooks":{"event":[{"type":"command",
+#            "bash":"...","timeoutSec":10}]}}. userPromptSubmitted carries
+#            `prompt`, so it is the dispatch candidate and the ACK field.
+#            agentStop shares only `sessionId` with it, which is not a turn
+#            key, and it can re-fire (stop_hook_active), so no end is
+#            declared: the loader refuses a candidate end without
+#            turn_key_fields. agentStop is still wired for liveness.
+#   screen   UNMEASURED. The docs quote no prompt string ("Thinking" is
+#            mentioned while working, and Esc cancels), so no idle or
+#            working rule ships and deliveries fail closed (not write-ready)
+#            until someone measures the composer.
+
+[agent]
+id = "copilot"
+display_name = "GitHub Copilot CLI"
+version_tested = "unverified"
+process_names = ["copilot"]
+argv_basenames = ["copilot"]
+launch = "copilot"
+
+[hooks]
+config_mechanism = "JSON hook file in ~/.copilot/hooks/ (version 1, hooks object)"
+turn_start = "userPromptSubmitted"
+turn_start_evidence = "candidate"
+ack = "userPromptSubmitted"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "notification"
+available = [
+  "sessionStart", "sessionEnd", "userPromptSubmitted", "userPromptTransformed",
+  "preToolUse", "postToolUse", "postToolUseFailure", "preCompact", "agentStop",
+  "subagentStart", "subagentStop", "errorOccurred", "notification",
+  "permissionRequest",
+]
+
+[hooks.wiring]
+shape = "copilot"
+file = "~/.copilot/hooks/cyclops.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "sessionStart"
+prompt_submit = "userPromptSubmitted"
+stop = "agentStop"
+notification = "notification"
+permission_request = "permissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Copilot CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

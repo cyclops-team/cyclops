@@ -35,6 +35,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+# Vendors whose hook file is TOML ([hooks.wiring] shape vibe-toml) are
+# edited in place; toml_edit keeps the operator's comments and layout.
+toml_edit.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true

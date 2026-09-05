@@ -1,0 +1,74 @@
+# Cyclops detection manifest: Grok Build (xAI)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No Grok Build binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://github.com/xai-org/grok-build
+#   https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md
+#   https://docs.x.ai/build/overview
+#
+# Skills directory (skills.sh catalog key grok): ~/.grok/skills ($GROK_HOME)
+#
+# Sensor summary for this CLI:
+#   process  grok is a native binary (curl x.ai/cli/install.sh), so
+#            #{pane_current_command} is expected to read "grok" (inferred).
+#   title    UNMEASURED. The TUI is fullscreen (alternate screen).
+#   hooks    DOCUMENTED, Claude-shaped: ~/.grok/hooks/*.json and
+#            <project>/.grok/hooks/*.json hold {"hooks":{"Event":[{"matcher",
+#            "hooks":[{"type":"command","command","timeout"}]}]}}; grok also
+#            reads .claude/settings.json and .cursor/hooks.json. Every payload
+#            carries hookEventName, sessionId, cwd, workspaceRoot, timestamp,
+#            permissionMode and promptId, and UserPromptSubmit and Stop share
+#            promptId ("to correlate"), which is a turn-key candidate for a
+#            follow-up. The docs name NO field carrying the submitted prompt
+#            text, so no ACK field and therefore no candidate start is
+#            declared (a dispatch ACK needs a payload field). No end is
+#            declared either: a candidate end needs a measured settle window.
+#            The events are wired for liveness only.
+#   screen   UNMEASURED. The docs quote no prompt string (only "a status
+#            line at the bottom"), so no idle or working rule ships and
+#            deliveries fail closed (not write-ready) until someone measures
+#            the composer.
+
+[agent]
+id = "grok"
+display_name = "Grok Build"
+version_tested = "unverified"
+process_names = ["grok"]
+argv_basenames = ["grok"]
+launch = "grok"
+
+[hooks]
+config_mechanism = "Claude-shaped JSON hook file in ~/.grok/hooks/"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+  "PostToolUseFailure", "PermissionDenied", "Stop", "StopFailure",
+  "StopCancelled", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+  "Notification",
+]
+
+[hooks.wiring]
+shape = "claude-hooks-file"
+file = "~/.grok/hooks/cyclops.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Grok Build."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

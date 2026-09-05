@@ -1,0 +1,55 @@
+# Cyclops detection manifest: Cline CLI
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No cline binary was run and nothing was measured: this file binds the
+# pane and nothing more. Sources:
+#   https://docs.cline.bot/features/hooks/hook-reference
+#   https://github.com/cline/cline/blob/main/docs/usage/tui.mdx
+#   https://cline.bot/cli
+#
+# Skills directory (skills.sh catalog key cline): ~/.agents/skills
+#
+# HOOKS NOT WIRED. Cline runs executable files named after the event from
+# a hooks directory (--hooks-dir, default ~/.cline/hooks; or --hook-command
+# <script>) with JSON on stdin. The event names documented on the hook
+# reference come from the extension era (TaskStart, TaskResume,
+# UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, TaskComplete,
+# TaskCancel) and no document confirms which of them the CLI 2.x host
+# fires, nor the UserPromptSubmit payload field. A per-event executable is
+# also not one of the wiring shapes Cyclops generates. So no [hooks] table
+# and no wiring ships; wire ~/.cline/hooks by hand once the CLI events are
+# confirmed. This manifest binds the pane and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  cline is an npm package run by Node, so #{pane_current_command}
+#            is expected to read "node" (MEASURED for gemini, inferred here).
+#            "node" is not listed: it would claim every Node process. Pin
+#            the pane: cyclops name %N <label> --manifest cline.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The TUI doc shows a bare "› " prompt and describes
+#            a status area (model, context, cost, branch, Plan/Act state),
+#            neither a stable anchor, so no idle rule ships and deliveries
+#            fail closed (not write-ready).
+
+[agent]
+id = "cline"
+display_name = "Cline CLI"
+version_tested = "unverified"
+process_names = ["cline"]
+argv_basenames = ["cline"]
+launch = "cline"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Cline CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

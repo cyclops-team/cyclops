@@ -1,0 +1,55 @@
+# Cyclops detection manifest: Pi (earendil-works pi-coding-agent)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no pi binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md          editor, footer, keys
+#   https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md  in-process extension events
+#   https://www.npmjs.com/package/@earendil-works/pi-coding-agent
+#   skills.sh catalog row `pi`: skills directory ~/.pi/agent/skills
+#
+# Sensor summary for this CLI:
+#   process  pi is an npm package run by Node, so #{pane_current_command}
+#            is expected to read "node" (MEASURED for gemini, inferred
+#            here). "node" is not listed: it would claim every Node
+#            process. Until the daemon reads the script path behind an
+#            interpreter, pin the pane: cyclops name %N <label> --manifest pi.
+#   title    UNMEASURED.
+#   hooks    NONE as shell commands. Pi's events (`pi.on(event)`, e.g.
+#            project_trust, tool_call) are handled by in-process
+#            TypeScript extensions under ~/.pi/agent/extensions/ or
+#            .pi/extensions/, not by a file that runs a command, so no
+#            [hooks] or [hooks.wiring] table is declared. An extension
+#            that shells out to `cyclops` would be the vendor-side bridge;
+#            none ships here.
+#   screen   UNMEASURED. The README describes the editor (border colour
+#            shows the thinking level, the border animates while
+#            streaming) and the footer (cwd, session name, token counts
+#            with ↑ ↓ R W CH markers, cost, context, model) but quotes no
+#            exact row, so no idle or working rule ships and deliveries
+#            fail closed (not write-ready) until someone measures the
+#            composer.
+#   config   ~/.pi/agent/ (settings.json, extensions/, skills/, sessions/).
+
+[agent]
+id = "pi"
+display_name = "Pi"
+version_tested = "unverified"
+process_names = ["pi"]
+argv_basenames = ["pi"]
+launch = "pi"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Pi."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

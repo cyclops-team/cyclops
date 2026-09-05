@@ -1,0 +1,56 @@
+# Cyclops detection manifest: Loaf (veyzyn)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no loaf binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://github.com/veyzyn/loaf   Ink + React terminal assistant; /skills, /tools, /help, /quit
+#   skills.sh catalog row `loaf`: skills directory ~/.agents/skills
+#
+# Sensor summary for this CLI:
+#   process  ARGV UNVERIFIED. The README names the project `loaf` but
+#            launches it from a checkout with `npm run dev` and names no
+#            published package or installed command, so `loaf` below is
+#            the catalog pass's guess at the binary name, not a documented
+#            fact. It would be an Ink app run by Node in any case, so
+#            #{pane_current_command} is expected to read "node" (MEASURED
+#            for gemini, inferred here); "node" is not listed. Pin the
+#            pane: cyclops name %N <label> --manifest loaf. Two unrelated
+#            projects share the name: veyzyn/loaf (this one) and
+#            levifig/loaf, an agent harness for Claude Code that is not a
+#            CLI.
+#   title    UNMEASURED.
+#   hooks    NONE DOCUMENTED, so no [hooks] or [hooks.wiring] table is
+#            declared: a loaf pane has no hook lifecycle and runs on
+#            screen evidence only.
+#   screen   UNMEASURED. The README lists slash commands (/auth, /model,
+#            /skills, /tools, /clear, /help, /quit) but quotes no prompt
+#            glyph, status row, or working line, so no idle or working
+#            rule ships and deliveries fail closed (not write-ready) until
+#            someone measures the composer.
+#   config   ~/.loaf (skills/) per the catalog pass; the catalog's skills
+#            directory for the `loaf` key is ~/.agents/skills. Neither is
+#            named in the README.
+
+[agent]
+id = "loaf"
+display_name = "Loaf"
+version_tested = "unverified"
+# Unverified: see the process note above.
+process_names = ["loaf"]
+argv_basenames = ["loaf"]
+launch = "loaf"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Loaf."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

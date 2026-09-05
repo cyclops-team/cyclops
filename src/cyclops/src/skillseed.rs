@@ -201,15 +201,231 @@ fn combine(observations: impl IntoIterator<Item = Installation>) -> Installation
     }
 }
 
-/// Consumers that read the shared `~/.agents/skills` copy and take no hook
-/// wiring from Cyclops, so they have no `CliKind` and no catalog entry. Each
-/// counts as installed when its own config directory exists. Crush also
-/// reads ~/.config/agents/skills, ~/.config/crush/skills, and
-/// ~/.claude/skills, but the shared ~/.agents copy is the one it gets.
-const SKILL_ONLY_CONSUMERS: &[(&str, &str)] = &[
-    ("OpenCode", ".config/opencode"),
-    ("Amp", ".config/amp"),
-    ("Crush", ".config/crush"),
+/// Where a skill-only consumer keeps its skills.
+#[derive(Clone, Copy)]
+enum SkillDir {
+    /// The shared `~/.agents/skills` copy. Also the target for a vendor
+    /// that reads `~/.config/agents/skills`: one copy, because a vendor
+    /// that reads two of its skill roots warns about the duplicate.
+    Shared,
+    /// The vendor's own skills directory, home-relative.
+    Own(&'static str),
+}
+
+/// A consumer that takes the Cyclops skill and no hook wiring: no
+/// `CliKind`, no `[hooks.wiring]` table. Some ship a manifest (a terminal
+/// CLI with no shell hook); the rest are IDEs, desktop apps, and bots that
+/// read a skills directory of their own. Each counts as installed when
+/// `root` exists under the home.
+struct SkillOnly {
+    name: &'static str,
+    root: &'static str,
+    skills: SkillDir,
+}
+
+/// Every skill-only consumer. Skills directories are the skills.sh catalog's
+/// global entries (`~/.config` for its `configHome`); `root` is the vendor's
+/// documented configuration directory, or the skills directory's own parent
+/// when the vendor keeps no other. Crush also reads ~/.config/agents/skills,
+/// ~/.config/crush/skills, and ~/.claude/skills, but the shared ~/.agents
+/// copy is the one it gets.
+const SKILL_ONLY_CONSUMERS: &[SkillOnly] = &[
+    // Terminal CLIs with a manifest and no shell hook.
+    SkillOnly {
+        name: "OpenCode",
+        root: ".config/opencode",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "Amp",
+        root: ".config/amp",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "Crush",
+        root: ".config/crush",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "Cline CLI",
+        root: ".cline",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "CodeArts Agent",
+        root: ".codeartsdoer",
+        skills: SkillDir::Own(".codeartsdoer/skills"),
+    },
+    SkillOnly {
+        name: "Dexto",
+        root: ".dexto",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "ForgeCode",
+        root: ".forge",
+        skills: SkillDir::Own(".forge/skills"),
+    },
+    SkillOnly {
+        name: "Jazz",
+        root: ".jazz",
+        skills: SkillDir::Own(".jazz/skills"),
+    },
+    SkillOnly {
+        name: "Kilo CLI",
+        root: ".kilocode",
+        skills: SkillDir::Own(".kilocode/skills"),
+    },
+    SkillOnly {
+        name: "Kimchi",
+        root: ".config/kimchi",
+        skills: SkillDir::Own(".config/kimchi/harness/skills"),
+    },
+    SkillOnly {
+        name: "Kode",
+        root: ".kode",
+        skills: SkillDir::Own(".kode/skills"),
+    },
+    SkillOnly {
+        name: "Loaf",
+        root: ".loaf",
+        skills: SkillDir::Shared,
+    },
+    SkillOnly {
+        name: "MiniMax Code CLI",
+        root: ".minimax",
+        skills: SkillDir::Own(".minimax/skills"),
+    },
+    SkillOnly {
+        name: "Neovate",
+        root: ".neovate",
+        skills: SkillDir::Own(".neovate/skills"),
+    },
+    // OpenHands reads hooks from the repository only (.openhands/hooks.json),
+    // so it takes the skill and no user-level wiring.
+    SkillOnly {
+        name: "OpenHands CLI",
+        root: ".openhands",
+        skills: SkillDir::Own(".openhands/skills"),
+    },
+    SkillOnly {
+        name: "OpenClaw",
+        root: ".openclaw",
+        skills: SkillDir::Own(".openclaw/skills"),
+    },
+    SkillOnly {
+        name: "Pi",
+        root: ".pi/agent",
+        skills: SkillDir::Own(".pi/agent/skills"),
+    },
+    SkillOnly {
+        name: "Reasonix",
+        root: ".reasonix",
+        skills: SkillDir::Own(".reasonix/skills"),
+    },
+    SkillOnly {
+        name: "Rovo Dev",
+        root: ".rovodev",
+        skills: SkillDir::Own(".rovodev/skills"),
+    },
+    // Warp keeps its macOS settings here; Linux uses ~/.config/warp-terminal/cli.
+    SkillOnly {
+        name: "Warp Agent CLI",
+        root: ".warp_cli",
+        skills: SkillDir::Shared,
+    },
+    // IDEs, desktop apps, and bots with a global skills directory.
+    SkillOnly {
+        name: "AiderDesk",
+        root: ".aider-desk",
+        skills: SkillDir::Own(".aider-desk/skills"),
+    },
+    SkillOnly {
+        name: "AstrBot",
+        root: ".astrbot",
+        skills: SkillDir::Own(".astrbot/data/skills"),
+    },
+    SkillOnly {
+        name: "Codemaker",
+        root: ".codemaker",
+        skills: SkillDir::Own(".codemaker/skills"),
+    },
+    SkillOnly {
+        name: "Code Studio",
+        root: ".codestudio",
+        skills: SkillDir::Own(".codestudio/skills"),
+    },
+    SkillOnly {
+        name: "Firebender",
+        root: ".firebender",
+        skills: SkillDir::Own(".firebender/skills"),
+    },
+    SkillOnly {
+        name: "inference.sh",
+        root: ".inferencesh",
+        skills: SkillDir::Own(".inferencesh/skills"),
+    },
+    SkillOnly {
+        name: "Lingma",
+        root: ".lingma",
+        skills: SkillDir::Own(".lingma/skills"),
+    },
+    SkillOnly {
+        name: "MCPJam",
+        root: ".mcpjam",
+        skills: SkillDir::Own(".mcpjam/skills"),
+    },
+    SkillOnly {
+        name: "Moxby",
+        root: ".moxby",
+        skills: SkillDir::Own(".moxby/skills"),
+    },
+    SkillOnly {
+        name: "Mux",
+        root: ".mux",
+        skills: SkillDir::Own(".mux/skills"),
+    },
+    SkillOnly {
+        name: "Ona",
+        root: ".ona",
+        skills: SkillDir::Own(".ona/skills"),
+    },
+    SkillOnly {
+        name: "Pochi",
+        root: ".pochi",
+        skills: SkillDir::Own(".pochi/skills"),
+    },
+    SkillOnly {
+        name: "Terramind",
+        root: ".terramind",
+        skills: SkillDir::Own(".terramind/skills"),
+    },
+    SkillOnly {
+        name: "Trae",
+        root: ".trae",
+        skills: SkillDir::Own(".trae/skills"),
+    },
+    SkillOnly {
+        name: "Windsurf",
+        root: ".codeium/windsurf",
+        skills: SkillDir::Own(".codeium/windsurf/skills"),
+    },
+    SkillOnly {
+        name: "ZCode",
+        root: ".zcode",
+        skills: SkillDir::Own(".zcode/skills"),
+    },
+    // Zenflow is Zencoder's product and reads the same directory: one entry.
+    SkillOnly {
+        name: "Zencoder",
+        root: ".zencoder",
+        skills: SkillDir::Own(".zencoder/skills"),
+    },
+    SkillOnly {
+        name: "Zed",
+        root: ".config/zed",
+        skills: SkillDir::Shared,
+    },
 ];
 
 /// One consumer's claim on a skill path: its name, the directory that proves
@@ -225,6 +441,12 @@ struct Member {
 /// one target, so the writer and the read-only plan cannot drift into two
 /// copies of one skill.
 fn targets(home: &Path) -> Vec<SkillTarget> {
+    targets_with(home, crate::wiring::catalog())
+}
+
+/// [`targets`] over an explicit vendor catalog, so a test can see a vendor
+/// the binary does not carry yet.
+fn targets_with(home: &Path, catalog: &[crate::wiring::Consumer]) -> Vec<SkillTarget> {
     let mut groups: Vec<(crate::consumer::AssetLocation, Vec<Member>)> = Vec::new();
     let mut claim =
         |location: crate::consumer::AssetLocation, name: &'static str, root: PathBuf| {
@@ -242,12 +464,16 @@ fn targets(home: &Path) -> Vec<SkillTarget> {
         let locations = spec.locations(home);
         claim(locations.skill, spec.skill_name, locations.install_root);
     }
-    for (name, root) in SKILL_ONLY_CONSUMERS {
-        claim(
-            crate::consumer::shared_agents_skill(home),
-            name,
-            home.join(root),
-        );
+    for consumer in SKILL_ONLY_CONSUMERS {
+        let location = match consumer.skills {
+            SkillDir::Shared => crate::consumer::shared_agents_skill(home),
+            SkillDir::Own(skills) => crate::consumer::skill_location(home, consumer.root, skills),
+        };
+        claim(location, consumer.name, home.join(consumer.root));
+    }
+    for consumer in catalog {
+        let locations = consumer.locations(home);
+        claim(locations.skill, consumer.name, locations.install_root);
     }
     groups
         .into_iter()
@@ -998,6 +1224,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The catalog's one-path-one-name rule. Every seed target is a path
+    /// under the home, absolute, ending in Cyclops's own leaf; a path that
+    /// is not the shared copy belongs to exactly one consumer, so no two
+    /// entries can name one directory differently and each report line
+    /// says whose file it is.
+    #[test]
+    fn every_skill_target_is_one_vendors_path_under_the_home() {
+        let home = Path::new("/home/op");
+        let catalog = crate::wiring::repo_catalog();
+        let targets = targets_with(home, &catalog);
+        let shared = crate::consumer::shared_agents_skill(home);
+        assert!(targets.len() > 40, "{}", targets.len());
+        for target in &targets {
+            let path = target.location.path();
+            assert!(
+                path.is_absolute() && path.starts_with(home),
+                "{}",
+                path.display()
+            );
+            assert!(
+                path.ends_with("skills/cyclops/SKILL.md"),
+                "{}",
+                path.display()
+            );
+            assert!(target.location.root.starts_with(home));
+            assert_ne!(
+                target.location.root, home,
+                "the home itself is no consumer root"
+            );
+            for root in &target.installation_roots {
+                assert!(
+                    root.starts_with(home) && *root != home,
+                    "{}",
+                    root.display()
+                );
+            }
+            if target.location != shared {
+                assert_eq!(
+                    target.installation_roots.len(),
+                    1,
+                    "{} is claimed by more than one consumer",
+                    path.display()
+                );
+            }
+        }
+        let mut names: Vec<&str> = SKILL_ONLY_CONSUMERS.iter().map(|c| c.name).collect();
+        names.extend(catalog.iter().map(|c| c.name));
+        names.extend(crate::consumer::SHIPPED.iter().map(|s| s.skill_name));
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "a consumer name is listed twice");
+        let mut roots: Vec<PathBuf> = SKILL_ONLY_CONSUMERS
+            .iter()
+            .map(|c| home.join(c.root))
+            .collect();
+        roots.extend(catalog.iter().map(|c| c.locations(home).install_root));
+        let count = roots.len();
+        roots.sort_unstable();
+        roots.dedup();
+        assert_eq!(roots.len(), count, "one directory proves two consumers");
     }
 
     #[test]

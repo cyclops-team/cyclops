@@ -718,6 +718,22 @@ pub(crate) fn run_remove_integrations(prefix: &Path) -> i32 {
             }
         }
     }
+    for consumer in crate::wiring::catalog() {
+        match crate::wiring::unwire(consumer) {
+            Ok(Some(result)) if result.removed => {
+                println!(
+                    "removed Cyclops {} hooks from {}",
+                    result.vendor,
+                    result.path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failed = true;
+                eprintln!("uninstall left vendor configuration unchanged: {error}");
+            }
+        }
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(home) = home {
         for result in crate::skillseed::remove_owned(&home) {

@@ -136,6 +136,28 @@ pub(crate) fn shared_agents_skill(user_home: &Path) -> AssetLocation {
     }
 }
 
+/// A vendor's own skills directory as a seed target. When the skills
+/// directory sits below the directory that proves the vendor is installed,
+/// that directory is the root and the skill leaf is created below it, the
+/// way `~/.claude/skills/cyclops/SKILL.md` is; otherwise the skills
+/// directory itself must already exist and is the root.
+pub(crate) fn skill_location(
+    user_home: &Path,
+    install_dir: &str,
+    skills_dir: &str,
+) -> AssetLocation {
+    match Path::new(skills_dir).strip_prefix(install_dir) {
+        Ok(rest) if !rest.as_os_str().is_empty() => AssetLocation {
+            root: user_home.join(install_dir),
+            relative: rest.join("cyclops/SKILL.md"),
+        },
+        _ => AssetLocation {
+            root: user_home.join(skills_dir),
+            relative: PathBuf::from("cyclops/SKILL.md"),
+        },
+    }
+}
+
 pub(crate) fn spec(kind: CliKind) -> &'static Spec {
     SHIPPED
         .iter()
