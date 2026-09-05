@@ -1,4 +1,18 @@
-//! Gating state machine, composer eligibility, holds, and receipt verification.
+//! The delivery gate, the one write it admits, and the receipt that follows.
+//!
+//! Ordinary doorbell delivery writes one line and presses Enter for a bound,
+//! live agent process unless a human draft is positively observed or a named
+//! block is present (modal, permission, quota, dead, copy-mode, durable
+//! composer hold). Ambiguous or absent composer evidence does not hold a
+//! doorbell. A raw send bypasses the composer check entirely and is recorded
+//! as an unverified write. Uncertainty is recorded, never retried
+//! automatically.
+//!
+//! [`gate`] is the first half of that sentence and [`attempt_delivery`] the
+//! second; everything after them decides what the journal says the write
+//! proved.
+
+use std::borrow::Cow;
 
 use super::*;
 
@@ -47,46 +61,107 @@ impl<'a> Step<'a> {
     }
 }
 
+/// Why the gate is holding a notification instead of writing.
+///
+/// Rendered to the same journal strings older readers already parse (the
+/// CLI and `cyclops-ui` map them to words), so a reader of a 1.0 ledger and
+/// a 1.1 ledger sees one vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HoldCause {
+    /// The session's control connection is down.
+    SessionDetached,
+    NoSuchPane,
+    PaneDead,
+    /// The human is reading their own scrollback; a paste now lands where
+    /// neither side can see it.
+    PaneInMode,
+    NoManifest,
+    /// Nothing proved that the pane's foreground process is the bound agent.
+    BindingUnprovable,
+    /// The agent handed the terminal to a tool: keystrokes would land in
+    /// the tool, not the agent.
+    ForegroundNotAgent,
+    /// The occupant changed between the gate's proof and the write.
+    BindingChanged,
+    /// A human draft was positively observed, or a doorbell an earlier
+    /// attempt staged has not been consumed yet.
+    ComposerHold,
+    BlockedQuota,
+    /// A modal or permission prompt the manifest does not dismiss on its
+    /// own; the rule id names it.
+    Blocked(String),
+    /// Another attempt claimed this pane's composer between the gate's
+    /// verdict and the write.
+    BarrierHeld,
+}
+
+impl HoldCause {
+    /// The gate ledger line's cause, exact for diagnostics.
+    pub(crate) fn journal(&self) -> Cow<'static, str> {
+        match self {
+            Self::SessionDetached => "session_detached".into(),
+            Self::NoSuchPane => "no_such_pane".into(),
+            Self::PaneDead => "pane_dead".into(),
+            Self::PaneInMode => "pane_in_mode".into(),
+            Self::NoManifest => "no_manifest".into(),
+            Self::BindingUnprovable => "occupant_unprovable".into(),
+            Self::ForegroundNotAgent => "foreground_not_agent".into(),
+            Self::BindingChanged => "binding_changed".into(),
+            Self::ComposerHold => "composer_hold".into(),
+            Self::BlockedQuota => "blocked_quota".into(),
+            Self::Blocked(rule) => format!("blocked:{rule}").into(),
+            Self::BarrierHeld => "barrier_held".into(),
+        }
+    }
+
+    /// The normalized `held_by` token a receipt carries. Vendor rule ids
+    /// stay on the ledger line; receipts expose only this closed set.
+    pub(crate) fn receipt_token(&self) -> &'static str {
+        match self {
+            Self::SessionDetached => "session_detached",
+            Self::PaneInMode => "pane_in_mode",
+            Self::ComposerHold => "held_for_existing_draft",
+            Self::BlockedQuota => "blocked_quota",
+            Self::Blocked(_) => "blocked",
+            Self::NoSuchPane
+            | Self::PaneDead
+            | Self::NoManifest
+            | Self::BindingUnprovable
+            | Self::ForegroundNotAgent
+            | Self::BindingChanged
+            | Self::BarrierHeld => "unknown",
+        }
+    }
+}
+
 /// The bytes one attempt writes, fixed at the write boundary.
 pub(crate) struct AttemptPayload {
     pub(crate) bytes: String,
-    pub(crate) doorbell_format: u32,
+    pub(crate) transport: NotificationTransport,
+    pub(crate) doorbell_format: Option<u32>,
 }
 
-impl AttemptPayload {
-    pub(crate) fn required_pane_width(&self) -> Option<u32> {
-        None
-    }
-}
-
-/// Refuse the write when the pane cannot carry the selected row. Both
-/// pre-write bookends use this exact check.
-pub(crate) fn notification_prewrite_bookend(
-    selected: &AttemptPayload,
-    pane_width: u32,
-) -> Option<String> {
-    if selected
-        .required_pane_width()
-        .is_some_and(|required| pane_width < required)
-    {
-        return Some(format!("pane_too_narrow:{pane_width}"));
-    }
-    None
-}
-
-/// The one line pasted into the recipient pane: the sender label, the
+/// What one attempt pastes: the Format 4 doorbell (the sender label, the
 /// sender-authored or daemon-derived summary, and the exact attempt claim
-/// command (Format 4).
+/// command), or for a raw send the whole rendered message.
 pub(crate) fn select_attempt_payload(
     handle: &DeliveryHandle,
 ) -> Result<AttemptPayload, NotificationAdapterError> {
     let notification = &handle.notification;
     let message = notification.message_line()?;
+    if handle.raw {
+        return Ok(AttemptPayload {
+            bytes: render_canonical_message_payload(&message),
+            transport: NotificationTransport::Raw,
+            doorbell_format: None,
+        });
+    }
     let bytes = render_summary_doorbell(&message, notification.attempt_id())
         .ok_or(NotificationAdapterError::MessageMissing)?;
     Ok(AttemptPayload {
         bytes,
-        doorbell_format: cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM,
+        transport: NotificationTransport::Doorbell,
+        doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM),
     })
 }
 
@@ -115,10 +190,10 @@ fn render_summary_doorbell(
 
 /// Rebuild the exact payload selected at this notification's write boundary.
 ///
-/// Delivery recovery and composer projection share this owner so a transport
-/// format cannot be actionable in one path and unprovable in the other. Every
-/// format an older daemon wrote stays rebuildable for replay and attention
-/// reads; only Format 4 is written now.
+/// The composer projection and the hook prompt matcher share this owner so a
+/// transport format cannot be actionable in one path and unprovable in the
+/// other. Every format an older daemon wrote stays rebuildable for replay;
+/// only Format 4 and raw are written now.
 pub(crate) fn expected_notification_payload(
     record: &cyclops_proto::NotificationRecord,
     message: &LedgerLine,
@@ -143,10 +218,10 @@ pub(crate) fn expected_notification_payload(
             }
             Some(_) => None,
         },
-        (NotificationTransport::DirectPayload, None) => {
+        (NotificationTransport::DirectPayload | NotificationTransport::Raw, None) => {
             Some(render_canonical_message_payload(message))
         }
-        (NotificationTransport::DirectPayload, Some(_)) => None,
+        (NotificationTransport::DirectPayload | NotificationTransport::Raw, Some(_)) => None,
     }
 }
 
@@ -154,7 +229,7 @@ pub(crate) fn expected_notification_payload(
 pub(crate) enum HandleRoute {
     Exact(Arc<SessionWatcher>),
     BindingChanged,
-    BindingUnprovable { pane_pid: i32 },
+    BindingUnprovable,
     Unavailable,
 }
 
@@ -197,14 +272,10 @@ pub(crate) fn handle_route(inner: &Inner, handle: &DeliveryHandle) -> HandleRout
         return HandleRoute::Unavailable;
     };
     let Some(root) = crate::identity::ProcId::of(row.pane_pid) else {
-        return HandleRoute::BindingUnprovable {
-            pane_pid: row.pane_pid,
-        };
+        return HandleRoute::BindingUnprovable;
     };
     let Ok(pane_root) = ProcessInstanceId::new(root.pid, root.birth) else {
-        return HandleRoute::BindingUnprovable {
-            pane_pid: row.pane_pid,
-        };
+        return HandleRoute::BindingUnprovable;
     };
     let registry = inner.registry.lock().expect("registry lock");
     if registry.for_route(recipient, pane_root).is_some() {
@@ -212,9 +283,7 @@ pub(crate) fn handle_route(inner: &Inner, handle: &DeliveryHandle) -> HandleRout
     } else if registry.for_recipient(recipient).is_some() {
         HandleRoute::BindingChanged
     } else {
-        HandleRoute::BindingUnprovable {
-            pane_pid: row.pane_pid,
-        }
+        HandleRoute::BindingUnprovable
     }
 }
 
@@ -225,27 +294,9 @@ pub(crate) fn watcher_for_handle(
 ) -> Option<Arc<SessionWatcher>> {
     match handle_route(inner, handle) {
         HandleRoute::Exact(watcher) => Some(watcher),
-        HandleRoute::BindingChanged
-        | HandleRoute::BindingUnprovable { .. }
-        | HandleRoute::Unavailable => None,
-    }
-}
-
-/// Resolve the route for a write that has not crossed the terminal boundary.
-pub(crate) fn exact_prewrite_watcher(
-    inner: &Inner,
-    handle: &DeliveryHandle,
-    manifest_id: &str,
-) -> Result<Arc<SessionWatcher>, AttemptFailure> {
-    match handle_route(inner, handle) {
-        HandleRoute::Exact(watcher) => Ok(watcher),
-        HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
-        HandleRoute::BindingUnprovable { pane_pid } => {
-            Err(AttemptFailure::binding_unprovable(Some(
-                binding_unprovable_observation(inner, handle, pane_pid, manifest_id),
-            )))
+        HandleRoute::BindingChanged | HandleRoute::BindingUnprovable | HandleRoute::Unavailable => {
+            None
         }
-        HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
     }
 }
 
@@ -286,13 +337,15 @@ pub(crate) fn advance(
     // either the vendor acknowledged this message, or the marker left the
     // composer and a turn started. Send-keys returning Ok proves neither.
     // tmux accepting the key says nothing about what the vendor did with
-    // it, and a swallowed Enter leaves the payload staged, which is the
-    // staged-never-sent class this whole unit exists for.
+    // it, and a swallowed Enter leaves the payload staged.
     //
     // Only the FIRST resolution promotes. The unverified-to-verified
     // upgrade is the same consumption arriving twice, and re-marking it
     // would push the mark past a turn-end edge that has already arrived.
+    // A resolution with no verifier proved nothing about the composer and
+    // settles no hold; its caller releases the barrier outright.
     let first_receipt = from == DeliveryState::Submitted
+        && step.verified_by.is_some()
         && matches!(
             step.next,
             DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
@@ -352,45 +405,6 @@ pub(crate) fn gate_line(
     );
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegateAction {
-    ImmediateReproof,
-    Hold,
-    BlockPreWrite,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegateCause {
-    BarrierHeld,
-    BindingChanged,
-}
-
-/// A held composer waits for its owner to release it. A binding race
-/// receives one immediate re-proof per exact evidence generation.
-pub(crate) fn regate_action(handle: &DeliveryHandle, cause: RegateCause) -> RegateAction {
-    let mut state = handle.state.lock().expect("handle state lock");
-    state.regates = state.regates.saturating_add(1);
-    match cause {
-        RegateCause::BarrierHeld => RegateAction::Hold,
-        RegateCause::BindingChanged => {
-            if state.regate_reproof_used {
-                RegateAction::BlockPreWrite
-            } else {
-                state.regate_reproof_used = true;
-                RegateAction::ImmediateReproof
-            }
-        }
-    }
-}
-
-pub(crate) fn reset_immediate_regates(handle: &DeliveryHandle) {
-    handle
-        .state
-        .lock()
-        .expect("handle state lock")
-        .regate_reproof_used = false;
-}
-
 pub(crate) enum AttemptOutcome {
     /// Delivery resolved (verified, unverified, or matcher-resolved).
     Done,
@@ -416,7 +430,9 @@ pub(crate) struct AttemptFailure {
     pub(crate) cause: String,
     pub(crate) boundary: WriteBoundary,
     pub(crate) pre_write_block: Option<Box<PreWriteBlock>>,
-    pub(crate) verify_outcome: Option<NotificationVerifyOutcome>,
+    /// Set when the failure is readiness moving under a delivery that had
+    /// not written anything: it goes back to the gate, not to the budget.
+    pub(crate) regate: Option<HoldCause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,7 +453,16 @@ impl AttemptFailure {
                 cause: block,
                 observation: None,
             })),
-            verify_outcome: None,
+            regate: None,
+        }
+    }
+
+    fn after_write(cause: impl Into<String>) -> Self {
+        Self {
+            cause: cause.into(),
+            boundary: WriteBoundary::AfterWrite,
+            pre_write_block: None,
+            regate: None,
         }
     }
 
@@ -469,75 +494,15 @@ impl AttemptFailure {
         )
     }
 
-    /// The pane's manifest requires hook liveness and no admitting edge has
-    /// been published for its current binding. Carries the observation so
-    /// the durable block names the exact binding and the block itself.
-    pub(crate) fn hook_admission_unproven(
-        observation: Option<NotificationPreWriteObservation>,
-    ) -> Self {
-        Self {
-            cause: HOOK_ADMISSION_UNPROVEN.into(),
-            boundary: WriteBoundary::BeforeWrite,
-            pre_write_block: Some(Box::new(PreWriteBlock {
-                cause: NotificationPreWriteCause::WriteReadinessChanged,
-                observation,
-            })),
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn binding_unprovable(observation: Option<NotificationPreWriteObservation>) -> Self {
-        Self {
-            cause: "binding_unprovable".into(),
-            boundary: WriteBoundary::BeforeWrite,
-            pre_write_block: Some(Box::new(PreWriteBlock {
-                cause: NotificationPreWriteCause::BindingUnprovable,
-                observation,
-            })),
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn pane_too_narrow(mut observation: NotificationPreWriteObservation) -> Self {
-        observation.required_pane_width = Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH);
-        Self {
-            cause: "pane_too_narrow".into(),
-            boundary: WriteBoundary::BeforeWrite,
-            pre_write_block: Some(Box::new(PreWriteBlock {
-                cause: NotificationPreWriteCause::WriteReadinessChanged,
-                observation: Some(observation),
-            })),
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn composer_ownership_unproven() -> Self {
-        Self::blocked_before_write(
-            "composer_ownership_unproven",
-            NotificationPreWriteCause::ComposerOwnershipUnproven,
-        )
-    }
-
-    /// Does this failure belong back at the gate rather than in the
-    /// retry budget? True only where the cause is readiness moving under
-    /// a delivery that had not yet written anything.
-    pub(crate) fn regate_cause(&self) -> Option<RegateCause> {
-        match self.cause.as_str() {
-            "barrier_held" => Some(RegateCause::BarrierHeld),
-            "binding_changed" => Some(RegateCause::BindingChanged),
-            _ => None,
-        }
-    }
-
     /// The composer barrier was not this attempt's to take: somebody
     /// else's payload or a person's typing is in there. Nothing was
     /// written, so this returns to the gate.
     pub(crate) fn barrier_held() -> Self {
         Self {
-            cause: "barrier_held".into(),
+            cause: HoldCause::BarrierHeld.journal().into_owned(),
             boundary: WriteBoundary::BeforeWrite,
             pre_write_block: None,
-            verify_outcome: None,
+            regate: Some(HoldCause::BarrierHeld),
         }
     }
 
@@ -553,109 +518,21 @@ impl AttemptFailure {
     }
 
     pub(crate) fn paste_failed() -> Self {
-        Self {
-            cause: "paste_failed".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn verify_failed() -> Self {
-        Self::verify_failed_with(NotificationVerifyOutcome::ambiguous())
-    }
-
-    pub(crate) fn verify_failed_with(verify_outcome: NotificationVerifyOutcome) -> Self {
-        Self {
-            cause: "verify_failed".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: Some(verify_outcome),
-        }
-    }
-
-    pub(crate) fn verify_timeout() -> Self {
-        Self::verify_failed_with(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::Timeout,
-            observed_composer: ComposerState::ComposerAmbiguous,
-        })
-    }
-
-    pub(crate) fn verify_mismatch(observed_composer: ComposerState) -> Self {
-        Self::verify_failed_with(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::Mismatch,
-            observed_composer,
-        })
-    }
-
-    pub(crate) fn verify_owner_missing(observed_composer: ComposerState) -> Self {
-        Self::verify_failed_with(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::OwnerMissing,
-            observed_composer,
-        })
+        Self::after_write("paste_failed")
     }
 
     pub(crate) fn pane_rebound_after_paste() -> Self {
-        Self {
-            cause: "pane_rebound_after_paste".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
+        Self::after_write("pane_rebound_after_paste")
     }
 
     pub(crate) fn submit_failed() -> Self {
-        Self {
-            cause: "submit_failed".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
-    }
-
-    /// The pane changed hands after Enter. Terminal, and after the write
-    /// boundary: the original occupant may well have received the message,
-    /// so this says the outcome is unknown rather than claiming a failure.
-    pub(crate) fn receipt_occupant_changed() -> Self {
-        Self {
-            cause: "receipt_occupant_changed".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn ack_timeout() -> Self {
-        Self {
-            cause: "ack_timeout".into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
+        Self::after_write("submit_failed")
     }
 
     /// The durable boundary could not be advanced after the attempt crossed it.
     /// Retrying could duplicate a notification whose append outcome is unknown.
     pub(crate) fn notification_record_failed() -> Self {
-        Self {
-            cause: NOTIFICATION_RECORD_FAILED.into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn claimed_staged_settlement_failed() -> Self {
-        Self {
-            cause: CLAIMED_STAGED_SETTLEMENT_FAILED.into(),
-            boundary: WriteBoundary::AfterWrite,
-            pre_write_block: None,
-            verify_outcome: None,
-        }
-    }
-
-    pub(crate) fn faults_notification_worker(&self) -> bool {
-        self.cause == CLAIMED_STAGED_SETTLEMENT_FAILED
+        Self::after_write(NOTIFICATION_RECORD_FAILED)
     }
 
     /// Map the injector's closed set of pre-submit causes to the semantic
@@ -664,55 +541,32 @@ impl AttemptFailure {
     pub(crate) fn from_inject(cause: String) -> Self {
         match cause.as_str() {
             "spool_failed" => Self::spool_failed(),
-            // The barrier refused before anything was written, so this is
-            // readiness changing between the proof and the write, not a
-            // transport failure. It goes back to the gate rather than to
-            // a human.
             "barrier_held" => Self::barrier_held(),
-            "prewrite_session_detached" => Self::session_detached(),
-            "prewrite_binding_unprovable" => Self::binding_unprovable(None),
-            "composer_ownership_unproven" => Self::composer_ownership_unproven(),
-            // The pane's binding moved between the proof and the write.
-            // Nothing was written, and re-proving it is the gate's job.
-            "binding_changed" => Self {
-                cause,
-                boundary: WriteBoundary::BeforeWrite,
-                pre_write_block: None,
-                verify_outcome: None,
-            },
             "paste_failed" => Self::paste_failed(),
-            "verify_failed" => Self::verify_failed(),
             NOTIFICATION_RECORD_FAILED => Self::notification_record_failed(),
-            _ => Self {
-                cause,
-                boundary: WriteBoundary::AfterWrite,
-                pre_write_block: None,
-                verify_outcome: None,
-            },
+            _ => Self::after_write(cause),
         }
     }
 }
 
-/// One injection attempt: paste, verify, submit, wait for an ACK tier.
+/// One doorbell write, in the order the steps must run.
 ///
-/// The gate's admitting snapshot is re-checked against the live pane table.
-/// The irreversible write and submit bookends require the same pane-root,
-/// terminal leader, and admitted agent generations plus the same manifest. A
-/// replacement occupant must never receive the payload or Enter.
+/// The gate proved `proven` a moment ago. That moment is over by the time
+/// the paste command goes out, so the occupant is re-read once before the
+/// paste and once before Enter, by the same function, and nothing else is
+/// re-proven in between: a second look at the composer cannot make a paste
+/// not have happened, so Enter follows whatever the read-back said and the
+/// journal records what was seen.
 pub(crate) async fn attempt_delivery(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
-    manifest_id: &str,
-    admitted_pid: i32,
+    proven: &fusion::Binding,
 ) -> AttemptOutcome {
-    // This capability belongs only to the capture immediately before this
-    // attempt's paste. A later retry must earn it again from fresh evidence.
-    handle.set_working_clean_submit_admitted(false);
-    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
-        Ok(watcher) => watcher,
-        Err(failure) => return AttemptOutcome::Failed(failure),
+    // 1. The route and the rules the gate admitted under.
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
     };
-    let Some(manifest) = inner.manifests.get(manifest_id) else {
+    let Some(manifest) = inner.manifests.get(&proven.manifest) else {
         return AttemptOutcome::Failed(AttemptFailure::no_manifest());
     };
     let injector = TmuxInjector {
@@ -723,9 +577,10 @@ pub(crate) async fn attempt_delivery(
             inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
         ),
     };
-    let observed = watcher
-        .pane(&handle.pane_id)
-        .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
+    // 2. The bytes, spooled BEFORE the occupant check. Loading the buffer
+    //    costs a control round trip, and a round trip is time a person can
+    //    type that no later capture would see; spooling touches no pane, so
+    //    it goes first and the check stays the last thing before the write.
     let selected = match select_attempt_payload(handle) {
         Ok(selected) => selected,
         Err(error) => {
@@ -733,204 +588,22 @@ pub(crate) async fn attempt_delivery(
             return AttemptOutcome::Failed(AttemptFailure::payload_unavailable());
         }
     };
-    handle.set_attempt_payload(
-        selected.bytes.clone(),
-        Some(NotificationTransport::Doorbell),
-    );
-    // Spooled FIRST, and deliberately before the pause and the proof
-    // below. Loading the buffer costs a control round trip, and a round
-    // trip is time a person can type into the composer that no capture
-    // afterwards would see, because the proof would already be behind it.
-    // Spooling touches no pane, so moving it earlier costs nothing and
-    // leaves the admitting capture as the last thing before the write.
-    // What remains between the proof and the paste is the command
-    // envelope itself, which is irreducible.
+    handle.set_attempt_payload(selected.bytes.clone(), Some(selected.transport));
     if let Err(cause) = injector.spool(&selected.bytes).await {
         return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
     }
     inject_pause(inner, "pre_paste").await;
-    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
-        Ok(watcher) => watcher,
-        Err(failure) => {
-            injector.discard().await;
-            if failure.cause == "pane_rebound" {
-                gate_line(
-                    inner,
-                    handle,
-                    "rebound",
-                    None,
-                    Some("route_binding_changed"),
-                );
-            }
-            return AttemptOutcome::Failed(failure);
-        }
-    };
-    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
+    // 3. The one pre-paste occupant check.
+    if let Err(detail) = occupant_unchanged(inner, handle, proven) {
         injector.discard().await;
-        gate_line(inner, handle, "rebound", None, Some(&detail));
-        let failure = if detail == "pane_gone" {
-            AttemptFailure::session_detached()
-        } else {
-            AttemptFailure::pane_rebound_before_paste()
-        };
-        return AttemptOutcome::Failed(failure);
+        gate_line(inner, handle, "rebound", None, Some(&detail.journal()));
+        return AttemptOutcome::Failed(rebound_before_paste(detail));
     }
-    // The gate's clean-composer evidence was current when it admitted, and
-    // admission is a decision about a moment. A person can start typing in
-    // the gap that follows, and the occupant re-check above would not
-    // notice: same pane, same pid, same manifest, new draft. So the
-    // readiness rule is asked again here, against a capture taken now,
-    // immediately before the write that cannot be taken back.
-    match crate::observe_pane(
-        inner,
-        handle.session_idx,
-        &watcher,
-        &handle.pane_id,
-        true,
-        "pre_paste",
-    )
-    .await
-    {
-        Some(det) => {
-            // A positive human draft remains a hard boundary. For an
-            // authenticated idle or working agent, however, an unreadable
-            // composer is not a reason to strand a durable doorbell after
-            // the gate already admitted the same live occupant.
-            let unproven_composer_is_still_eligible =
-                watcher.pane(&handle.pane_id).is_some_and(|row| {
-                    notification_pane_for_unproven_composer(inner, handle, &row, manifest_id, &det)
-                        .is_some()
-                });
-            if !det.write_ready && !unproven_composer_is_still_eligible {
-                let reason = det.write_block.as_deref().unwrap_or("unstamped");
-                gate_line(
-                    inner,
-                    handle,
-                    "hold",
-                    None,
-                    Some(&format!("not_write_ready:{reason}")),
-                );
-                injector.discard().await;
-                if reason == HOOK_ADMISSION_UNPROVEN {
-                    // Not a readiness flicker: nothing on the pane will
-                    // clear it. Park the wake as a named durable block
-                    // that carries the exact binding it was refused for.
-                    let observation = watcher.pane(&handle.pane_id).and_then(|row| {
-                        let mut observation =
-                            composer_semantic_observation(inner, handle, &row, manifest_id)?;
-                        observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
-                        Some(observation)
-                    });
-                    return AttemptOutcome::Failed(AttemptFailure::hook_admission_unproven(
-                        observation,
-                    ));
-                }
-                return AttemptOutcome::Failed(AttemptFailure::barrier_held());
-            }
-            // A Working runtime is safe only in this narrow, positive shape.
-            // Keep that admission with the in-flight notification: after the
-            // paste, the exact doorbell itself naturally renders as input and
-            // cannot repeat the clean-composer proof that made the write safe.
-            handle.set_working_clean_submit_admitted(
-                det.state == AgentState::Working
-                    && (det.write_ready
-                        || det.screen_proves_write_safe_composer()
-                        || unproven_composer_is_still_eligible),
-            );
-        }
-        None => {
-            injector.discard().await;
-            return AttemptOutcome::Failed(AttemptFailure::session_detached());
-        }
-    }
-    // That recompute took a capture, so who owns the pane is checked again
-    // after it: otherwise the newest fact about the composer would rest on
-    // an older fact about whose composer it is.
-    let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
-        Ok(watcher) => watcher,
-        Err(failure) => {
-            injector.discard().await;
-            return AttemptOutcome::Failed(failure);
-        }
-    };
-    if let Err(detail) = occupant_unchanged(inner, &watcher, handle, manifest_id, admitted_pid) {
-        gate_line(inner, handle, "rebound", None, Some(&detail));
-        injector.discard().await;
-        let failure = if detail == "pane_gone" {
-            AttemptFailure::session_detached()
-        } else {
-            AttemptFailure::pane_rebound_before_paste()
-        };
-        return AttemptOutcome::Failed(failure);
-    }
-    // The binding this write depends on, proven ONCE here, immediately
-    // after the last capture that admitted it. Three lookups taken
-    // separately can disagree with each other; this is one observation of
-    // the leader, the agent and the rules that agent is running under.
-    let Some(final_row) = watcher.pane(&handle.pane_id) else {
-        injector.discard().await;
-        return AttemptOutcome::Failed(AttemptFailure::session_detached());
-    };
-    let observed_binding = if inner
-        .fail_next_final_binding_observation
-        .swap(false, Ordering::SeqCst)
-    {
-        None
-    } else {
-        fusion::admitted_binding(inner, handle.session_idx, &final_row)
-    };
-    // Retain the last complete binding that this attempt genuinely observed.
-    // If the terminal lookup itself is unavailable, this prior proof is the
-    // durable baseline that prevents the unchanged occupant from looking like
-    // a new route edge and reopening the same blocked attempt.
-    let evidence_binding = observed_binding.as_ref().or(observed.as_ref());
-    let observation = NotificationPreWriteObservation {
-        pane_root: evidence_binding.and_then(|binding| process_instance_id(binding.pane_root)),
-        selected_manifest: Some(
-            NotificationManifestId::new(manifest_id)
-                .expect("loaded manifest ids are validated before delivery"),
-        ),
-        binding: evidence_binding
-            .and_then(|binding| notification_binding(handle.notification.recipient(), binding)),
-        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
-        pane_width: Some(final_row.width),
-        required_pane_width: selected.required_pane_width(),
-        write_block: None,
-    };
-    let proven = match observed_binding {
-        // The gate admitted under a manifest, and the live read has to
-        // still agree with it: a process that exec'd in place keeps its
-        // identity while becoming another program.
-        Some(binding) if binding.manifest == manifest_id => binding,
-        _ => {
-            // Widths are a paired observation used only by the pane-too-narrow
-            // bookend below. Carrying either half through a binding failure
-            // makes the durable observation invalid and strands the attempt.
-            let mut observation = observation;
-            observation.pane_width = None;
-            observation.required_pane_width = None;
-            gate_line(inner, handle, "rebound", None, Some("binding_unprovable"));
-            injector.discard().await;
-            return AttemptOutcome::Failed(AttemptFailure::binding_unprovable(Some(observation)));
-        }
-    };
-    if let Some(cause) = notification_prewrite_bookend(&selected, final_row.width) {
-        injector.discard().await;
-        if cause.starts_with("pane_too_narrow:") {
-            return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
-        }
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
-    }
-    inject_pause(inner, "post_final_prewrite").await;
-    // The composer hold is installed AT the write boundary, by the injector,
-    // not before the attempt and not after it resolves. Installing it before
-    // the attempt would catch `spool_failed` and block its bounded transport
-    // retry with no staged payload and no turn that could clear the hold.
-    // Exhausted spool failures use the separate durable pre-write block.
-    // Installing the composer hold after the attempt resolves would leave a
-    // window where `verify_failed` (the paste may have
-    // landed, nobody could prove what it did) is visible to another
-    // delivery for the same pane before anything holds it.
+    // 4. The paste. `on_write` runs immediately before the command that may
+    //    put bytes in the composer: it claims the composer barrier and
+    //    records `Writing`, so from here the attempt is post-write whatever
+    //    tmux answers. A refused claim means readiness moved in the gap and
+    //    the attempt goes back to the gate with nothing written.
     let target = StagingTarget::ExactRow(&selected.bytes);
     let (staged_window, id_staged, payload_at_proof) = match inject(
         &injector,
@@ -943,68 +616,26 @@ pub(crate) async fn attempt_delivery(
                 .notification
                 .ensure_current_gating()
                 .map_err(notification_write_cause)?;
-            // The last thing before the pane is asked to take the
-            // payload: the same binding, read again, and equal. Nothing
-            // has been written yet, so a change here is the world moving
-            // rather than a transport failure.
-            let (now, pane_width) = match handle_route(inner, handle) {
-                HandleRoute::Exact(watcher) => {
-                    let row = watcher
-                        .pane(&handle.pane_id)
-                        .ok_or_else(|| "prewrite_session_detached".to_string())?;
-                    let binding = fusion::admitted_binding(inner, handle.session_idx, &row)
-                        .ok_or_else(|| "prewrite_binding_unprovable".to_string())?;
-                    (binding, row.width)
-                }
-                HandleRoute::BindingChanged => return Err("binding_changed".to_string()),
-                HandleRoute::BindingUnprovable { .. } => {
-                    return Err("prewrite_binding_unprovable".to_string())
-                }
-                HandleRoute::Unavailable => return Err("prewrite_session_detached".to_string()),
-            };
-            if now != proven {
-                return Err("binding_changed".to_string());
-            }
-            if let Some(cause) = notification_prewrite_bookend(&selected, pane_width) {
-                return Err(cause);
-            }
             let pane_root = ProcessInstanceId::new(proven.pane_root.pid, proven.pane_root.birth)
                 .map_err(|_| NOTIFICATION_RECORD_FAILED.to_string())?;
             let leader = ProcessInstanceId::new(proven.leader.pid, proven.leader.birth)
                 .map_err(|_| NOTIFICATION_RECORD_FAILED.to_string())?;
             let agent = ProcessInstanceId::new(proven.agent.pid, proven.agent.birth)
                 .map_err(|_| NOTIFICATION_RECORD_FAILED.to_string())?;
-            latch_hold(inner, handle, &proven)?;
-            let mut unwritten_hold = UnwrittenHold::new(inner, handle, &proven);
-            let should_panic_attempt = {
-                let current_attempt = handle.notification.attempt_id();
-                let mut guard = inner.fail_pre_record_writing.lock().unwrap();
-                if let Some(target) = *guard {
-                    if current_attempt == target {
-                        *guard = None;
-                        Some(target)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-            if let Some(target_attempt) = should_panic_attempt {
-                panic!(
-                    "worker exit at synchronous on_write boundary before first durable transition for attempt {target_attempt}"
-                );
-            }
-            if let Err(error) = handle.notification.record_writing(
-                pane_root,
-                leader,
-                agent,
-                &proven.manifest,
-                NotificationTransport::Doorbell,
-                Some(selected.doorbell_format),
-            ) {
-                return Err(notification_write_cause(error));
-            }
+            latch_hold(inner, handle, proven)?;
+            let mut unwritten_hold = UnwrittenHold::new(inner, handle, proven);
+            fail_pre_record_writing_if_requested(inner, handle);
+            handle
+                .notification
+                .record_writing(
+                    pane_root,
+                    leader,
+                    agent,
+                    &proven.manifest,
+                    NotificationTransport::Doorbell,
+                    selected.doorbell_format,
+                )
+                .map_err(notification_write_cause)?;
             handle.write_boundary_crossed.store(true, Ordering::SeqCst);
             unwritten_hold.commit();
             Ok(())
@@ -1014,20 +645,12 @@ pub(crate) async fn attempt_delivery(
     {
         Ok(v) => v,
         Err(failure) => {
-            return finish_attempt_delivery_inject_failure(
-                inner,
-                handle,
-                &proven,
-                Some(observation),
-                failure,
-            );
+            return finish_inject_failure(handle, failure, || {
+                rollback_unwritten_hold(inner, handle, proven)
+            });
         }
     };
-    let mut staging_verified = !payload_at_proof.is_empty();
-    if let Err(error) = handle.notification.record_staged() {
-        error!(id = %handle.msg_id, error = %error, "notification staged fact failed");
-        return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
-    }
+    let staging_verified = !payload_at_proof.is_empty();
     if !advance(
         inner,
         handle,
@@ -1036,166 +659,30 @@ pub(crate) async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
-
+    // 5. The one post-paste occupant check, immediately before Enter. The
+    //    staged row belongs to the occupant that took it; the key must
+    //    never reach whoever replaced them.
+    inject_pause(inner, "pre_submit").await;
+    if let Err(detail) = occupant_unchanged(inner, handle, proven) {
+        unregister_ack(inner, handle);
+        gate_line(inner, handle, "rebound", None, Some(&detail.journal()));
+        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
+    }
+    // 6. Enter. Subscribed before the key: a fast vendor can paint its whole
+    //    working phase before send-keys returns, and the ACK registration
+    //    lands here too, after every proof and before the key, because the
+    //    measured hook edge follows Enter by 21-28ms.
     let submit_key = if manifest.injection.submit.is_empty() {
         "Enter"
     } else {
         manifest.injection.submit.as_str()
     };
-    inject_pause(inner, "pre_submit").await;
-    if let Err(detail) = proven_binding_unchanged(inner, handle, &proven) {
-        // The staged payload belongs to the occupant that verified it; the
-        // submit key must never reach whoever replaced it.
-        unregister_ack(inner, handle);
-        gate_line(inner, handle, "rebound", None, Some(&detail));
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    }
-    // Verification proved a representation at a moment, and Enter is sent
-    // at a later one. A person can append to the staged text, or replace
-    // it, in between; pressing Enter then submits something nobody
-    // verified and nobody wrote. Repaint is also not atomic: after a valid
-    // paste proof, a capture can land between the terminal clear and the
-    // renderer's next complete frame. Reuse the bounded post-paste evidence
-    // schedule so that transient incomplete frames do not turn a clean,
-    // owned doorbell into a false verify failure.
-    let recheck = if staging_verified {
-        match recheck_exact_staging_snapshot(
-            &injector,
-            &handle.pane_id,
-            manifest,
-            target,
-            &selected.bytes,
-            id_staged,
-            &payload_at_proof,
-        )
-        .await
-        {
-            Ok(now) => now,
-            Err(ExactStagingRecheck::Mismatch) => {
-                unregister_ack(inner, handle);
-                gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-                return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-                    ComposerState::ComposerAmbiguous,
-                ));
-            }
-            Err(ExactStagingRecheck::Unobservable) => {
-                staging_verified = false;
-                injector
-                    .capture_joined_escaped(&handle.pane_id)
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        injector
-            .capture_joined_escaped(&handle.pane_id)
-            .await
-            .unwrap_or_default()
-    };
-    // The capture above took time, so the occupant is checked once more
-    // after it. Otherwise the last thing proven about who owns the pane is
-    // older than the last thing proven about what is in it.
-    if let Err(detail) = proven_binding_unchanged(inner, handle, &proven) {
-        unregister_ack(inner, handle);
-        gate_line(inner, handle, "rebound", None, Some(&detail));
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    }
-    if staging_verified {
-        if let Err(detail) =
-            notification_staged_action_safe(inner, handle, manifest, &recheck, &proven, true)
-        {
-            unregister_ack(inner, handle);
-            gate_line(inner, handle, "rebound", None, Some(&detail));
-            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
-        }
-    }
-    match handle.notification.reserve_submit() {
-        Ok(SubmitReservation::Reserved) => {}
-        Ok(SubmitReservation::ClaimedBeforeSubmit) => {
-            return reconcile_claimed_notification_barrier(
-                inner,
-                handle,
-                manifest,
-                StagingExpectation {
-                    target,
-                    payload: &selected.bytes,
-                },
-                &proven,
-                &injector,
-                ClaimedStagedReconciliation::CurrentStaged,
-            )
-            .await;
-        }
-        Err(error) => {
-            error!(id = %handle.msg_id, %error, "notification submit reservation failed");
-            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
-        }
-    }
-    // Reserving submit appends a journal fact and therefore opens another
-    // content and process replacement window. Re-capture the composer and
-    // re-prove the complete binding after that append. `Submitting` reserves
-    // one key attempt; it never authorizes changed or unobservable bytes.
-    if staging_verified {
-        inject_pause(inner, "post_submit_reservation").await;
-        match recheck_exact_staging_snapshot(
-            &injector,
-            &handle.pane_id,
-            manifest,
-            target,
-            &selected.bytes,
-            id_staged,
-            &payload_at_proof,
-        )
-        .await
-        {
-            Ok(now) => {
-                if let Err(detail) =
-                    notification_staged_action_safe(inner, handle, manifest, &now, &proven, true)
-                {
-                    gate_line(
-                        inner,
-                        handle,
-                        "rebound",
-                        None,
-                        Some(&format!("{detail}_after_submit_reservation")),
-                    );
-                    return AttemptOutcome::Failed(AttemptFailure::verify_failed());
-                }
-            }
-            Err(ExactStagingRecheck::Mismatch) => {
-                gate_line(
-                    inner,
-                    handle,
-                    "rebound",
-                    None,
-                    Some("staging_changed_after_submit_reservation"),
-                );
-                return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-                    ComposerState::ComposerAmbiguous,
-                ));
-            }
-            Err(ExactStagingRecheck::Unobservable) => {
-                staging_verified = false;
-            }
-        }
-    }
-    // Subscribe before Enter. A fast vendor can paint its entire working
-    // phase before send-keys returns, so subscribing inside the receipt
-    // waiter loses the only turn evidence that actually followed this key.
     let receipt_events = inner.events.subscribe();
-    // This receiver has one job: retain a matching working edge until a
-    // screen checkpoint has accounted for it. The main receipt receiver
-    // still owns session lifecycle and lag handling below. Keeping those
-    // responsibilities separate means a screen receipt cannot settle first
-    // and strand the `turn_ended` wait behind an already-observed turn.
     let receipt_turn_events = inner.events.subscribe();
     let receipt_submit_at = Instant::now();
     let receipt_submit_at_ms = unix_ms();
-    // The AGENT behind the admitted pid is what a hook report is filed
-    // under. The foreground leader can be a tool the agent handed the
-    // terminal to, so the two are recorded separately and never
-    // substituted for one another: the leader is terminal admission
-    // evidence, the agent identity is who this notification belongs to.
+    // The AGENT behind the binding is what a hook report is filed under;
+    // the foreground leader can be a tool the agent handed the terminal to.
     *handle.submitted_agent.lock().expect("submitted agent lock") = Some(proven.agent);
     handle
         .submitted_at_ms
@@ -1204,10 +691,6 @@ pub(crate) async fn attempt_delivery(
         .submitted_manifest
         .lock()
         .expect("submitted manifest lock") = Some(proven.manifest.clone());
-    // Registered here, after every proof and immediately before the key:
-    // the measured hook edge lands 21-28ms after Enter, so this is early
-    // enough, and it closes the window where a stale ACK from the same
-    // occupant could set the early flag before any submit was attempted.
     register_ack(inner, handle);
     if let Err(cause) = injector.submit(&handle.pane_id, submit_key).await {
         unregister_ack(inner, handle);
@@ -1223,9 +706,8 @@ pub(crate) async fn attempt_delivery(
         error!(id = %handle.msg_id, error = %error, "notification submitted fact failed");
         return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
     }
-    // The key is sent and the binding is recorded, so an acknowledgement
-    // can arrive from here on, while the delivery is still `Staged`.
-    // Always None in production.
+    // Test-only pause: an acknowledgement can arrive from here on, while the
+    // delivery is still `Staged` in memory.
     inject_pause(inner, "post_key").await;
     if !advance(
         inner,
@@ -1235,24 +717,11 @@ pub(crate) async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
-    if !staging_verified {
-        // One-time doorbell submitted unverified.
-        // Enter was sent once, state is SubmittedUnverified, never duplicate Enter. Done.
-        let _ = advance(
-            inner,
-            handle,
-            &[DeliveryState::Submitted],
-            Step::to(DeliveryState::DeliveredUnverified)
-                .cause("unverified_staging")
-                .verified(VerifiedBy::Screen),
-        );
-        unregister_ack(inner, handle);
-        return AttemptOutcome::Done;
-    }
-    // Take any accepted early receipt before claim settlement can return.
-    // A hook can carry the exact TurnKey while a concurrent socket claim has
-    // already made the durable notification Notified. The claim must not
-    // discard that stronger receipt.
+    // 7. The receipt: a hook ACK, then screen evidence, then nothing. Any
+    //    accepted early receipt is taken before claim settlement can return:
+    //    a hook can carry the exact TurnKey while a concurrent socket claim
+    //    has already made the durable notification Notified, and the claim
+    //    must not discard that stronger receipt.
     let early = take_accepted_early_ack(handle);
     let notified_during_submit_gap = match handle.notification.settle_submitted_claim() {
         Ok(notified) => notified,
@@ -1269,15 +738,11 @@ pub(crate) async fn attempt_delivery(
         }
         return AttemptOutcome::Done;
     }
-    // The window this pause exists for: the delivery is Submitted after the
-    // worker took any earlier record. A hook arriving now resolves the exact
-    // submitted handle directly instead of installing another early record.
-    // Always None in production.
+    // Test-only pause: a hook arriving now resolves the submitted handle
+    // directly instead of installing another early record.
     inject_pause(inner, "post_submit").await;
-    // An acknowledgement that arrived between paste verification and the
-    // Submitted line was taken under the same state lock the installer used.
     if let Some(early) = early {
-        match record_notification_notified(handle) {
+        match record_notification_notified(handle, Some(VerifiedBy::Hook)) {
             Ok(true) => {}
             Ok(false) => return AttemptOutcome::Done,
             Err(error) => {
@@ -1303,16 +768,14 @@ pub(crate) async fn attempt_delivery(
         },
     )
     .await;
-    // Test-only boundary after receipt observation has finished but before
-    // this worker publishes its delivery verdict. It proves the composed
-    // wait owns a receiver with no observation gap after an early receipt.
+    // Test-only pause after receipt observation, before the verdict.
     inject_pause(inner, "post_receipt").await;
     match ack_outcome {
         AckOutcome::Resolved => AttemptOutcome::Done,
         AckOutcome::Screen => {
             // Stays registered: a late matching hook ACK upgrades it to
             // delivered_verified (the legal upgrade transition).
-            match record_notification_notified(handle) {
+            match record_notification_notified(handle, Some(VerifiedBy::Screen)) {
                 Ok(true) => {}
                 Ok(false) => return AttemptOutcome::Done,
                 Err(error) => {
@@ -1330,27 +793,161 @@ pub(crate) async fn attempt_delivery(
             );
             AttemptOutcome::Done
         }
-        AckOutcome::Timeout => {
-            unregister_ack(inner, handle);
-            AttemptOutcome::Failed(AttemptFailure::ack_timeout())
-        }
-        AckOutcome::Rebound => {
-            unregister_ack(inner, handle);
-            AttemptOutcome::Failed(AttemptFailure::receipt_occupant_changed())
-        }
+        AckOutcome::Timeout => settle_without_receipt(inner, handle, "no_receipt"),
+        AckOutcome::Rebound => settle_without_receipt(inner, handle, "receipt_occupant_changed"),
     }
 }
 
-/// Resolve the exact injector failure arm of [`attempt_delivery`].
+/// Neither receipt tier answered, or the pane changed hands while waiting.
 ///
-/// Keeping the durable correction, runtime boundary, and composer hold in one
-/// arm makes their order directly testable without a live tmux process.
-pub(crate) fn finish_attempt_delivery_inject_failure(
+/// Enter reached the admitted occupant, so the notification is recorded as
+/// notified with no verifier, and this attempt's composer barrier is
+/// released: from here the screen sensor alone decides whether the next
+/// doorbell may write. A doorbell left in the composer reads as human input
+/// and holds; an unreadable composer does not.
+fn settle_without_receipt(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
-    proven: &fusion::Binding,
-    observation: Option<NotificationPreWriteObservation>,
+    cause: &'static str,
+) -> AttemptOutcome {
+    match record_notification_notified(handle, None) {
+        Ok(true) => {}
+        Ok(false) => return AttemptOutcome::Done,
+        Err(error) => {
+            error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
+            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+        }
+    }
+    let _ = advance(
+        inner,
+        handle,
+        &[DeliveryState::Submitted],
+        Step::to(DeliveryState::DeliveredUnverified).cause(cause),
+    );
+    gate_line(inner, handle, "unverified", None, Some(cause));
+    fusion::clear_hold_owner(
+        inner,
+        handle.session_idx,
+        &handle.pane_id,
+        &handle.barrier_owner(),
+    );
+    AttemptOutcome::Done
+}
+
+/// One raw write: the whole rendered message, then Enter, then `Notified`
+/// with no verifier. Nothing about the pane is checked beyond its
+/// existence, nothing is read back, and no receipt is awaited; the sender
+/// asked for exactly that and the journal says so.
+pub(crate) async fn attempt_raw_delivery(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+) -> AttemptOutcome {
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    };
+    let injector = TmuxInjector {
+        client: watcher.client(),
+        buffer: format!(
+            "cyc-{}-{}",
+            std::process::id(),
+            inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
+        ),
+    };
+    let selected = match select_attempt_payload(handle) {
+        Ok(selected) => selected,
+        Err(error) => {
+            error!(id = %handle.msg_id, error = %error, "raw payload reconstruction failed");
+            return AttemptOutcome::Failed(AttemptFailure::payload_unavailable());
+        }
+    };
+    handle.set_attempt_payload(selected.bytes.clone(), Some(selected.transport));
+    if let Err(cause) = injector.spool(&selected.bytes).await {
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+    }
+    inject_pause(inner, "pre_paste").await;
+    if !watcher.pane(&handle.pane_id).is_some_and(|row| !row.dead) {
+        injector.discard().await;
+        return AttemptOutcome::Failed(AttemptFailure::session_detached());
+    }
+    // `Writing` without a binding: nothing about the occupant was proven,
+    // and the record must not pretend otherwise.
+    if let Err(failure) = injector
+        .commit(&handle.pane_id, &|| {
+            handle
+                .notification
+                .ensure_current_gating()
+                .map_err(notification_write_cause)?;
+            handle
+                .notification
+                .record_writing_raw()
+                .map_err(notification_write_cause)?;
+            handle.write_boundary_crossed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+    {
+        return finish_inject_failure(handle, failure, || {});
+    }
+    if !advance(
+        inner,
+        handle,
+        &[DeliveryState::Pasting],
+        Step::to(DeliveryState::Submitted),
+    ) {
+        return AttemptOutcome::Done;
+    }
+    inject_pause(inner, "pre_submit").await;
+    if let Err(cause) = injector.submit(&handle.pane_id, "Enter").await {
+        debug_assert_eq!(cause, "submit_failed");
+        return AttemptOutcome::Failed(AttemptFailure::submit_failed());
+    }
+    match record_notification_notified(handle, None) {
+        Ok(true) => {}
+        Ok(false) => return AttemptOutcome::Done,
+        Err(error) => {
+            error!(id = %handle.msg_id, error = %error, "raw notified fact failed");
+            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+        }
+    }
+    let _ = advance(
+        inner,
+        handle,
+        &[DeliveryState::Submitted],
+        Step::to(DeliveryState::DeliveredUnverified).cause("raw"),
+    );
+    gate_line(inner, handle, "unverified", None, Some("raw"));
+    AttemptOutcome::Done
+}
+
+/// Test seam: exit the worker at the synchronous write boundary, after the
+/// composer claim and before the first durable transition, for one named
+/// attempt. Always inert in production.
+fn fail_pre_record_writing_if_requested(inner: &Inner, handle: &DeliveryHandle) {
+    let current_attempt = handle.notification.attempt_id();
+    // The guard is released before the panic so the recovery run can read
+    // the seam again instead of inheriting a poisoned lock.
+    let armed = {
+        let mut guard = inner.fail_pre_record_writing.lock().unwrap();
+        (*guard == Some(current_attempt))
+            .then(|| guard.take())
+            .is_some()
+    };
+    if armed {
+        panic!(
+            "worker exit at synchronous on_write boundary before first durable transition for attempt {current_attempt}"
+        );
+    }
+}
+
+/// Resolve the injector's failure arm for both write paths.
+///
+/// A paste command tmux provably accepted no byte of corrects the durable
+/// boundary back to pre-write (and `release_hold` gives the composer claim
+/// back); every other outcome keeps its cause and stays post-write.
+pub(crate) fn finish_inject_failure(
+    handle: &Arc<DeliveryHandle>,
     failure: InjectFailure,
+    release_hold: impl FnOnce(),
 ) -> AttemptOutcome {
     match failure {
         InjectFailure::PasteCommandUnwritten => {
@@ -1358,122 +955,351 @@ pub(crate) fn finish_attempt_delivery_inject_failure(
                 error!(id = %handle.msg_id, error = %error, "notification unwritten correction failed");
                 return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
             }
-            rollback_unwritten_hold(inner, handle, proven);
+            release_hold();
             AttemptOutcome::Failed(AttemptFailure::paste_command_unwritten())
         }
-        InjectFailure::Other(cause) => {
-            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
-                return AttemptOutcome::NoLongerCurrentBeforeWrite;
+        InjectFailure::Other(cause) if cause == NO_LONGER_CURRENT_BEFORE_WRITE => {
+            AttemptOutcome::NoLongerCurrentBeforeWrite
+        }
+        InjectFailure::Other(cause) => AttemptOutcome::Failed(AttemptFailure::from_inject(cause)),
+    }
+}
+
+/// A pre-paste occupant change is retryable through the gate unless the
+/// route itself is gone, which is a durable pre-write block.
+fn rebound_before_paste(detail: HoldCause) -> AttemptFailure {
+    match detail {
+        HoldCause::SessionDetached | HoldCause::NoSuchPane | HoldCause::PaneDead => {
+            AttemptFailure::session_detached()
+        }
+        _ => AttemptFailure::pane_rebound_before_paste(),
+    }
+}
+
+/// Is the pane still the one the gate admitted: present, alive, out of
+/// copy-mode, and running the same agent under the same rules?
+///
+/// Called once before the paste and once before Enter, by this one
+/// function, so the two checks cannot drift apart. The binding compares
+/// whole: pids are reusable, and a process that exec'd in place keeps its
+/// identity while becoming another program.
+pub(crate) fn occupant_unchanged(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    proven: &fusion::Binding,
+) -> Result<(), HoldCause> {
+    let Some(watcher) = watcher_for_handle(inner, handle) else {
+        return Err(HoldCause::SessionDetached);
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return Err(HoldCause::NoSuchPane);
+    };
+    if row.dead {
+        return Err(HoldCause::PaneDead);
+    }
+    if row.in_mode {
+        return Err(HoldCause::PaneInMode);
+    }
+    if inner
+        .fail_next_final_binding_observation
+        .swap(false, Ordering::SeqCst)
+    {
+        return Err(HoldCause::BindingUnprovable);
+    }
+    match fusion::admitted_binding(inner, handle.session_idx, &row) {
+        Some(current) if current == *proven => Ok(()),
+        Some(_) => Err(HoldCause::BindingChanged),
+        None => Err(HoldCause::BindingUnprovable),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gate
+// ---------------------------------------------------------------------------
+
+pub(crate) enum GateOutcome {
+    Proceed(Admission),
+    /// Repeated identical evidence proved this exact mailbox attempt cannot
+    /// reach the write boundary. The durable block makes it visible and
+    /// operator-withdrawable without touching the pane.
+    BlockedPreWrite {
+        cause: NotificationPreWriteCause,
+        observation: Box<NotificationPreWriteObservation>,
+    },
+    /// A mailbox notification remains durably queued or gating. The
+    /// in-memory worker stops, and the next route or restart reconciliation
+    /// can attach a fresh worker without inventing a terminal session fact.
+    Deferred {
+        cause: String,
+    },
+    Withdrawn,
+}
+
+/// What the gate admitted and what the write may rely on.
+pub(crate) enum Admission {
+    /// A bound, live agent process. The write re-checks exactly this
+    /// binding before the paste and before Enter.
+    Doorbell {
+        binding: fusion::Binding,
+        /// The rule that decided the admitting frame, for the gate line.
+        decided_by: String,
+    },
+    /// The sender asked for a raw write: only the pane's existence was
+    /// checked.
+    Raw,
+}
+
+enum Refusal {
+    Hold(HoldCause),
+    /// The process table could not prove the occupant. Held once; the same
+    /// reading again settles as the durable block carrying this
+    /// observation, because "we could not read it" announces no pane event
+    /// and would otherwise wait in memory forever.
+    Unprovable(Box<NotificationPreWriteObservation>),
+    /// Decline keys went out; the pane needs a moment to redraw before it is
+    /// read again.
+    Declined,
+}
+
+/// The gate: hold until the admission path proves the write may happen.
+///
+/// Event-driven. A hold wakes on fused state and readiness changes, pane
+/// field changes, and session reattach; the two causes that announce no
+/// event (an unreadable process table, a refused barrier claim) wake once
+/// on a bounded timer. A wedged hold pings the admin exactly once after
+/// `gate_hold_notify_ms` and keeps waiting. `regate` is the cause an attempt
+/// came back with after the write boundary refused it.
+pub(crate) async fn gate(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    regate: Option<HoldCause>,
+) -> GateOutcome {
+    let mut declines: HashMap<String, u32> = HashMap::new();
+    let mut regate = regate;
+    let mut last_hold: Option<HoldCause> = None;
+    let mut hold_since: Option<Instant> = None;
+    let mut hold_notified = false;
+    // Subscribed once, before the first evaluation, and kept for the gate's
+    // whole life: replacing it between evaluations leaves a gap where a
+    // readiness edge published after an early pane wake but before the next
+    // receiver exists strands a now-clean pane.
+    let mut ev_rx = inner.events.subscribe();
+    loop {
+        let watcher = watcher_for_handle(inner, handle);
+        let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
+        match handle.notification.ensure_current_gating() {
+            Ok(()) => {}
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
+                return GateOutcome::Withdrawn;
             }
-            if let Some(width) = cause
-                .strip_prefix("pane_too_narrow:")
-                .and_then(|width| width.parse::<u32>().ok())
-            {
-                let mut observation = observation.expect("format 3 belongs to a notification");
-                observation.pane_width = Some(width);
-                return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
+            Err(error) => {
+                error!(id = %handle.msg_id, error = %error, "notification gate recheck failed");
+                return GateOutcome::Deferred {
+                    cause: NOTIFICATION_RECORD_FAILED.to_string(),
+                };
             }
-            AttemptOutcome::Failed(AttemptFailure::from_inject(cause))
+        }
+        let refusal = match (regate.take(), &watcher) {
+            (Some(cause), _) => Refusal::Hold(cause),
+            (None, None) => Refusal::Hold(HoldCause::SessionDetached),
+            (None, Some(watcher)) => match admit(inner, handle, watcher, &mut declines).await {
+                Ok(admission) => {
+                    let rule = match &admission {
+                        Admission::Doorbell { decided_by, .. } => Some(decided_by.as_str()),
+                        Admission::Raw => None,
+                    };
+                    gate_line(inner, handle, "proceed", rule, None);
+                    return GateOutcome::Proceed(admission);
+                }
+                Err(refusal) => refusal,
+            },
+        };
+        let cause = match refusal {
+            Refusal::Hold(cause) => cause,
+            Refusal::Declined => {
+                // One-shot settle so the dismissal renders before the
+                // re-check; the decline count bounds this loop.
+                tokio::time::sleep(DECLINE_SPACING).await;
+                continue;
+            }
+            Refusal::Unprovable(observation) => {
+                if last_hold == Some(HoldCause::BindingUnprovable) {
+                    return GateOutcome::BlockedPreWrite {
+                        cause: NotificationPreWriteCause::BindingUnprovable,
+                        observation,
+                    };
+                }
+                HoldCause::BindingUnprovable
+            }
+        };
+        handle.set_hold(Some(cause.receipt_token()));
+        if last_hold.as_ref() != Some(&cause) {
+            gate_line(inner, handle, "hold", None, Some(&cause.journal()));
+            last_hold = Some(cause.clone());
+        }
+        let since = *hold_since.get_or_insert_with(Instant::now);
+        let notify_at = since + Duration::from_millis(inner.cfg.gate_hold_notify_ms);
+        let retry_at = match cause {
+            HoldCause::BindingUnprovable => Some(Instant::now() + OBSERVATION_RETRY),
+            HoldCause::BarrierHeld => Some(Instant::now() + BARRIER_RETRY),
+            _ => None,
+        };
+        tokio::select! {
+            _ = wait_pane_change(
+                &mut ev_rx,
+                pane_rx.as_mut(),
+                handle.session_idx,
+                &handle.pane_id,
+                &handle.cancel,
+            ) => {}
+            _ = async {
+                match retry_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = tokio::time::sleep_until(notify_at), if !hold_notified => {
+                // A wedged hold must at least be visible. One ping per
+                // delivery; the hold itself keeps waiting on events.
+                hold_notified = true;
+                admin_notify(
+                    inner,
+                    NotifyLevel::ActionRequired,
+                    &format!("notification to {} held in gating", handle.to),
+                    &format!(
+                        "message {} has been held for over {}ms ({})",
+                        handle.msg_id,
+                        inner.cfg.gate_hold_notify_ms,
+                        cause.journal()
+                    ),
+                    Some(&handle.msg_id),
+                    Some(handle.session_idx),
+                    About::pane(&handle.pane_id),
+                );
+            }
         }
     }
 }
 
-/// Re-prove that an automatic notification submit still owns this exact
-/// staged composer. The caller separately compares the normalized bytes.
-/// This check binds that content to the current process generations and
-/// manifest, requires a terminal-safe visual state, and refuses any known
-/// blocked-state or final-submit conflict. An ordinary in-flight notification
-/// can use the exact proof when a vendor's short screen projection loses the
-/// prompt row to chrome; recovery and terminal clear paths stay on the
-/// quiet-frame rule.
-pub(crate) fn notification_staged_action_safe(
+/// The admission path, in the order the contract names it.
+///
+/// Steps 4 and 5 read one fresh capture. The binding is read last, after
+/// that capture, so it is the newest fact the write depends on: the composer
+/// verdict must not rest on an older answer about whose composer it is.
+async fn admit(
     inner: &Arc<Inner>,
-    handle: &DeliveryHandle,
-    manifest: &Manifest,
-    capture: &str,
-    proven: &fusion::Binding,
-    allow_inflight_working_admission: bool,
-) -> Result<(), String> {
-    let notification = &handle.notification;
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return Err("session_detached".to_string());
-    };
+    handle: &Arc<DeliveryHandle>,
+    watcher: &Arc<SessionWatcher>,
+    declines: &mut HashMap<String, u32>,
+) -> Result<Admission, Refusal> {
+    // 1. The pane must be present and alive, and not in copy-mode.
     let Some(row) = watcher.pane(&handle.pane_id) else {
-        return Err("pane_gone".to_string());
+        return Err(Refusal::Hold(HoldCause::NoSuchPane));
     };
     if row.dead {
-        return Err("pane_dead".to_string());
+        return Err(Refusal::Hold(HoldCause::PaneDead));
+    }
+    // A raw write asked for nothing beyond that.
+    if handle.raw {
+        return Ok(Admission::Raw);
     }
     if row.in_mode {
-        return Err("pane_in_mode".to_string());
+        return Err(Refusal::Hold(HoldCause::PaneInMode));
     }
-    let current = fusion::admitted_binding(inner, handle.session_idx, &row);
-    if !binding_is_exact(current.as_ref(), proven) {
-        return Err("binding_changed".to_string());
-    }
-    let state = manifest
-        .evaluate_esc(&row.title, &strip_csi(capture), Some(capture))
-        .map(|rule| rule.state);
-    if matches!(
-        state,
-        Some(
-            AgentState::BlockedModal
-                | AgentState::BlockedPermission
-                | AgentState::BlockedQuota
-                | AgentState::Dead
-        )
-    ) {
-        return Err("staged_manifest_state_unsafe".to_string());
-    }
-    let Some(agent) = process_instance_id(proven.agent) else {
-        return Err("binding_unprovable".to_string());
+    // 2. A manifest must claim the pane, or nothing knows how to read it.
+    let Some(manifest) = fusion::bind_manifest_for(inner, handle.session_idx, &row) else {
+        return Err(Refusal::Hold(HoldCause::NoManifest));
     };
-    // Exact bytes and an unchanged binding are stronger than a fixed tail
-    // window that happened to omit a long wrapped prompt. This is deliberately
-    // limited to a non-Working normal post-paste submit: a freshly observed
-    // Working edge still needs the separately recorded clean-composer
-    // admission. Claim recovery and terminal clear retain the stricter
-    // quiet-frame rule below.
-    if allow_inflight_working_admission
-        && fusion::staged_exact_submit_ready(
-            inner,
-            handle.session_idx,
-            &handle.pane_id,
-            &notification.attempt_id().to_string(),
-            agent,
-            &proven.manifest,
-        )
-    {
-        return Ok(());
-    }
-    let working_clean_submit = allow_inflight_working_admission
-        && state == Some(AgentState::Working)
-        && handle.working_clean_submit_admitted();
-    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) && !working_clean_submit
-    {
-        return Err("staged_manifest_state_unsafe".to_string());
-    }
-    let quiet_staged_action = fusion::staged_action_ready(
+    let manifest_id = manifest.agent.id.clone();
+    // 3. One fresh capture, fused, so the verdict is newer than any human
+    //    keystroke round trip.
+    let Some(det) = crate::observe_pane(
         inner,
         handle.session_idx,
+        watcher,
         &handle.pane_id,
-        &notification.attempt_id().to_string(),
-        agent,
-        &proven.manifest,
-    );
-    let working_staged_action = working_clean_submit
-        && fusion::staged_working_clean_action_ready(
-            inner,
-            handle.session_idx,
-            &handle.pane_id,
-            &notification.attempt_id().to_string(),
-            agent,
-            &proven.manifest,
-        );
-    if !quiet_staged_action && !working_staged_action {
-        return Err("staged_action_unsafe".to_string());
+        true,
+        "gate",
+    )
+    .await
+    else {
+        return Err(Refusal::Hold(HoldCause::NoSuchPane));
+    };
+    // 4. Named blocks. A modal the manifest can dismiss gets its decline
+    //    keys, bounded by MAX_DECLINES; every other block waits for a human.
+    match det.state {
+        AgentState::Dead => return Err(Refusal::Hold(HoldCause::PaneDead)),
+        AgentState::BlockedQuota => return Err(Refusal::Hold(HoldCause::BlockedQuota)),
+        AgentState::BlockedModal | AgentState::BlockedPermission => {
+            let rule = manifest
+                .rules
+                .iter()
+                .find(|rule| rule.id == det.decided_by && rule.state.is_blocked());
+            return Err(match rule {
+                Some(rule)
+                    if rule.auto_dismiss
+                        && !rule.decline_keys.is_empty()
+                        && *declines.get(&rule.id).unwrap_or(&0) < MAX_DECLINES =>
+                {
+                    *declines.entry(rule.id.clone()).or_insert(0) += 1;
+                    gate_line(inner, handle, "decline", Some(&rule.id), None);
+                    if !send_decline_keys(
+                        watcher,
+                        &handle.pane_id,
+                        manifest,
+                        &rule.id,
+                        &rule.decline_keys,
+                    )
+                    .await
+                    {
+                        // The screen changed under the decline: the
+                        // confirming key was withheld.
+                        gate_line(
+                            inner,
+                            handle,
+                            "decline_aborted",
+                            Some(&rule.id),
+                            Some("modal_changed"),
+                        );
+                    }
+                    Refusal::Declined
+                }
+                _ => Refusal::Hold(HoldCause::Blocked(
+                    rule.map(|rule| rule.id.clone())
+                        .unwrap_or_else(|| det.decided_by.clone()),
+                )),
+            });
+        }
+        _ => {}
     }
-    Ok(())
+    // 5. The composer. Only a positively observed human draft, or a hold a
+    //    delivery owns (a doorbell staged and not consumed, or the turn it
+    //    started that has not ended), holds. An unreadable or ambiguous
+    //    composer does not; what it costs is a line the journal records as
+    //    unverified.
+    if fusion::composer_is_held(inner, handle.session_idx, &handle.pane_id) {
+        return Err(Refusal::Hold(HoldCause::ComposerHold));
+    }
+    // 6. The binding: the pane's foreground process must be the agent this
+    //    manifest describes, itself and not a tool it handed the terminal
+    //    to, because the foreground process is where the keystrokes land.
+    //    Falling back to the pane root would pin the delivery to the SHELL
+    //    and resolve receipts against whoever sits at that prompt next, so
+    //    an unreadable process table is a hold.
+    match fusion::admitted_binding(inner, handle.session_idx, &row) {
+        Some(binding) if binding.manifest == manifest_id && binding.leader == binding.agent => {
+            Ok(Admission::Doorbell {
+                binding,
+                decided_by: det.decided_by,
+            })
+        }
+        Some(binding) if binding.manifest == manifest_id => {
+            Err(Refusal::Hold(HoldCause::ForegroundNotAgent))
+        }
+        _ => Err(Refusal::Unprovable(Box::new(
+            binding_unprovable_observation(inner, handle, row.pane_pid, &manifest_id),
+        ))),
+    }
 }
 
 /// Take only receipt evidence that can settle the submitted delivery.
@@ -1514,354 +1340,6 @@ pub(crate) fn early_ack_step(early: PendingAck) -> Step<'static> {
         .turn(early.turn)
 }
 
-pub(crate) async fn reconcile_recovered_claimed_notification_barrier(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    barrier: ClaimedNotificationBarrier,
-) -> AttemptOutcome {
-    let notification = &handle.notification;
-    let record = match notification.current_record() {
-        Ok(record) => record,
-        Err(_) => {
-            return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
-        }
-    };
-    let message = match notification.message_line() {
-        Ok(message) => message,
-        Err(_) => {
-            return AttemptOutcome::Failed(AttemptFailure::from_inject(
-                "claim_recovery_message_missing".to_string(),
-            ));
-        }
-    };
-    let Some(expected) = expected_notification_payload(&record, &message) else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_format_unknown".to_string(),
-        ));
-    };
-    let Some(binding) = record.binding.as_ref() else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_binding_missing".to_string(),
-        ));
-    };
-    let Some(pane_root) = binding.pane_root else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_pane_root_missing".to_string(),
-        ));
-    };
-    let Some(leader) = binding.leader else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_leader_missing".to_string(),
-        ));
-    };
-    let proven = fusion::Binding {
-        pane_root: crate::identity::ProcId {
-            pid: pane_root.pid(),
-            birth: pane_root.birth(),
-        },
-        leader: crate::identity::ProcId {
-            pid: leader.pid(),
-            birth: leader.birth(),
-        },
-        agent: crate::identity::ProcId {
-            pid: binding.agent.pid(),
-            birth: binding.agent.birth(),
-        },
-        manifest: binding.manifest.as_str().to_string(),
-    };
-    let Some(manifest) = inner.manifests.get(&proven.manifest) else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_manifest_missing".to_string(),
-        ));
-    };
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return AttemptOutcome::Failed(AttemptFailure::from_inject(
-            "claim_recovery_route_unavailable".to_string(),
-        ));
-    };
-    let injector = TmuxInjector {
-        client: watcher.client(),
-        buffer: format!(
-            "cyc-{}-{}",
-            std::process::id(),
-            inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
-        ),
-    };
-    reconcile_claimed_notification_barrier(
-        inner,
-        handle,
-        manifest,
-        StagingExpectation {
-            target: StagingTarget::ExactRow(&expected),
-            payload: &expected,
-        },
-        &proven,
-        &injector,
-        ClaimedStagedReconciliation::Recovered(barrier),
-    )
-    .await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimedStagedReconciliation {
-    CurrentStaged,
-    Recovered(ClaimedNotificationBarrier),
-}
-
-impl ClaimedStagedReconciliation {
-    pub(crate) fn barrier(self) -> ClaimedNotificationBarrier {
-        match self {
-            Self::CurrentStaged => ClaimedNotificationBarrier::Staged,
-            Self::Recovered(barrier) => barrier,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StagingExpectation<'a> {
-    pub(crate) target: StagingTarget<'a>,
-    pub(crate) payload: &'a str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimedStagedComposer {
-    ExactDoorbell,
-    Clean,
-    Ambiguous,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimedStagedAction {
-    ClearThenSettle,
-    SettleOnly,
-    Refuse,
-}
-
-pub(crate) fn claimed_staged_action(
-    composer: ClaimedStagedComposer,
-    reconciliation: ClaimedStagedReconciliation,
-) -> ClaimedStagedAction {
-    match (composer, reconciliation) {
-        (ClaimedStagedComposer::ExactDoorbell, _) => ClaimedStagedAction::ClearThenSettle,
-        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::Recovered(_)) => {
-            ClaimedStagedAction::SettleOnly
-        }
-        (ClaimedStagedComposer::Clean, ClaimedStagedReconciliation::CurrentStaged)
-        | (ClaimedStagedComposer::Ambiguous, _) => ClaimedStagedAction::Refuse,
-    }
-}
-
-pub(crate) fn classify_claimed_staged_composer(
-    manifest: &Manifest,
-    capture: &str,
-    target: StagingTarget<'_>,
-    expected_payload: &str,
-) -> ClaimedStagedComposer {
-    if exact_staging_proof(manifest, capture, target, expected_payload).is_some() {
-        return ClaimedStagedComposer::ExactDoorbell;
-    }
-    if clean_composer_proof(manifest, capture) {
-        return ClaimedStagedComposer::Clean;
-    }
-    ClaimedStagedComposer::Ambiguous
-}
-
-/// Reconcile an exact claimed notification barrier.
-///
-/// The claim proves payload retrieval, not Enter. Cyclops clears only an
-/// exact, still-bound doorbell that it can reconstruct byte for byte. Any
-/// missing proof becomes one post-write attention state.
-pub(crate) async fn reconcile_claimed_notification_barrier<I: Injector>(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    manifest: &Manifest,
-    staging: StagingExpectation<'_>,
-    proven: &fusion::Binding,
-    injector: &I,
-    reconciliation: ClaimedStagedReconciliation,
-) -> AttemptOutcome {
-    if proven_binding_unchanged(inner, handle, proven).is_err() {
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    }
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    };
-    let staged = match injector.capture_joined_escaped(&handle.pane_id).await {
-        Ok(screen) => screen,
-        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_timeout()),
-    };
-    if proven_binding_unchanged(inner, handle, proven).is_err() {
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    }
-    let Some(row) = watcher.pane(&handle.pane_id) else {
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    };
-    if row.in_mode {
-        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
-    }
-
-    let composer =
-        classify_claimed_staged_composer(manifest, &staged, staging.target, staging.payload);
-    match claimed_staged_action(composer, reconciliation) {
-        ClaimedStagedAction::ClearThenSettle => {
-            if manifest.injection.clear_keys.is_empty() {
-                return AttemptOutcome::Failed(AttemptFailure::from_inject(
-                    "claim_clear_unsupported".to_string(),
-                ));
-            }
-            if let Err(cause) =
-                notification_staged_action_safe(inner, handle, manifest, &staged, proven, false)
-            {
-                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
-            }
-            if let Err(cause) = injector
-                .clear(&handle.pane_id, &manifest.injection.clear_keys)
-                .await
-            {
-                return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
-            }
-            if !observe_exact_composer_clear(inner, handle, manifest, proven, injector).await {
-                return AttemptOutcome::Failed(AttemptFailure::from_inject(
-                    "claim_clear_unconfirmed".to_string(),
-                ));
-            }
-        }
-        ClaimedStagedAction::SettleOnly => {
-            // A crash can land after exact clear but before the settlement
-            // fact. The fresh clean observation and exact process binding
-            // authorize only the missing durable settlement. No terminal
-            // input is sent again.
-        }
-        ClaimedStagedAction::Refuse => {
-            let failure = match composer {
-                ClaimedStagedComposer::Clean => {
-                    AttemptFailure::verify_owner_missing(ComposerState::ComposerClean)
-                }
-                ClaimedStagedComposer::Ambiguous => AttemptFailure::verify_failed(),
-                ClaimedStagedComposer::ExactDoorbell => {
-                    unreachable!("an exact claimed doorbell cannot select the refusal action")
-                }
-            };
-            return AttemptOutcome::Failed(failure);
-        }
-    }
-
-    if proven_binding_unchanged(inner, handle, proven).is_err() {
-        return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
-    }
-    inject_pause(inner, "pre_claimed_notification_settlement").await;
-    let notification = &handle.notification;
-    let record = match settle_claimed_notification_after_clear(
-        notification,
-        reconciliation.barrier(),
-    ) {
-        Ok(record) => record,
-        Err(error) => {
-            error!(id = %handle.msg_id, %error, "claimed notification settlement failed twice; notification worker remains faulted");
-            return AttemptOutcome::Failed(AttemptFailure::claimed_staged_settlement_failed());
-        }
-    };
-    if let Some(binding) = record.binding.as_ref() {
-        fusion::resolve_staged_hold(
-            inner,
-            handle.session_idx,
-            &handle.pane_id,
-            &record.attempt_id.to_string(),
-            binding.agent,
-            binding.manifest.as_str(),
-        )
-        .await;
-    }
-    if let Some(messaging) = inner.workspace_messaging() {
-        messaging.composer_barrier_retired(record.attempt_id);
-        if let Err(error) = messaging.notification_head_changed(notification.recipient()) {
-            error!(id = %handle.msg_id, %error, "cannot advance notification FIFO after staged claim");
-        }
-    } else {
-        error!(
-            id = %handle.msg_id,
-            "cannot advance notification FIFO after staged claim without workspace messaging"
-        );
-    }
-    AttemptOutcome::Done
-}
-
-/// Retry only the content-free durable settlement after a proven clear.
-///
-/// The first error may be an interrupted append whose outcome the caller did
-/// not observe. The store operation is idempotent, so one immediate repeat can
-/// discover an already-landed fact or append the missing one. It never clears
-/// the composer or sends a terminal key.
-pub(crate) fn settle_claimed_notification_after_clear(
-    notification: &NotificationContext,
-    barrier: ClaimedNotificationBarrier,
-) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
-    let settle = || match barrier {
-        ClaimedNotificationBarrier::Staged => notification.settle_claimed_staged_clear(),
-        ClaimedNotificationBarrier::AckTimeout => {
-            notification.settle_claimed_ack_timeout_reconciliation()
-        }
-    };
-    match settle() {
-        Ok(record) => Ok(record),
-        Err(first) => {
-            warn!(
-                message_id = %notification.message_id(),
-                attempt_id = %notification.attempt_id(),
-                error = %first,
-                "retrying claimed notification settlement once"
-            );
-            settle()
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn settle_claimed_staged_after_clear(
-    notification: &NotificationContext,
-) -> Result<cyclops_proto::NotificationRecord, NotificationAdapterError> {
-    settle_claimed_notification_after_clear(notification, ClaimedNotificationBarrier::Staged)
-}
-
-pub(crate) async fn observe_exact_composer_clear<I: Injector>(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    manifest: &Manifest,
-    proven: &fusion::Binding,
-    injector: &I,
-) -> bool {
-    let mut last_delay = 0;
-    for delay in VERIFY_DELAYS_MS {
-        if delay > last_delay {
-            tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
-        }
-        last_delay = delay;
-        let Some(watcher) = watcher_for_handle(inner, handle) else {
-            return false;
-        };
-        if proven_binding_unchanged(inner, handle, proven).is_err() {
-            return false;
-        }
-        let Ok(capture) = injector.capture_joined_escaped(&handle.pane_id).await else {
-            continue;
-        };
-        let Some(row) = watcher.pane(&handle.pane_id) else {
-            return false;
-        };
-        if proven_binding_unchanged(inner, handle, proven).is_err() {
-            return false;
-        }
-        if !row.in_mode
-            && clean_composer_proof(manifest, &capture)
-            && notification_staged_action_safe(inner, handle, manifest, &capture, proven, false)
-                .is_ok()
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// Is the pane still held by the process and rules that Enter reached?
 ///
 /// Receipt evidence answers "did the message land", and it can only
@@ -1896,79 +1374,6 @@ pub(crate) fn submitted_binding_holds(
         .is_some_and(|binding| binding.agent == want_agent && binding.manifest == want_manifest)
 }
 
-/// Pane-rebind re-check between the gate's admitting recompute and the
-/// irreversible injection steps. The pane must still exist, be alive, keep
-/// the pid it was admitted with, and bind to the manifest the gate
-/// admitted. Err carries the mismatch detail for the gate ledger line; the
-/// delivery then retries through the gate, which re-evaluates from scratch.
-pub(crate) fn occupant_unchanged(
-    inner: &Arc<Inner>,
-    watcher: &Arc<SessionWatcher>,
-    handle: &Arc<DeliveryHandle>,
-    manifest_id: &str,
-    admitted_pid: i32,
-) -> Result<(), String> {
-    let Some(row) = watcher.pane(&handle.pane_id) else {
-        return Err("pane_gone".to_string());
-    };
-    if row.dead {
-        return Err("pane_dead".to_string());
-    }
-    // Copy-mode after admission: the human is scrolling, and a paste now
-    // lands somewhere neither of us can see. The gate checks this before
-    // admitting, but admission is a decision about a moment and the human
-    // can enter copy-mode inside the window that follows.
-    if row.in_mode {
-        return Err("pane_in_mode".to_string());
-    }
-    if fusion::foreground_pid(row.pane_pid) != admitted_pid {
-        return Err("pane_pid_changed".to_string());
-    }
-    match fusion::bind_manifest_for(inner, handle.session_idx, &row) {
-        Some(m) if m.agent.id == manifest_id => Ok(()),
-        Some(_) => Err("manifest_changed".to_string()),
-        None => Err("manifest_unbound".to_string()),
-    }
-}
-
-/// Re-prove the complete binding captured at the write boundary.
-///
-/// PID numbers alone are reusable. The submit path must retain the same
-/// terminal leader generation, admitted agent generation, and manifest that
-/// authorized the paste.
-pub(crate) fn proven_binding_unchanged(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    proven: &fusion::Binding,
-) -> Result<(), String> {
-    let Some(watcher) = watcher_for_handle(inner, handle) else {
-        return Err("session_detached".to_string());
-    };
-    let Some(row) = watcher.pane(&handle.pane_id) else {
-        return Err("pane_gone".to_string());
-    };
-    if row.dead {
-        return Err("pane_dead".to_string());
-    }
-    if row.in_mode {
-        return Err("pane_in_mode".to_string());
-    }
-    let Some(current) = fusion::admitted_binding(inner, handle.session_idx, &row) else {
-        return Err("binding_unprovable".to_string());
-    };
-    if !binding_is_exact(Some(&current), proven) {
-        return Err("binding_changed".to_string());
-    }
-    Ok(())
-}
-
-pub(crate) fn binding_is_exact(
-    current: Option<&fusion::Binding>,
-    proven: &fusion::Binding,
-) -> bool {
-    current == Some(proven)
-}
-
 pub(crate) fn process_instance(pid: i32) -> Option<ProcessInstanceId> {
     let process = crate::identity::ProcId::of(pid)?;
     process_instance_id(process)
@@ -1995,99 +1400,6 @@ pub(crate) fn binding_unprovable_observation(
     }
 }
 
-/// A notification may continue without a clean-composer proof only for an
-/// A notification may continue without a clean-composer proof for an
-/// authenticated agent unless positive human input or a modal is present.
-/// Cyclops must never type over a person's active text.
-pub(crate) fn unproven_composer_is_eligible(detection: &Detection) -> bool {
-    if detection.composer_semantic == Some(ComposerSemantic::HumanInput)
-        || matches!(
-            detection.state,
-            AgentState::BlockedModal
-                | AgentState::BlockedPermission
-                | AgentState::BlockedQuota
-                | AgentState::Dead
-        )
-        || detection.write_block.as_deref() == Some("composer_hold")
-        || detection.write_block.as_deref() == Some("pane_in_mode")
-    {
-        return false;
-    }
-    true
-}
-
-/// Return the current foreground agent process for the explicit liveness
-/// policy. Unreadable composers do not block a notification, but a stale or
-/// mismatched process binding still does: that would risk typing into a shell
-/// or a different agent.
-pub(crate) fn notification_pane_for_unproven_composer(
-    inner: &Inner,
-    handle: &DeliveryHandle,
-    row: &PaneRow,
-    manifest_id: &str,
-    detection: &Detection,
-) -> Option<i32> {
-    if !unproven_composer_is_eligible(detection) {
-        return None;
-    }
-    if crate::deadlock::pane_runs_watch(row.pane_pid) {
-        return None;
-    }
-    let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
-    if binding.manifest != manifest_id {
-        return None;
-    }
-    fusion::foreground_pid_checked(row.pane_pid)
-}
-
-#[allow(dead_code)]
-pub(crate) fn composer_semantic_missing(manifest: &Manifest, detection: &Detection) -> bool {
-    detection
-        .readings
-        .iter()
-        .find(|reading| {
-            reading.sensor == cyclops_proto::Sensor::Screen && reading.state == AgentState::Idle
-        })
-        .and_then(|reading| manifest.rules.iter().find(|rule| rule.id == reading.rule))
-        .is_some_and(|rule| rule.composer_semantic.is_none())
-}
-
-pub(crate) fn composer_semantic_observation(
-    inner: &Inner,
-    handle: &DeliveryHandle,
-    row: &PaneRow,
-    manifest_id: &str,
-) -> Option<NotificationPreWriteObservation> {
-    let notification = &handle.notification;
-    let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
-    if binding.manifest != manifest_id {
-        return None;
-    }
-
-    Some(NotificationPreWriteObservation {
-        pane_root: Some(process_instance_id(binding.pane_root)?),
-        selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
-        binding: Some(notification_binding(notification.recipient(), &binding)?),
-        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
-        pane_width: None,
-        required_pane_width: None,
-        write_block: None,
-    })
-}
-
-pub(crate) fn notification_binding(
-    recipient: RecipientKey,
-    binding: &fusion::Binding,
-) -> Option<NotificationBinding> {
-    Some(NotificationBinding {
-        recipient,
-        pane_root: Some(process_instance_id(binding.pane_root)?),
-        leader: Some(process_instance_id(binding.leader)?),
-        agent: process_instance_id(binding.agent)?,
-        manifest: NotificationManifestId::new(&binding.manifest).ok()?,
-    })
-}
-
 /// Await the test-only injection pause, when one is installed. Production
 /// never installs one; this is a no-op there.
 pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
@@ -2101,35 +1413,13 @@ pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
     }
 }
 
-/// The gate hold cause that no pane event will ever clear: the daemon
-/// could not read who is in the pane.
-pub(crate) const OBSERVATION_HOLD: &str = "occupant_unprovable";
-/// The gate hold for an idle pane whose composer keeps reading `ambiguous`.
-/// Held on events like any composer cause, but also on a timed wake at the
-/// settle boundary: ambiguity that never changes emits no pane event, and
-/// without the timer the wake would wait in memory forever instead of
-/// settling as the durable `composer_semantic_ambiguous` block.
-pub(crate) const AMBIGUOUS_COMPOSER_HOLD: &str = "not_write_ready:composer_semantic_ambiguous";
-pub(crate) const WRITE_READINESS_OBSERVATION_HOLD: &str = "not_write_ready:occupant_unprovable";
-/// The write block a hook-liveness manifest stamps when no admitting hook
-/// edge has been published for the pane's current binding. Durable, never
-/// retried: the wake parks as a named pre-write block until the recipient
-/// claims, its next admitting edge reopens the oldest attempt once, or an
-/// administrator withdraws the exact attempt.
-pub(crate) const HOOK_ADMISSION_UNPROVEN: &str = "hook_admission_unproven";
-
-/// How long that one cause waits before looking again. Short enough that
-/// a transient `ps` failure costs a person nothing, long enough that a
-/// permanently unreadable process table is not a spin.
+/// How long an unreadable process table waits before it is read again.
+/// Short enough that a transient `ps` failure costs a person nothing, long
+/// enough that a permanently unreadable table is not a spin.
 pub(crate) const OBSERVATION_RETRY: Duration = Duration::from_millis(250);
-
-pub(crate) fn gate_hold_action(cause: &str) -> &'static str {
-    if cause == "blocked_quota" {
-        "wait"
-    } else {
-        "hold"
-    }
-}
+/// A refused barrier claim is a race with another attempt's release, which
+/// broadcasts readiness; this bounds the wait if that broadcast was missed.
+pub(crate) const BARRIER_RETRY: Duration = Duration::from_millis(50);
 
 /// Retry accounting. Only failures proven to precede the pane write may
 /// consume the configured retry budget. True means the caller should retry
@@ -2181,16 +1471,8 @@ pub(crate) async fn fail_attempt(
             return false;
         }
         let notification = &handle.notification;
-        let result = match failure.verify_outcome {
-            Some(outcome) => notification.record_verify_attention(outcome),
-            None => notification.record_attention(notification_attention_cause(&failure.cause)),
-        };
-        match result {
-            Ok(record) => {
-                if let Some(messaging) = inner.workspace_messaging() {
-                    messaging.notification_attention_recorded(record);
-                }
-            }
+        match notification.record_attention(notification_attention_cause(&failure.cause)) {
+            Ok(_) => {}
             Err(NotificationAdapterError::TerminalConflict(_)) => return false,
             Err(error) => {
                 // The workspace journal remains at its last post-write
@@ -2242,33 +1524,20 @@ pub(crate) fn notify_notification_prewrite_blocked(
 pub(crate) fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
     match cause {
         "paste_failed" => NotificationAttentionCause::PasteFailed,
-        "verify_failed" => NotificationAttentionCause::VerifyFailed,
         "pane_rebound_after_paste" => NotificationAttentionCause::PaneReboundAfterPaste,
         "submit_failed" => NotificationAttentionCause::SubmitFailed,
-        "receipt_occupant_changed" => NotificationAttentionCause::ReceiptOccupantChanged,
-        "ack_timeout" => NotificationAttentionCause::AckTimeout,
         _ => NotificationAttentionCause::TransportOutcomeUnknown,
     }
 }
 
 pub(crate) fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
-    // Unproven hook admission is a durable block, never a retry budget
-    // question: only an admitting edge, a claim, or a withdrawal moves it.
-    if failure.cause == HOOK_ADMISSION_UNPROVEN {
-        return false;
-    }
     // The attempt already has a durable Writing fact. Its exact zero-byte
     // correction must remain withdrawable instead of being replayed
     // automatically.
     if failure.cause == "paste_command_unwritten" {
         return false;
     }
-    matches!(failure.boundary, WriteBoundary::BeforeWrite)
-        && !matches!(
-            failure.cause.as_str(),
-            "pane_too_narrow" | "composer_ownership_unproven" | "binding_unprovable"
-        )
-        && spent <= retry_max
+    matches!(failure.boundary, WriteBoundary::BeforeWrite) && spent <= retry_max
 }
 
 /// Report a pre-write notification stall without inventing a terminal fact.
@@ -2290,630 +1559,6 @@ pub(crate) fn notify_notification_deferred(
         None,
         About::default(),
     );
-}
-
-/// Quota hold: the in-flight notification records its durable hold and the
-/// admin is alerted once with the reset hint. Nothing here ever requeues
-/// automatically; the positive reset edge reopens the exact attempt.
-pub(crate) async fn park_recipient(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    hint: Option<String>,
-) {
-    match handle.notification.record_quota_held() {
-        Ok(_) => {}
-        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
-        Err(error) => {
-            error!(id = %handle.msg_id, error = %error, "notification quota-held fact failed");
-            notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
-            return;
-        }
-    }
-    advance(
-        inner,
-        handle,
-        &[DeliveryState::Gating],
-        Step::to(DeliveryState::ParkedBlockedQuota).cause("blocked_quota"),
-    );
-    let hint = hint.unwrap_or_else(|| "quota exhausted".to_string());
-    admin_notify(
-        inner,
-        NotifyLevel::Urgent,
-        &format!("{} held: quota exhausted", handle.to),
-        &format!(
-            "message {} to {} is held ({hint}); it will not resume automatically",
-            handle.msg_id, handle.to
-        ),
-        Some(&handle.msg_id),
-        Some(handle.session_idx),
-        About::delivery(&handle.to),
-    );
-    // The positive reset edge can race this durable hold append. If it
-    // already won, the edge's scan found no held attempt. Recheck the
-    // exact route once after the hold exists so the attempt cannot be
-    // stranded until another unrelated redraw.
-    if let Some(observation) =
-        fusion::quota_reset_observation_now(inner, handle.session_idx, &handle.pane_id)
-    {
-        crate::apply_messaging_observation(inner, observation);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Gate
-// ---------------------------------------------------------------------------
-
-pub(crate) enum GateOutcome {
-    Proceed {
-        manifest_id: String,
-        /// pane_pid of the admitted occupant, re-checked before paste and
-        /// submit: a pane whose occupant changed after admit must never be
-        /// injected into.
-        pane_pid: i32,
-        /// The regate hold observed an exact state, readiness, or pane edge.
-        /// Only this grants a fresh immediate re-proof allowance.
-        regate_evidence_changed: bool,
-    },
-    Park {
-        hint: Option<String>,
-    },
-    /// Repeated identical evidence proved this exact mailbox attempt cannot
-    /// reach the write boundary. The durable block makes it visible and
-    /// operator-withdrawable without touching the pane.
-    BlockedPreWrite {
-        cause: NotificationPreWriteCause,
-        observation: Box<NotificationPreWriteObservation>,
-    },
-    /// A mailbox notification remains durably queued or gating. The
-    /// in-memory worker stops, and the next route or restart reconciliation
-    /// can attach a fresh worker without inventing a terminal session fact.
-    Deferred {
-        cause: String,
-    },
-    Withdrawn,
-}
-
-/// The delivery gate, in spec order: pane resolution and liveness, mode,
-/// fused state (quota park, modal decline-or-hold, working composer proof,
-/// idle_with_input hold, idle proceed). Event-driven: holds wake on fused
-/// state changes, pane field changes, and session reattach. The recompute
-/// that admits a delivery runs immediately before pasting, so the gate
-/// snapshot is fresher than any human keystroke round-trip.
-pub(crate) async fn gate(
-    inner: &Arc<Inner>,
-    handle: &Arc<DeliveryHandle>,
-    initial_hold: Option<String>,
-) -> GateOutcome {
-    let mut declines: HashMap<String, u32> = HashMap::new();
-    let mut notified_rules: HashSet<String> = HashSet::new();
-    let mut last_hold: Option<String> = None;
-    let mut forced_hold = initial_hold;
-    let mut regate_evidence_changed = false;
-    // One-shot visibility for wedged holds: a delivery held in gating past
-    // the configured threshold pings the admin exactly once.
-    let mut hold_since: Option<Instant> = None;
-    let mut hold_notified = false;
-    // Subscribe once before the first evaluation and retain this receiver for
-    // the gate's whole lifetime. Replacing it between re-evaluations leaves a
-    // gap where a settled readiness edge can be published after an early pane
-    // wake but before the next receiver exists, stranding a now-clean pane.
-    let mut ev_rx = inner.events.subscribe();
-    // When the idle-ambiguous composer hold began. Cleared whenever any
-    // other verdict interrupts, so only unbroken ambiguity can outlive the
-    // settle window and become the durable block.
-    let mut ambiguous_since: Option<Instant> = None;
-    let ambiguous_settle = Duration::from_millis(inner.cfg.ambiguous_composer_settle_ms);
-    'gate: loop {
-        // The event receiver predates every evaluation, so events published
-        // mid-evaluation or between iterations remain buffered. Evaluation
-        // itself is still authoritative.
-        let watcher = watcher_for_handle(inner, handle);
-        let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
-
-        match handle.notification.ensure_current_gating() {
-            Ok(()) => {}
-            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
-                return GateOutcome::Withdrawn;
-            }
-            Err(error) => {
-                error!(id = %handle.msg_id, error = %error, "notification gate recheck failed");
-                return GateOutcome::Deferred {
-                    cause: NOTIFICATION_RECORD_FAILED.to_string(),
-                };
-            }
-        }
-
-        // A regate hold is only a seed. A cached `Working` verdict must take
-        // the fresh capture path so a clean composer can admit a doorbell
-        // during the turn, and a cached draft must be re-read so the durable
-        // composer hold is recorded immediately instead of waiting in memory
-        // for another pane event.
-        let initial_hold = forced_hold
-            .take()
-            .filter(|cause| !matches!(cause.as_str(), "idle_with_input" | "working"));
-        let hold = if let Some(cause) = initial_hold {
-            Some(cause)
-        } else {
-            match &watcher {
-                None => Some("session_detached".to_string()),
-                Some(w) => 'pane: {
-                    let Some(row) = w.pane(&handle.pane_id) else {
-                        break 'pane Some("no_such_pane".to_string());
-                    };
-                    if row.dead {
-                        break 'pane Some("pane_dead".to_string());
-                    }
-                    if row.in_mode {
-                        // Human scrolling in copy-mode; %pane-mode-changed
-                        // re-triggers via the pane event stream.
-                        Some("pane_in_mode".to_string())
-                    } else {
-                        let Some(manifest) =
-                            fusion::bind_manifest_for(inner, handle.session_idx, &row)
-                        else {
-                            break 'pane Some("no_manifest".to_string());
-                        };
-                        let manifest_id = manifest.agent.id.clone();
-                        let Some(det) = crate::observe_pane(
-                            inner,
-                            handle.session_idx,
-                            w,
-                            &handle.pane_id,
-                            true,
-                            "gate",
-                        )
-                        .await
-                        else {
-                            break 'pane Some("no_such_pane".to_string());
-                        };
-
-                        if let Some(pane_pid) = notification_pane_for_unproven_composer(
-                            inner,
-                            handle,
-                            &row,
-                            &manifest_id,
-                            &det,
-                        ) {
-                            gate_line(inner, handle, "proceed", Some(&det.decided_by), None);
-                            return GateOutcome::Proceed {
-                                manifest_id,
-                                pane_pid,
-                                regate_evidence_changed,
-                            };
-                        }
-                        if det.write_block.as_deref() == Some(HOOK_ADMISSION_UNPROVEN) {
-                            let Some(mut observation) =
-                                composer_semantic_observation(inner, handle, &row, &manifest_id)
-                            else {
-                                return GateOutcome::BlockedPreWrite {
-                                    cause: NotificationPreWriteCause::BindingUnprovable,
-                                    observation: Box::new(binding_unprovable_observation(
-                                        inner,
-                                        handle,
-                                        row.pane_pid,
-                                        &manifest_id,
-                                    )),
-                                };
-                            };
-                            observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
-                            return GateOutcome::BlockedPreWrite {
-                                cause: NotificationPreWriteCause::WriteReadinessChanged,
-                                observation: Box::new(observation),
-                            };
-                        }
-                        match det.state {
-                            AgentState::Idle => {
-                                // Runtime idle is not permission to write. A
-                                // turn-end hook can put the pane in idle while
-                                // the composer holds a staged payload the screen
-                                // sensor could not read. Proceeding pastes over it.
-                                match (det.write_ready, det.write_block.as_deref()) {
-                                    (true, _) => {
-                                        // The admitted pid is what every
-                                        // receipt is later held against, so an
-                                        // unreadable process table is a
-                                        // refusal, not a shrug. Falling back
-                                        // to the pane root here would pin the
-                                        // delivery to the SHELL and then
-                                        // resolve receipts against whoever
-                                        // sits at that prompt next.
-                                        //
-                                        // A HOLD rather than an ending: not
-                                        // being able to name the occupant is
-                                        // doubt, and nothing has been written
-                                        // yet. A respawned pane updates its
-                                        // pid in the table without emitting a
-                                        // pane change, so the row can briefly
-                                        // name a process that has already
-                                        // exited, and ending the delivery
-                                        // there would summon a human for a
-                                        // table that was about to catch up.
-                                        let admitted = fusion::admitted_binding(
-                                            inner,
-                                            handle.session_idx,
-                                            &row,
-                                        )
-                                        .filter(|b| b.manifest == manifest_id);
-                                        match admitted {
-                                            None if last_hold.as_deref()
-                                                == Some(OBSERVATION_HOLD) =>
-                                            {
-                                                return GateOutcome::BlockedPreWrite {
-                                                    cause:
-                                                        NotificationPreWriteCause::BindingUnprovable,
-                                                    observation: Box::new(
-                                                        binding_unprovable_observation(
-                                                            inner,
-                                                            handle,
-                                                            row.pane_pid,
-                                                            &manifest_id,
-                                                        ),
-                                                    ),
-                                                };
-                                            }
-                                            None => Some(OBSERVATION_HOLD.to_string()),
-                                            Some(_) => {
-                                                match fusion::foreground_pid_checked(row.pane_pid) {
-                                                    None => Some(OBSERVATION_HOLD.to_string()),
-                                                    Some(pane_pid) => {
-                                                        gate_line(
-                                                            inner,
-                                                            handle,
-                                                            "proceed",
-                                                            Some(&det.decided_by),
-                                                            None,
-                                                        );
-                                                        return GateOutcome::Proceed {
-                                                            manifest_id,
-                                                            pane_pid,
-                                                            regate_evidence_changed,
-                                                        };
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Hold on an event, never a clock: the next
-                                    // pane change re-evaluates, and a screen
-                                    // sensor that can see the composer resolves
-                                    // it without anyone pasting blind.
-                                    // Fusion may have recorded the same failed
-                                    // lookup in write readiness. Settle that path
-                                    // after the same bounded second observation.
-                                    (false, Some(OBSERVATION_HOLD))
-                                        if last_hold.as_deref()
-                                            == Some(WRITE_READINESS_OBSERVATION_HOLD) =>
-                                    {
-                                        return GateOutcome::BlockedPreWrite {
-                                            cause: NotificationPreWriteCause::BindingUnprovable,
-                                            observation: Box::new(binding_unprovable_observation(
-                                                inner,
-                                                handle,
-                                                row.pane_pid,
-                                                &manifest_id,
-                                            )),
-                                        };
-                                    }
-                                    // A composer that reads `ambiguous` on an
-                                    // idle pane may be one frame from proof (a
-                                    // redraw caught mid-paint) or may never be
-                                    // provable at all (a manifest whose rules
-                                    // cannot classify this vendor's clean
-                                    // composer). No single frame separates the
-                                    // two, so the first reading holds — but
-                                    // only for the settle window. Ambiguity
-                                    // that outlives it is a manifest gap
-                                    // wearing a transient's clothes, and no
-                                    // pane event announces "still ambiguous",
-                                    // so the wake settles as a durable,
-                                    // operator-visible block instead of
-                                    // waiting in memory forever. Working
-                                    // frames never reach this arm (the
-                                    // Working arm above owns them), so
-                                    // mid-turn ambiguity — deliberate where a
-                                    // vendor's mid-turn injection is
-                                    // unmeasured — cannot escalate.
-                                    (false, _) if unproven_composer_is_eligible(&det) => {
-                                        if fusion::composer_has_unsubmitted_draft(
-                                            inner,
-                                            handle.session_idx,
-                                            &handle.pane_id,
-                                        ) {
-                                            Some("composer_hold".to_string())
-                                        } else {
-                                            match fusion::foreground_pid_checked(row.pane_pid) {
-                                                None => Some(OBSERVATION_HOLD.to_string()),
-                                                Some(pane_pid) => {
-                                                    gate_line(
-                                                        inner,
-                                                        handle,
-                                                        "proceed",
-                                                        Some(&det.decided_by),
-                                                        None,
-                                                    );
-                                                    return GateOutcome::Proceed {
-                                                        manifest_id,
-                                                        pane_pid,
-                                                        regate_evidence_changed,
-                                                    };
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // A staged human draft is an exact boundary,
-                                    // not a terminal delivery outcome. Keep the
-                                    // notification in Gating until a pane edge
-                                    // proves the draft was submitted or erased.
-                                    (false, Some("composer_hold")) => {
-                                        Some("composer_hold".to_string())
-                                    }
-                                    (false, reason) => Some(format!(
-                                        "not_write_ready:{}",
-                                        reason.unwrap_or("unstamped")
-                                    )),
-                                }
-                            }
-                            AgentState::Dead => Some("pane_dead".to_string()),
-                            AgentState::BlockedQuota => {
-                                let hint = quota_hint(w, &handle.pane_id).await;
-                                gate_line(
-                                    inner,
-                                    handle,
-                                    "park",
-                                    Some(&det.decided_by),
-                                    Some("blocked_quota"),
-                                );
-                                return GateOutcome::Park { hint };
-                            }
-                            AgentState::BlockedModal | AgentState::BlockedPermission => {
-                                let rule = inner.manifests.get(&manifest_id).and_then(|m| {
-                                    m.rules
-                                        .iter()
-                                        .find(|r| r.id == det.decided_by && r.state.is_blocked())
-                                });
-                                match rule {
-                                    Some(r)
-                                        if r.auto_dismiss
-                                            && !r.decline_keys.is_empty()
-                                            && *declines.get(&r.id).unwrap_or(&0)
-                                                < MAX_DECLINES =>
-                                    {
-                                        *declines.entry(r.id.clone()).or_insert(0) += 1;
-                                        gate_line(inner, handle, "decline", Some(&r.id), None);
-                                        let keys = r.decline_keys.clone();
-                                        let rule_id = r.id.clone();
-                                        if !send_decline_keys(
-                                            w,
-                                            &handle.pane_id,
-                                            manifest,
-                                            &rule_id,
-                                            &keys,
-                                        )
-                                        .await
-                                        {
-                                            // The screen changed under the
-                                            // decline (TOCTOU): the confirming
-                                            // key was withheld. Back to the
-                                            // gate loop to re-read reality.
-                                            gate_line(
-                                                inner,
-                                                handle,
-                                                "decline_aborted",
-                                                Some(&rule_id),
-                                                Some("modal_changed"),
-                                            );
-                                        }
-                                        // One-shot settle so the dismissal
-                                        // renders before the re-check; the
-                                        // decline count bounds this loop.
-                                        tokio::time::sleep(DECLINE_SPACING).await;
-                                        continue 'gate;
-                                    }
-                                    _ => {
-                                        // Trust/permission prompts belong to the
-                                        // human: hold and alert, never dismiss.
-                                        let rule_id = rule
-                                            .map(|r| r.id.clone())
-                                            .unwrap_or_else(|| det.decided_by.clone());
-                                        if notified_rules.insert(rule_id.clone()) {
-                                            admin_notify(
-                                            inner,
-                                            NotifyLevel::ActionRequired,
-                                            &format!("{} blocked: {rule_id}", handle.to),
-                                            &format!(
-                                                "delivery {} is held; rule {rule_id} needs a decision",
-                                                handle.msg_id
-                                            ),
-                                            Some(&handle.msg_id),
-                                            Some(handle.session_idx),
-                                            // The pane, not the delivery:
-                                            // the delivery is only gating,
-                                            // and the thing a human clears
-                                            // is the prompt on the pane.
-                                            About::pane(&handle.pane_id),
-                                        );
-                                        }
-                                        Some(format!("blocked:{rule_id}"))
-                                    }
-                                }
-                            }
-                            AgentState::Working => {
-                                // Runtime state is not permission to write,
-                                // but it is not an automatic refusal either.
-                                // A running turn is an observation, not a
-                                // blocker; only a proven non-Cyclops draft
-                                // holds the doorbell.
-                                if fusion::composer_has_unsubmitted_draft(
-                                    inner,
-                                    handle.session_idx,
-                                    &handle.pane_id,
-                                ) {
-                                    Some("composer_hold".to_string())
-                                } else {
-                                    match fusion::foreground_pid_checked(row.pane_pid) {
-                                        None if last_hold.as_deref() == Some(OBSERVATION_HOLD) => {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        }
-                                        None => Some(OBSERVATION_HOLD.to_string()),
-                                        Some(pane_pid) => {
-                                            gate_line(
-                                                inner,
-                                                handle,
-                                                "proceed",
-                                                Some(&det.decided_by),
-                                                None,
-                                            );
-                                            return GateOutcome::Proceed {
-                                                manifest_id,
-                                                pane_pid,
-                                                regate_evidence_changed,
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                            // Human typing always wins. A notification has
-                            // reached a conclusive pre-write refusal: publish
-                            // it durably now, rather than waiting in memory
-                            // for a turn that may never occur (for example a
-                            // local slash command).
-                            AgentState::IdleWithInput => {
-                                let Some(mut observation) = composer_semantic_observation(
-                                    inner,
-                                    handle,
-                                    &row,
-                                    &manifest_id,
-                                ) else {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                };
-                                observation.write_block = Some("composer_hold".to_string());
-                                return GateOutcome::BlockedPreWrite {
-                                    cause: NotificationPreWriteCause::WriteReadinessChanged,
-                                    observation: Box::new(observation),
-                                };
-                            }
-                            AgentState::Unknown => Some("unknown".to_string()),
-                        }
-                    }
-                }
-            }
-        };
-        // Only unbroken ambiguity may settle: any other verdict in between
-        // restarts the window from zero.
-        if hold.as_deref() != Some(AMBIGUOUS_COMPOSER_HOLD) {
-            ambiguous_since = None;
-        }
-        if let Some(cause) = hold {
-            handle.set_hold(Some(normalize_hold_cause(&cause)));
-            if last_hold.as_deref() != Some(cause.as_str()) {
-                gate_line(inner, handle, gate_hold_action(&cause), None, Some(&cause));
-                last_hold = Some(cause.clone());
-            }
-            let since = *hold_since.get_or_insert_with(Instant::now);
-            let notify_at = since + Duration::from_millis(inner.cfg.gate_hold_notify_ms);
-            // A hold caused by a failed OBSERVATION has no edge coming to
-            // release it. Every other cause is a fact about the pane, and
-            // the pane announces when that changes; "we could not read the
-            // process table" announces nothing, and a transient failure
-            // would otherwise wedge the delivery for good. So that one
-            // cause, and only that one, also wakes on a bounded retry.
-            // The re-evaluation is the full gate: a fresh binding and
-            // fresh clean-composer proof, never a shortcut back to
-            // proceed.
-            // The same doubt reaches the gate two ways: this gate's own
-            // foreground check, and a stamped verdict that already
-            // refused for it. Both are an observation that did not
-            // answer, and neither produces a pane event to wake on.
-            let unprovable =
-                cause == OBSERVATION_HOLD || cause == format!("not_write_ready:{OBSERVATION_HOLD}");
-            // The ambiguous-composer hold gets the same treatment for the
-            // same reason: unchanged ambiguity emits no pane event, so the
-            // settle boundary needs its own wake to become the durable
-            // block rather than an indefinite in-memory wait.
-            let retry_at = if unprovable {
-                Some(Instant::now() + OBSERVATION_RETRY)
-            } else if cause == AMBIGUOUS_COMPOSER_HOLD {
-                ambiguous_since.map(|since| since + ambiguous_settle)
-            } else if cause == "barrier_held" {
-                Some(Instant::now() + Duration::from_millis(50))
-            } else {
-                None
-            };
-            let exact_evidence = tokio::select! {
-                changed = wait_pane_change(
-                    &mut ev_rx,
-                    pane_rx.as_mut(),
-                    handle.session_idx,
-                    &handle.pane_id,
-                    &handle.cancel,
-                ) => changed,
-                _ = async {
-                    match retry_at {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = tokio::time::sleep_until(notify_at), if !hold_notified => {
-                    // A wedged hold must at least be visible. One ping per
-                    // delivery; the hold itself keeps waiting on events.
-                    hold_notified = true;
-                    admin_notify(
-                        inner,
-                        NotifyLevel::ActionRequired,
-                        &format!("notification to {} held in gating", handle.to),
-                        &format!(
-                            "message {} has been held for over {}ms ({cause})",
-                            handle.msg_id, inner.cfg.gate_hold_notify_ms
-                        ),
-                        Some(&handle.msg_id),
-                        Some(handle.session_idx),
-                        About::pane(&handle.pane_id),
-                    );
-                    false
-                }
-            };
-            regate_evidence_changed |= exact_evidence;
-        }
-    }
-}
-
-/// Keep receipt vocabulary stable and independent of vendor manifest rule
-/// ids. Ledger gate lines retain the exact cause for diagnostics; receipts
-/// expose only these normalized tokens.
-pub(crate) fn normalize_hold_cause(cause: &str) -> &'static str {
-    match cause {
-        "session_detached" => "session_detached",
-        "pane_in_mode" => "pane_in_mode",
-        "working" => "working",
-        "idle_with_input" => "idle_with_input",
-        "held_for_existing_draft" => "held_for_existing_draft",
-        "blocked_quota" => "blocked_quota",
-        "unknown" => "unknown",
-        c if c.split(':').next() == Some("blocked") => "blocked",
-        // Runtime state is idle, but nothing proved the composer
-        // was clean. Receipts say so plainly; the exact reason stays on
-        // the gate ledger line.
-        c if c.split(':').next() == Some("not_write_ready") => "not_write_ready",
-        _ => "unknown",
-    }
 }
 
 /// Manifest decline keys, in order, with spacing. The keys come from the
@@ -2966,13 +1611,6 @@ pub(crate) fn modal_still_matches(
     manifest
         .evaluate(title, screen)
         .is_some_and(|r| r.id == rule_id && r.state.is_blocked())
-}
-
-/// Parse the quota reset hint from the screen. Only the parsed phrase ever
-/// leaves this function; raw captures stay out of the ledger.
-pub(crate) async fn quota_hint(watcher: &Arc<SessionWatcher>, pane_id: &str) -> Option<String> {
-    let screen = watcher.client().capture_pane(pane_id).await.ok()?;
-    parse_reset_hint(&screen)
 }
 
 /// Mark a pane as holding text, without waiting for a sensor to see it.
@@ -3092,13 +1730,14 @@ pub(crate) fn notification_write_cause(error: NotificationAdapterError) -> Strin
     }
 }
 
-/// Record a receipt before the legacy delivery state claims it.
+/// Record a receipt before the in-memory delivery state claims it.
 ///
 /// False means the notification already resolved the other way in a race.
 pub(crate) fn record_notification_notified(
     handle: &Arc<DeliveryHandle>,
+    verified_by: Option<VerifiedBy>,
 ) -> Result<bool, NotificationAdapterError> {
-    match handle.notification.record_notified() {
+    match handle.notification.record_notified(verified_by) {
         Ok(_) => Ok(true),
         Err(NotificationAdapterError::TerminalConflict(_)) => Ok(false),
         Err(error) => Err(error),
@@ -4205,23 +2844,25 @@ pub(crate) fn resolve_hook_ack(
         // resolves the delivery here instead. `advance` is its own
         // transaction and refuses if the state moved again underneath,
         // which is the safe handoff back to the worker.
-        DeliveryState::Submitted => match record_notification_notified(handle) {
-            Ok(true) => advance(
-                inner,
-                handle,
-                &[DeliveryState::Submitted],
-                Step::to(DeliveryState::DeliveredVerified)
-                    .cause("hook_ack")
-                    .verified(VerifiedBy::Hook)
-                    .turn_edge(edge_ms)
-                    .turn(turn),
-            ),
-            Ok(false) => false,
-            Err(error) => {
-                error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
-                false
+        DeliveryState::Submitted => {
+            match record_notification_notified(handle, Some(VerifiedBy::Hook)) {
+                Ok(true) => advance(
+                    inner,
+                    handle,
+                    &[DeliveryState::Submitted],
+                    Step::to(DeliveryState::DeliveredVerified)
+                        .cause("hook_ack")
+                        .verified(VerifiedBy::Hook)
+                        .turn_edge(edge_ms)
+                        .turn(turn),
+                ),
+                Ok(false) => false,
+                Err(error) => {
+                    error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
+                    false
+                }
             }
-        },
+        }
         // A screen receipt that already resolved stands. The replacement
         // occupant cannot upgrade it, and it must not be taken away
         // either: the original binding earned it before the pane changed
@@ -4427,7 +3068,7 @@ pub(crate) fn confirm_unkeyed_dispatch_ack(
     match state {
         DeliveryState::Staged => {}
         DeliveryState::Submitted => {
-            let recorded = match record_notification_notified(&handle) {
+            let recorded = match record_notification_notified(&handle, Some(VerifiedBy::Hook)) {
                 Ok(recorded) => recorded,
                 Err(error) => {
                     error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");
@@ -4584,7 +3225,7 @@ pub(crate) fn confirm_dispatch_ack(
         match state {
             DeliveryState::Staged => {}
             DeliveryState::Submitted => {
-                let recorded = match record_notification_notified(&handle) {
+                let recorded = match record_notification_notified(&handle, Some(VerifiedBy::Hook)) {
                     Ok(recorded) => recorded,
                     Err(error) => {
                         error!(id = %handle.msg_id, error = %error, "notification receipt fact failed");

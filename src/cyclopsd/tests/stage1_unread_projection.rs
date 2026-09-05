@@ -554,6 +554,16 @@ async fn slice1_withdrawal_leaves_message_pending_and_unread() {
         )
         .await;
     assert_eq!(resp["result"]["label"], "worker", "{resp}");
+    // Copy-mode holds the wake in the gate, which is the one place a
+    // withdrawal can still take it.
+    rig.tmux.run_ok(&["copy-mode", "-t", &pane]);
+    rig.ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "readiness"
+                && e["data"]["pane_id"] == pane.as_str()
+                && e["data"]["write_block"] == "pane_in_mode"
+        })
+        .await;
 
     let send = rig
         .daemon

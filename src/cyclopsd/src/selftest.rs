@@ -569,6 +569,7 @@ pub(crate) async fn selftest(
     let started = Instant::now();
     let started_ms = unix_ms();
     let send_params = MsgSendParams {
+        raw: false,
         to: vec![params.target.clone()],
         recipient_keys: None,
         expected_caller: None,

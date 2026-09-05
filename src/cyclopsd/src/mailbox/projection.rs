@@ -11,10 +11,10 @@ use cyclops_proto::{
     MessagesFollowResult, MessagesSnapshotCounts, MessagesSnapshotResult, NotificationAttemptId,
     NotificationAttentionCause, NotificationBarrierRetirementCause, NotificationFact,
     NotificationPreWriteCause, NotificationRecord, NotificationRequeue, NotificationResolution,
-    NotificationResolutionConsumptionEvidence, NotificationResolutionConsumptionObservation,
-    NotificationRouteEvidenceId, NotificationState, NotificationTransport, RecipientKey,
-    RequestContent, RequestDigest, StatusBlockedNotification, StatusNextAction, WorkspaceId,
-    CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
+    NotificationTransport, RecipientKey, RequestContent, RequestDigest, StatusBlockedNotification,
+    StatusNextAction, WorkspaceId, CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_COMPACT_CLAIM,
+    NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 
 use super::*;
@@ -31,6 +31,8 @@ pub struct MessageDraft {
     pub client_key: Option<String>,
     pub supersedes: Option<MessageId>,
     pub presentation: MessagePresentation,
+    /// The sender asked for a raw write.
+    pub raw: bool,
 }
 
 /// One active composer barrier with the durable message and mailbox facts
@@ -40,16 +42,6 @@ pub(crate) struct ActiveComposerNotification {
     pub(crate) record: NotificationRecord,
     pub(crate) message: Option<LedgerLine>,
     pub(crate) entry_state: Option<MailboxEntryState>,
-    pub(crate) recovery_action: ExactOwnedRecoveryAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactOwnedRecoveryAction {
-    Ineligible,
-    Submit,
-    Clear,
-    Reconcile,
-    Inspect,
 }
 
 /// Bounded body-free status projection of durable pre-write failures.
@@ -73,6 +65,8 @@ pub struct ReplyDraft {
     /// presents a current name; the parent keeps its historical sender
     /// label in its own fact, which this never rewrites.
     pub recipient_label: String,
+    /// The sender asked for a raw write.
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +81,7 @@ pub(crate) struct CanonicalDraft {
     pub(crate) client_key: Option<String>,
     pub(crate) supersedes: Option<MessageId>,
     pub(crate) presentation: MessagePresentation,
+    pub(crate) raw: bool,
 }
 
 /// Result of pre-append idempotency verification.
@@ -120,7 +115,6 @@ pub enum ClaimOutcome {
         skipped_oldest: Option<MessageId>,
         withdrawn_attempt: Option<NotificationAttemptId>,
         consumed_doorbell_attempt: Option<NotificationAttemptId>,
-        claimed_ack_timeout_attempt: Option<NotificationAttemptId>,
     },
     /// Entry was already claimed by this claimant; returns existing entry and canonical message line.
     AlreadyClaimed {
@@ -128,7 +122,6 @@ pub enum ClaimOutcome {
         message: InboxMessage,
         withdrawn_attempt: Option<NotificationAttemptId>,
         consumed_doorbell_attempt: Option<NotificationAttemptId>,
-        claimed_ack_timeout_attempt: Option<NotificationAttemptId>,
     },
 }
 
@@ -278,6 +271,8 @@ pub enum MailboxError {
     NotificationBindingRequired,
     #[error("notification binding is only allowed on the Writing transition")]
     NotificationBindingForbidden,
+    #[error("notification verified_by is only allowed on the Notified transition")]
+    NotificationVerifiedByForbidden,
     #[error("notification binding recipient does not match the fact recipient")]
     NotificationBindingMismatch,
     #[error("notification transport is only allowed on the Writing transition")]
@@ -315,14 +310,6 @@ pub enum MailboxError {
     NotificationRecipientNotAgent,
     #[error("notification requeue requires attention or an observed quota reset")]
     NotificationRequeueRequiresAttention,
-    #[error(
-        "notification attempt '{0}' has an unresolved post-write composer barrier with an incomplete durable binding"
-    )]
-    NotificationRequeueBarrierBindingIncomplete(NotificationAttemptId),
-    #[error(
-        "notification attempt '{0}' still owns an exact staged composer notification; resolve it before requeueing"
-    )]
-    NotificationRequeueExactComposerBarrier(NotificationAttemptId),
     #[error("notification clearance requires an attention-required attempt")]
     NotificationClearRequiresAttention,
     #[error(
@@ -545,6 +532,7 @@ pub(crate) fn uses_legacy_notification_write_contract(record: &NotificationRecor
             None | Some(DOORBELL_FORMAT_COMPACT_CLAIM)
         ),
         NotificationTransport::DirectPayload => record.doorbell_format.is_none(),
+        NotificationTransport::Raw => false,
     };
     legacy_transport
         && record
@@ -642,25 +630,6 @@ pub(crate) struct NotificationScheduleBlock {
     pub message_id: MessageId,
     pub attempt_id: NotificationAttemptId,
     pub block: MessageWakeBlock,
-}
-
-/// Immutable authorization inputs for one unresolved attention attempt.
-#[derive(Debug, Clone)]
-pub(crate) struct AttentionTarget {
-    pub(crate) record: NotificationRecord,
-}
-
-/// How an exact resolution action may proceed after reserving its attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttentionResolutionStart {
-    /// No durable terminal action exists for this attempt.
-    Fresh,
-    /// A pre-key intent exists, but terminal acceptance was never recorded.
-    IntentOnlyUncertain,
-    /// The terminal accepted Complete, but consumption was not observed.
-    AcceptedUnconsumed,
-    /// The matching terminal action may have landed and may only be reconciled.
-    ReconcileOnly,
 }
 
 impl MailboxProjection {
@@ -1054,6 +1023,7 @@ impl MailboxProjection {
                         transport: current.transport,
                         doorbell_format: current.doorbell_format,
                         cause: None,
+                        verified_by: None,
                         verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
@@ -1203,6 +1173,7 @@ impl MailboxProjection {
                         transport: current.transport,
                         doorbell_format: current.doorbell_format,
                         cause: None,
+                        verified_by: None,
                         verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
@@ -1324,6 +1295,7 @@ impl MailboxProjection {
             transport,
             doorbell_format,
             cause,
+            verified_by,
             verify_outcome,
             pre_write_cause,
             wake_block,
@@ -1380,7 +1352,10 @@ impl MailboxProjection {
             _ => {}
         }
 
-        if state == NotificationState::Writing {
+        // A raw write proves nothing about the occupant, so it is the one
+        // Writing transition that carries no binding.
+        let raw = transport == Some(NotificationTransport::Raw);
+        if state == NotificationState::Writing && !raw {
             let Some(binding) = binding.as_ref() else {
                 return Err(MailboxError::NotificationBindingRequired);
             };
@@ -1389,6 +1364,9 @@ impl MailboxProjection {
             }
         } else if binding.is_some() {
             return Err(MailboxError::NotificationBindingForbidden);
+        }
+        if verified_by.is_some() && state != NotificationState::Notified {
+            return Err(MailboxError::NotificationVerifiedByForbidden);
         }
         if state != NotificationState::Writing && transport.is_some() {
             return Err(MailboxError::NotificationTransportForbidden);
@@ -1502,6 +1480,7 @@ impl MailboxProjection {
                         transport: NotificationTransport::Doorbell,
                         doorbell_format: None,
                         cause: None,
+                        verified_by: None,
                         verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
@@ -1545,6 +1524,7 @@ impl MailboxProjection {
                         current.doorbell_format
                     },
                     cause,
+                    verified_by,
                     verify_outcome,
                     pre_write_cause,
                     wake_block,
@@ -1624,6 +1604,7 @@ impl MailboxProjection {
         let mut record = current.clone();
         record.state = NotificationState::Gating;
         record.cause = None;
+        record.verified_by = None;
         record.verify_outcome = None;
         record.pre_write_cause = None;
         record.wake_block = None;
@@ -1767,6 +1748,7 @@ impl MailboxProjection {
                 transport: NotificationTransport::Doorbell,
                 doorbell_format: None,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
@@ -2035,6 +2017,7 @@ impl MailboxProjection {
                 transport: current.transport,
                 doorbell_format: current.doorbell_format,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
@@ -3200,114 +3183,6 @@ impl MailboxProjection {
             .is_some_and(|entry| entry.state.is_pending())
     }
 
-    /// Whether this exact force-submit timer target is still eligible under
-    /// the workspace journal lock.
-    pub(crate) fn force_submit_target_is_pending(&self, target: &AttentionTarget) -> bool {
-        let current = self.alarm_by_attempt(target.record.attempt_id);
-        current == Some(&target.record)
-            && current.is_some_and(NotificationRecord::needs_exact_owned_reconciliation)
-            && self.notification(target.record.recipient, &target.record.message_id) == current
-            && self
-                .active_notification_barriers
-                .get(&target.record.attempt_id)
-                == current
-            && self.entry_is_pending(target.record.recipient, &target.record.message_id)
-    }
-
-    /// Choose the terminal recovery for one exact active composer barrier.
-    ///
-    /// An existing durable intent always wins. For a fresh action, pending
-    /// means submit the staged doorbell and a claim ordered after the write
-    /// means clear it. Selection and intent persistence share the store lock
-    /// so a concurrent claim lands wholly before or after that boundary.
-    pub(crate) fn exact_owned_resolution(
-        &self,
-        target: &AttentionTarget,
-    ) -> Option<NotificationResolution> {
-        let current = self.alarm_by_attempt(target.record.attempt_id)?;
-        if current != &target.record
-            || self.attention_resolved(current.attempt_id)
-            || !current.needs_exact_owned_reconciliation()
-            || self.notification(current.recipient, &current.message_id) != Some(current)
-            || self.active_notification_barriers.get(&current.attempt_id) != Some(current)
-        {
-            return None;
-        }
-        if let Some(recorded) = self.attention_resolution_intent(current.attempt_id) {
-            return Some(recorded);
-        }
-        if self.entry_is_pending(current.recipient, &current.message_id) {
-            Some(NotificationResolution::Complete)
-        } else if self.exact_recipient_claimed_after_write(current) {
-            Some(NotificationResolution::Discard)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn exact_owned_recovery_action(
-        &self,
-        current: &NotificationRecord,
-    ) -> ExactOwnedRecoveryAction {
-        if self.attention_resolved(current.attempt_id)
-            || !current.needs_exact_owned_reconciliation()
-            || self.notification(current.recipient, &current.message_id) != Some(current)
-            || self.active_notification_barriers.get(&current.attempt_id) != Some(current)
-        {
-            return ExactOwnedRecoveryAction::Ineligible;
-        }
-        match self.attention_resolution_intent(current.attempt_id) {
-            None if self.entry_is_pending(current.recipient, &current.message_id) => {
-                ExactOwnedRecoveryAction::Submit
-            }
-            None if self.exact_recipient_claimed_after_write(current) => {
-                ExactOwnedRecoveryAction::Clear
-            }
-            Some(NotificationResolution::Complete)
-                if self.attention_resolution_action_accepted(current.attempt_id)
-                    == Some(NotificationResolution::Complete)
-                    && (self
-                        .attention_resolution_consumption_observed(current.attempt_id)
-                        .is_some()
-                        || self.exact_claim_after_attention_action(current).is_some()) =>
-            {
-                ExactOwnedRecoveryAction::Reconcile
-            }
-            Some(NotificationResolution::Discard)
-                if self.attention_resolution_action_accepted(current.attempt_id)
-                    == Some(NotificationResolution::Discard) =>
-            {
-                ExactOwnedRecoveryAction::Reconcile
-            }
-            Some(_) => ExactOwnedRecoveryAction::Inspect,
-            None => ExactOwnedRecoveryAction::Ineligible,
-        }
-    }
-
-    /// Oldest exact notification barrier owned by a durable recipient claim.
-    ///
-    /// A staged doorbell and an exact-attempt ACK-timeout doorbell keep their original
-    /// FIFO position until byte-exact composer reconciliation settles them.
-    pub(crate) fn claimed_notification_barrier(
-        &self,
-        recipient: RecipientKey,
-    ) -> Option<&NotificationRecord> {
-        self.notifications
-            .values()
-            .filter(|record| {
-                record.recipient == recipient
-                    && record.transport == NotificationTransport::Doorbell
-                    && (record.state == NotificationState::Staged
-                        || record.needs_claimed_ack_timeout_reconciliation())
-                    && self.exact_recipient_claimed_after_write(record)
-                    && self
-                        .active_notification_barriers
-                        .get(&record.attempt_id)
-                        .is_some_and(|active| active == *record)
-            })
-            .min_by_key(|record| record.started_seq)
-    }
-
     /// Oldest pre-submit operator notification whose mailbox payload was
     /// already claimed through the socket. Retrieval does not relinquish this
     /// notification's FIFO position.
@@ -3487,6 +3362,7 @@ impl MailboxProjection {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verified_by: None,
                 verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
@@ -3532,6 +3408,7 @@ impl MailboxProjection {
                 .then_some(true),
             attempt_id: Some(record.attempt_id),
             cause: record.cause,
+            verified_by: record.verified_by,
             verify_outcome: record.verify_outcome,
             pre_write_cause: record.pre_write_cause,
             pre_write_pane_width: width_block.map(|(observed, _)| observed),
@@ -3574,64 +3451,6 @@ impl MailboxProjection {
         }
     }
 
-    pub(crate) fn attention_resolution_action_accepted(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> Option<NotificationResolution> {
-        self.resolution_actions_accepted.get(&attempt_id).copied()
-    }
-
-    pub(crate) fn attention_resolution_consumption_observed(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> Option<NotificationResolutionConsumptionObservation> {
-        self.resolution_consumptions
-            .get(&attempt_id)
-            .copied()
-            .filter(|observation| observation.evidence.proves_exact_consumption())
-    }
-
-    pub(crate) fn exact_claim_after_attention_action(
-        &self,
-        record: &NotificationRecord,
-    ) -> Option<NotificationResolutionConsumptionObservation> {
-        // Ordinary actions linearize when their terminal key is accepted.
-        // Forced Complete uses its separately validated reservation instead:
-        // the reservation and inbox claim share the journal lock, while the
-        // terminal write necessarily occurs after that lock is released.
-        let accepted_seq = self
-            .resolution_action_sequences
-            .get(&record.attempt_id)
-            .copied()?;
-        let action_seq = self
-            .resolution_action_reservation_sequences
-            .get(&record.attempt_id)
-            .copied()
-            .unwrap_or(accepted_seq);
-        let claim_seq = self
-            .claim_sequences
-            .get(&(record.recipient, record.message_id.clone()))
-            .copied()?;
-        if claim_seq <= action_seq {
-            return None;
-        }
-        let entry = self.get_entry(record.recipient, &record.message_id)?;
-        let MailboxEntryState::Claimed {
-            claimant,
-            claimed_at,
-        } = &entry.state
-        else {
-            return None;
-        };
-        if *claimant != record.recipient {
-            return None;
-        }
-        Some(NotificationResolutionConsumptionObservation {
-            evidence: NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
-            observed_at_ms: *claimed_at,
-        })
-    }
-
     pub(crate) fn exact_recipient_claimed_after_write(&self, record: &NotificationRecord) -> bool {
         let Some(write_seq) = self
             .notification_write_sequences
@@ -3659,21 +3478,6 @@ impl MailboxProjection {
                 })
     }
 
-    pub(crate) fn unresolved_attention_for_message(
-        &self,
-        message_id: &MessageId,
-    ) -> Vec<&NotificationRecord> {
-        let mut records: Vec<_> = self
-            .notifications
-            .values()
-            .filter(|record| &record.message_id == message_id)
-            .filter(|record| record.state == NotificationState::AttentionRequired)
-            .filter(|record| !self.resolved_attempts.contains_key(&record.attempt_id))
-            .collect();
-        records.sort_by_key(|record| record.started_seq);
-        records
-    }
-
     pub(crate) fn requeueable_for_message(
         &self,
         message_id: &MessageId,
@@ -3688,20 +3492,6 @@ impl MailboxProjection {
                         && !self.cleared_attempts.contains(&record.attempt_id))
             })
             .filter(|record| !self.resolved_attempts.contains_key(&record.attempt_id))
-            .collect();
-        records.sort_by_key(|record| record.started_seq);
-        records
-    }
-
-    pub(crate) fn quota_held_for_recipient(
-        &self,
-        recipient: RecipientKey,
-    ) -> Vec<&NotificationRecord> {
-        let mut records: Vec<_> = self
-            .notifications
-            .values()
-            .filter(|record| record.recipient == recipient)
-            .filter(|record| record.state == NotificationState::QuotaHeld)
             .collect();
         records.sort_by_key(|record| record.started_seq);
         records

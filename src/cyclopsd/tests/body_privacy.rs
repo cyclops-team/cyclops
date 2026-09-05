@@ -561,6 +561,9 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
     assert!(claimed["error"].is_null(), "claim failed: {claimed}");
     assert_eq!(claimed["result"]["disposition"], "claimed");
     assert_eq!(claimed["result"]["message"]["body"], "first private body");
+    // The claim frees the FIFO and the second doorbell rings at once; the
+    // next request is typed only after that row has landed.
+    wait_for_notification_submitted(&rig, &second_id).await;
 
     let snapshot = pane_request(
         &mut rig,
@@ -612,7 +615,13 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
         );
     let client_dir = named_clients("blocked-claim-releases-fifo");
     let pane_command = codex_ghost_agent_command_loop(&client_dir);
-    let mut rig = Rig::new("blocked-claim-releases-fifo", &manifest, &pane_command, "").await;
+    let mut rig = Rig::new(
+        "blocked-claim-releases-fifo",
+        &manifest,
+        &pane_command,
+        "delivery_retry_max = 0\n",
+    )
+    .await;
     wait_pane_state(&mut rig, "idle").await;
     let recipient = rig.pane_ids().await[0].clone();
     rig.label(&recipient, "recipient").await;
@@ -647,7 +656,10 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
                 && line["data"]["state"] == blocked_state
         })
         .expect("blocked transition is durable");
-    assert_eq!(blocked["data"]["pre_write_cause"], "binding_unprovable");
+    assert_eq!(
+        blocked["data"]["pre_write_cause"],
+        "write_readiness_changed"
+    );
     assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
     assert!(!pane_history(&rig, &recipient).contains(&compact_doorbell(&first_attempt)));
 

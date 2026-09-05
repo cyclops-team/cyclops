@@ -590,23 +590,6 @@ pub(crate) async fn handle_report(
         }
         drop(readings);
     }
-    // A confirmed, exactly keyed Stop can arrive after Cyclops safely staged one
-    // doorbell but before that in-flight path sends its final Enter. Record
-    // that causal conflict only after this hook passed correlation, dedupe,
-    // and current-terminal admission. It is a private check for the exact
-    // staged owner, not a replacement for the pane's current visual state.
-    if keyed_confirmed_end && applied_state == Some(AgentState::Idle) {
-        if let Some(manifest) = origin.manifest.as_deref() {
-            let _ = fusion::record_final_submit_conflict(
-                inner,
-                session_idx,
-                &pane_id,
-                origin.pane_root,
-                origin.agent,
-                manifest,
-            );
-        }
-    }
     if let (Some(previous_edge), Some(manifest_id)) =
         (replaced_provisional_edge, origin.manifest.as_deref())
     {
@@ -668,30 +651,6 @@ pub(crate) async fn handle_report(
             );
         }
     }
-    if let Some(start) = &start_confirmed_by_end {
-        crate::apply_recovered_turn_evidence(
-            inner,
-            fusion::PaneRecoveredTurnEvidence {
-                session_idx: origin.session_idx,
-                pane_id: pane_id.clone(),
-                turn: start.turn.clone(),
-                since_ms: start.edge_ms,
-            },
-        );
-    }
-    if is_turn_start && lifecycle_confirmed {
-        if let Some(turnkey::TurnCorrelation::Exact(turn)) = &correlation {
-            crate::apply_recovered_turn_evidence(
-                inner,
-                fusion::PaneRecoveredTurnEvidence {
-                    session_idx: origin.session_idx,
-                    pane_id: pane_id.clone(),
-                    turn: turn.clone(),
-                    since_ms: edge_ms,
-                },
-            );
-        }
-    }
     // Resolve any waiting delivery whose own payload framing owns this
     // prompt. Not any prompt that mentions its id: see `prompt_names`.
     let mut matched = false;
@@ -700,22 +659,6 @@ pub(crate) async fn handle_report(
         if is_ack {
             if let Some(field) = &m.hooks.ack_payload_field {
                 if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
-                    if m.hooks.ack_evidence == AckEvidence::Receipt {
-                        if let Some(messaging) = inner.workspace_messaging() {
-                            matched |= messaging.attention_consumption_observed(
-                                crate::messaging::MessagingAttentionConsumptionObservation::new(
-                                    session_idx,
-                                    &pane_id,
-                                    origin.recipient_key,
-                                    origin.pane_root,
-                                    origin.agent,
-                                    &m.agent.id,
-                                    text,
-                                    edge_ms,
-                                ),
-                            );
-                        }
-                    }
                     let matching: Vec<_> = delivery::ack_candidates(inner, session_idx, &pane_id)
                         .into_iter()
                         .filter(|handle| handle.claims_prompt(text))

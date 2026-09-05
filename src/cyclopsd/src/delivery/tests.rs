@@ -1,10 +1,11 @@
 use super::*;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Barrier;
 
 use cyclops_proto::{
-    ComposerHold, MessageId, MessagePresentation, NotificationAttemptId,
+    ComposerHold, MessageId, MessagePresentation, NotificationAttemptId, NotificationBinding,
     NotificationRouteEvidenceId, NotificationState, RecipientKey, RecipientPresentation,
     SessionInstanceId, TmuxPaneId, WorkspaceId,
 };
@@ -37,6 +38,20 @@ fn notification_fixture(
 fn notification_fixture_with_summary(
     tag: &str,
     summary: Option<&str>,
+) -> (
+    NotificationScratch,
+    Arc<StdMutex<MessageStore>>,
+    NotificationContext,
+    Arc<DeliveryHandle>,
+    RecipientKey,
+) {
+    notification_fixture_full(tag, summary, false)
+}
+
+fn notification_fixture_full(
+    tag: &str,
+    summary: Option<&str>,
+    raw: bool,
 ) -> (
     NotificationScratch,
     Arc<StdMutex<MessageStore>>,
@@ -81,6 +96,7 @@ fn notification_fixture_with_summary(
                         label: "reviewer".into(),
                     }],
                 },
+                raw,
             },
         )
         .unwrap();
@@ -163,6 +179,67 @@ fn expected_notification_payload_is_the_single_transport_renderer() {
     assert_eq!(expected_notification_payload(&record, &message), None);
 }
 
+/// The raw contract from the unsafe side: the whole rendered message is
+/// what gets pasted, nothing about the occupant is recorded, and the journal
+/// closes the attempt as Notified with no verifier.
+#[test]
+fn a_raw_send_pastes_the_whole_message_and_records_transport_raw() {
+    let (scratch, store, context, handle, recipient) =
+        notification_fixture_full("raw-send", None, true);
+    assert!(handle.raw);
+    let message = context.message_line().unwrap();
+
+    let selected = select_attempt_payload(&handle).unwrap();
+    assert_eq!(selected.bytes, render_canonical_message_payload(&message));
+    assert_eq!(selected.transport, NotificationTransport::Raw);
+    assert_eq!(selected.doorbell_format, None);
+    let lines: Vec<&str> = selected.bytes.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("[cyclops {}] FROM: admin  SUBJECT: Wake", message.id)
+    );
+    assert_eq!(lines[1], "Review the mailbox");
+    assert_eq!(
+        lines.last().copied(),
+        Some(sentinel_for(&message.id).as_str())
+    );
+
+    context.record_gating().unwrap();
+    let writing = context.record_writing_raw().unwrap();
+    assert_eq!(writing.state, NotificationState::Writing);
+    assert_eq!(writing.transport, NotificationTransport::Raw);
+    assert_eq!(writing.binding, None);
+    assert_eq!(writing.doorbell_format, None);
+    assert_eq!(
+        expected_notification_payload(&writing, &message).as_deref(),
+        Some(selected.bytes.as_str())
+    );
+    let notified = context.record_notified(None).unwrap();
+    assert_eq!(notified.state, NotificationState::Notified);
+    assert_eq!(notified.verified_by, None);
+
+    let message_id = context.message_id().clone();
+    drop(handle);
+    drop(context);
+    drop(store);
+    let root = StateRoot::open_or_create(&scratch.0).unwrap();
+    let replayed = MessageStore::open(
+        &root,
+        Path::new("workspaces/current/messages.ndjson"),
+        recipient.workspace_id(),
+        "replay",
+    )
+    .unwrap();
+    let record = replayed
+        .projection()
+        .notification(recipient, &message_id)
+        .unwrap();
+    assert_eq!(record.state, NotificationState::Notified);
+    assert_eq!(record.transport, NotificationTransport::Raw);
+    assert_eq!(record.binding, None);
+    assert_eq!(record.verified_by, None);
+}
+
 fn notification_state(
     store: &Arc<StdMutex<MessageStore>>,
     recipient: RecipientKey,
@@ -175,38 +252,6 @@ fn notification_state(
         .notification(recipient, message_id)
         .cloned()
         .unwrap()
-}
-
-fn prepare_claimed_staged(
-    store: &Arc<StdMutex<MessageStore>>,
-    context: &NotificationContext,
-    recipient: RecipientKey,
-) -> cyclops_proto::NotificationRecord {
-    context.record_gating().unwrap();
-    context
-        .record_writing(
-            ProcessInstanceId::new(3999, 817_999).unwrap(),
-            ProcessInstanceId::new(4000, 818_000).unwrap(),
-            ProcessInstanceId::new(4242, 818_221).unwrap(),
-            "codex",
-            NotificationTransport::Doorbell,
-            Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM),
-        )
-        .unwrap();
-    context.record_staged().unwrap();
-    let claimed = store
-        .lock()
-        .unwrap()
-        .claim(recipient, context.message_id().clone())
-        .unwrap();
-    assert!(matches!(
-        claimed,
-        crate::mailbox::ClaimOutcome::Claimed {
-            consumed_doorbell_attempt: None,
-            ..
-        }
-    ));
-    notification_state(store, recipient, context.message_id())
 }
 
 fn churn_recipient(workspace: WorkspaceId, ordinal: u128) -> RecipientKey {
@@ -631,7 +676,7 @@ async fn status_worker_ownership_requires_a_live_current_or_queued_attempt() {
         .expect("queued handle becomes current");
     assert!(engine.notification_worker_owns(recipient, attempt));
     assert!(!engine.notification_worker_owns(recipient, NotificationAttemptId::generate()));
-    worker.set_fault(CLAIMED_STAGED_SETTLEMENT_FAILED);
+    worker.set_fault("simulated worker fault");
     assert!(
         !engine.notification_worker_owns(recipient, attempt),
         "a faulted worker cannot advertise automatic reconciliation"
@@ -864,19 +909,17 @@ fn prepare_notification_receipt(context: &NotificationContext) {
             None,
         )
         .unwrap();
-    context.record_staged().unwrap();
-    context.reserve_submit().unwrap();
     context.record_submitted().unwrap();
 }
 
 #[test]
 fn screen_and_hook_receipts_keep_the_canonical_barrier_active() {
-    for source in ["screen", "hook"] {
+    for (source, verified_by) in [("screen", VerifiedBy::Screen), ("hook", VerifiedBy::Hook)] {
         let (_scratch, store, context, _handle, recipient) =
             notification_fixture(&format!("{source}-notified-barrier"));
         prepare_notification_receipt(&context);
 
-        context.record_notified().unwrap();
+        context.record_notified(Some(verified_by)).unwrap();
         let active = store
             .lock()
             .unwrap()
@@ -889,7 +932,7 @@ fn screen_and_hook_receipts_keep_the_canonical_barrier_active() {
 }
 
 #[test]
-fn a_summary_notification_keeps_its_operator_preview_in_a_narrow_pane() {
+fn a_summary_notification_renders_the_sender_summary_or_derives_one() {
     let summary = "Yahir needs three jazz songs tonight. Reply with concise recommendations.";
     let (_scratch, _store, context, handle, _recipient) =
         notification_fixture_with_summary("narrow-summary", Some(summary));
@@ -901,12 +944,7 @@ fn a_summary_notification_keeps_its_operator_preview_in_a_narrow_pane() {
     );
     assert_eq!(
         selected.doorbell_format,
-        cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
-    );
-    assert_eq!(
-        selected.required_pane_width(),
-        None,
-        "format 4 may soft-wrap instead of dropping its human-readable summary"
+        Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
     );
 
     // A message accepted without a summary still writes one exact row:
@@ -956,6 +994,7 @@ fn supersede_notification(
                         label: "reviewer".into(),
                     }],
                 },
+                raw: false,
             },
         )
         .unwrap();
@@ -977,25 +1016,13 @@ fn retry_policy_only_retries_failures_proven_before_the_write() {
             "paste_command_unwritten",
             false,
         ),
-        (
-            AttemptFailure::composer_ownership_unproven(),
-            "composer_ownership_unproven",
-            false,
-        ),
-        (
-            AttemptFailure::binding_unprovable(None),
-            "binding_unprovable",
-            false,
-        ),
         (AttemptFailure::paste_failed(), "paste_failed", false),
-        (AttemptFailure::verify_failed(), "verify_failed", false),
         (
             AttemptFailure::pane_rebound_after_paste(),
             "pane_rebound_after_paste",
             false,
         ),
         (AttemptFailure::submit_failed(), "submit_failed", false),
-        (AttemptFailure::ack_timeout(), "ack_timeout", false),
         (
             AttemptFailure::notification_record_failed(),
             NOTIFICATION_RECORD_FAILED,
@@ -1012,55 +1039,6 @@ fn retry_policy_only_retries_failures_proven_before_the_write() {
     }
     let exhausted = AttemptFailure::spool_failed();
     assert!(!should_retry(&exhausted, 2, 1));
-
-    assert_eq!(
-        AttemptFailure::verify_failed().verify_outcome,
-        Some(NotificationVerifyOutcome::ambiguous())
-    );
-    assert_eq!(
-        AttemptFailure::verify_timeout().verify_outcome,
-        Some(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::Timeout,
-            observed_composer: ComposerState::ComposerAmbiguous,
-        })
-    );
-    assert_eq!(
-        AttemptFailure::verify_mismatch(ComposerState::HumanDraft).verify_outcome,
-        Some(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::Mismatch,
-            observed_composer: ComposerState::HumanDraft,
-        })
-    );
-    assert_eq!(
-        AttemptFailure::verify_owner_missing(ComposerState::ComposerClean).verify_outcome,
-        Some(NotificationVerifyOutcome {
-            kind: NotificationVerifyFailureKind::OwnerMissing,
-            observed_composer: ComposerState::ComposerClean,
-        })
-    );
-
-    let pane_too_narrow = AttemptFailure::pane_too_narrow(NotificationPreWriteObservation {
-        pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),
-        selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
-        binding: None,
-        route_evidence: None,
-        pane_width: Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1),
-        required_pane_width: None,
-        write_block: None,
-    });
-    assert!(!should_retry(&pane_too_narrow, 0, 3));
-    assert_eq!(
-        pane_too_narrow.pre_write_block.as_deref().unwrap().cause,
-        NotificationPreWriteCause::WriteReadinessChanged
-    );
-    assert_eq!(
-        pane_too_narrow
-            .pre_write_block
-            .as_deref()
-            .and_then(|block| block.observation.as_ref())
-            .and_then(|observation| observation.required_pane_width),
-        Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH)
-    );
 
     // The production mapping keeps unknown injector errors conservative
     // too: they can never opt into the pre-write retry budget.
@@ -1095,10 +1073,6 @@ fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
             AttemptFailure::paste_command_unwritten(),
             NotificationPreWriteCause::PasteCommandUnwritten,
         ),
-        (
-            AttemptFailure::composer_ownership_unproven(),
-            NotificationPreWriteCause::ComposerOwnershipUnproven,
-        ),
     ];
 
     for (failure, expected) in cases {
@@ -1113,45 +1087,11 @@ fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
 
     for failure in [
         AttemptFailure::barrier_held(),
-        AttemptFailure::from_inject("binding_changed".into()),
+        AttemptFailure::from_inject("barrier_held".into()),
     ] {
-        assert!(failure.regate_cause().is_some());
+        assert!(failure.regate.is_some());
         assert!(failure.pre_write_block.is_none());
     }
-}
-
-#[test]
-fn write_boundary_regates_are_bounded_per_evidence_edge() {
-    let (_scratch, _store, _context, handle, _recipient) = notification_fixture("regate");
-    assert_eq!(
-        regate_action(&handle, RegateCause::BarrierHeld),
-        RegateAction::Hold,
-        "a held composer waits for its owner, never a retry budget"
-    );
-    assert_eq!(
-        regate_action(&handle, RegateCause::BindingChanged),
-        RegateAction::ImmediateReproof
-    );
-    assert_eq!(
-        regate_action(&handle, RegateCause::BindingChanged),
-        RegateAction::BlockPreWrite,
-        "unchanged binding evidence cannot spin"
-    );
-
-    let cumulative = handle.state.lock().unwrap().regates;
-    assert_eq!(cumulative, 3);
-
-    reset_immediate_regates(&handle);
-    assert_eq!(
-        regate_action(&handle, RegateCause::BindingChanged),
-        RegateAction::ImmediateReproof,
-        "a new pane edge opens one fresh proof"
-    );
-    assert_eq!(
-        handle.state.lock().unwrap().regates,
-        cumulative + 1,
-        "an evidence edge never rewrites cumulative unwritten attempts"
-    );
 }
 
 #[tokio::test]
@@ -1469,16 +1409,6 @@ fn bottom_window_takes_non_empty_tail() {
     assert_eq!(bottom_window(screen, 10), "a\nb\nc\nd");
 }
 
-#[test]
-fn reset_hint_parses_and_stays_short() {
-    let screen = "junk\n⚠ Individual quota reached. Resets in 135h57m42s.\nmore";
-    assert_eq!(
-        parse_reset_hint(screen).as_deref(),
-        Some("resets in 135h57m42s")
-    );
-    assert_eq!(parse_reset_hint("no hint here"), None);
-}
-
 // -----------------------------------------------------------------
 // Post-paste verification ignores stale transcript text.
 // -----------------------------------------------------------------
@@ -1555,7 +1485,6 @@ fn unwritten_test_inner(path: &Path) -> Arc<Inner> {
     let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
     Arc::new(Inner {
         cfg: crate::Config::defaults(path),
-        force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
         state_root,
         durable_record_forget_lease: StdMutex::new(None),
         state_repair: cyclops_state::RepairSummary::default(),
@@ -1563,9 +1492,6 @@ fn unwritten_test_inner(path: &Path) -> Arc<Inner> {
         session_identities: StdMutex::new(session_identities),
         mailbox: None,
         workspace_messaging: std::sync::OnceLock::new(),
-        composer_recovery: Arc::new(StdMutex::new(
-            crate::composer_recovery::RecoveryCoordinator::default(),
-        )),
         mailbox_publication: Arc::new(StdMutex::new(())),
         unread_projection_gate: tokio::sync::Mutex::new(()),
         unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -1645,11 +1571,9 @@ fn seed_unwritten_test_composer(inner: &Arc<Inner>, binding: &fusion::Binding) {
             occupant: Some(binding.leader.pid),
             agent: Some(binding.agent),
             in_mode: false,
-            quota_screen_clear: false,
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
-            final_submit_conflict_owner: None,
             composer: crate::ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -1691,7 +1615,9 @@ async fn run_unwritten_attempt_arm(
     )
     .await
     .expect_err("test injector proves the paste command was unwritten");
-    finish_attempt_delivery_inject_failure(inner, handle, binding, None, failure)
+    finish_inject_failure(handle, failure, || {
+        rollback_unwritten_hold(inner, handle, binding)
+    })
 }
 
 impl MockInjector {
@@ -1786,20 +1712,18 @@ async fn notification_facts_follow_real_inject_submit_and_receipt_boundaries() {
         cyclops_proto::NotificationState::Writing
     );
 
-    context.record_staged().unwrap();
     injector.submit("%1", "Enter").await.unwrap();
     assert_eq!(
         notification_state(&store, recipient, context.message_id()).state,
-        cyclops_proto::NotificationState::Staged,
+        cyclops_proto::NotificationState::Writing,
         "send-keys success is not a receipt"
     );
-    context.reserve_submit().unwrap();
     context.record_submitted().unwrap();
     assert_eq!(
         notification_state(&store, recipient, context.message_id()).state,
         cyclops_proto::NotificationState::Submitted
     );
-    context.record_notified().unwrap();
+    context.record_notified(Some(VerifiedBy::Hook)).unwrap();
     let notified = notification_state(&store, recipient, context.message_id());
     assert_eq!(notified.state, cyclops_proto::NotificationState::Notified);
     assert_eq!(notified.binding.unwrap().manifest.as_str(), "codex");
@@ -2167,230 +2091,6 @@ async fn operator_withdrawal_wakes_a_queued_attempt_before_gating() {
     );
 }
 
-#[test]
-fn staged_doorbell_claim_cannot_prove_submit_or_turn_start() {
-    let (_scratch, store, context, _handle, recipient) = notification_fixture("staged-claim");
-    context.record_gating().unwrap();
-    let writing = context
-        .record_writing(
-            ProcessInstanceId::new(3999, 817_999).unwrap(),
-            ProcessInstanceId::new(4000, 818_000).unwrap(),
-            ProcessInstanceId::new(4242, 818_221).unwrap(),
-            "codex",
-            NotificationTransport::Doorbell,
-            None,
-        )
-        .unwrap();
-    context.record_staged().unwrap();
-
-    let outcome = store
-        .lock()
-        .unwrap()
-        .claim(recipient, context.message_id().clone())
-        .unwrap();
-    let crate::mailbox::ClaimOutcome::Claimed {
-        withdrawn_attempt,
-        consumed_doorbell_attempt,
-        ..
-    } = outcome
-    else {
-        panic!("first claim must append a claim fact");
-    };
-    assert_eq!(withdrawn_attempt, None);
-    assert_eq!(consumed_doorbell_attempt, None);
-
-    let store = store.lock().unwrap();
-    let record = store
-        .projection()
-        .notification(recipient, context.message_id())
-        .unwrap();
-    assert_eq!(record.state, cyclops_proto::NotificationState::Staged);
-    assert_eq!(record.binding, writing.binding);
-    let barriers = store.projection().active_notification_barriers();
-    assert_eq!(barriers.len(), 1);
-    assert_eq!(barriers[0].attempt_id, context.attempt_id());
-    assert_eq!(barriers[0].state, cyclops_proto::NotificationState::Staged);
-    drop(store);
-    assert_eq!(
-        context.reserve_submit().unwrap(),
-        SubmitReservation::Reserved
-    );
-}
-
-#[test]
-fn changed_content_after_submit_reservation_becomes_one_durable_attention() {
-    let (_scratch, store, context, handle, recipient) =
-        notification_fixture("reserved-content-change");
-    context.record_gating().unwrap();
-    context
-        .record_writing(
-            ProcessInstanceId::new(3999, 817_999).unwrap(),
-            ProcessInstanceId::new(4000, 818_000).unwrap(),
-            ProcessInstanceId::new(4242, 818_221).unwrap(),
-            "codex",
-            NotificationTransport::Doorbell,
-            None,
-        )
-        .unwrap();
-    context.record_staged().unwrap();
-    assert_eq!(
-        context.reserve_submit().unwrap(),
-        SubmitReservation::Reserved
-    );
-
-    let manifest = sentinel_manifest();
-    let expected = handle.payload();
-    let exact = format!("\u{1b}[39m❯ {expected}\n{CHROME}");
-    let (id_staged, payload_at_proof) = exact_staging_proof(
-        &manifest,
-        &exact,
-        StagingTarget::ExactRow(&expected),
-        &expected,
-    )
-    .expect("baseline exact payload");
-    let changed = format!("\u{1b}[39m❯ {expected} plus human draft\n{CHROME}");
-    assert!(!exact_staging_snapshot_matches(
-        &manifest,
-        &changed,
-        StagingTarget::ExactRow(&expected),
-        &expected,
-        id_staged,
-        &payload_at_proof,
-    ));
-
-    context
-        .record_attention(NotificationAttentionCause::VerifyFailed)
-        .unwrap();
-    let attention = notification_state(&store, recipient, context.message_id());
-    assert_eq!(attention.state, NotificationState::AttentionRequired);
-    assert_eq!(
-        attention.cause,
-        Some(NotificationAttentionCause::VerifyFailed)
-    );
-    let sequence = store.lock().unwrap().projection().last_sequence();
-    let repeated = context
-        .record_attention(NotificationAttentionCause::VerifyFailed)
-        .unwrap();
-    assert_eq!(repeated.state, NotificationState::AttentionRequired);
-    assert_eq!(store.lock().unwrap().projection().last_sequence(), sequence);
-}
-
-#[tokio::test]
-async fn cleared_claimed_stage_retries_only_the_settlement_fact_once() {
-    let (_scratch, store, context, _handle, recipient) =
-        notification_fixture("claimed-clear-retry");
-    prepare_claimed_staged(&store, &context, recipient);
-    let injector = MockInjector::new(Vec::new());
-    injector.clear("%1", &["C-c".to_string()]).await.unwrap();
-    let before_seq = store.lock().unwrap().projection().last_sequence();
-    store
-        .lock()
-        .unwrap()
-        .inject_next_claimed_staged_clear_append_failure();
-
-    let settled = settle_claimed_staged_after_clear(&context).unwrap();
-    assert_eq!(settled.state, NotificationState::WithdrawnAfterStaging);
-    assert_eq!(
-        store.lock().unwrap().projection().last_sequence(),
-        before_seq.map(|seq| seq + 1),
-        "the failed append writes nothing and the one bounded retry appends one fact"
-    );
-    assert!(store
-        .lock()
-        .unwrap()
-        .projection()
-        .active_notification_barriers()
-        .is_empty());
-
-    let settled_seq = store.lock().unwrap().projection().last_sequence();
-    let replayed = settle_claimed_staged_after_clear(&context).unwrap();
-    assert_eq!(replayed, settled);
-    assert_eq!(
-        store.lock().unwrap().projection().last_sequence(),
-        settled_seq,
-        "an already-landed settlement is discovered without a second fact"
-    );
-    assert_eq!(
-        injector.submitted.lock().unwrap().as_slice(),
-        &[("%1".to_string(), "C-c".to_string())],
-        "settlement retry never repeats clear or sends Enter"
-    );
-    assert!(injector.pasted.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn persistent_claimed_stage_settlement_failure_faults_the_exact_fifo_owner() {
-    let (_scratch, store, context, handle, recipient) =
-        notification_fixture("claimed-clear-persistent-failure");
-    prepare_claimed_staged(&store, &context, recipient);
-    let injector = MockInjector::new(Vec::new());
-    injector.clear("%1", &["C-c".to_string()]).await.unwrap();
-    store
-        .lock()
-        .unwrap()
-        .inject_claimed_staged_clear_append_failures(2);
-
-    assert!(settle_claimed_staged_after_clear(&context).is_err());
-    let record = notification_state(&store, recipient, context.message_id());
-    assert_eq!(record.state, NotificationState::Staged);
-    assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .projection()
-            .active_notification_barriers(),
-        vec![record],
-        "both failed appends leave the exact barrier as FIFO owner"
-    );
-
-    let worker = Arc::new(Worker::new());
-    let follower = handle_with(&context, "reviewer", "%1", 0);
-    worker.enqueue_back(Arc::clone(&handle));
-    worker.enqueue_back(follower);
-    assert!(Arc::ptr_eq(
-        &worker.current_or_next().expect("current attempt"),
-        &handle
-    ));
-    let failure = AttemptFailure::claimed_staged_settlement_failed();
-    assert!(fault_notification_worker(&worker, &failure));
-    let state = worker.state.lock().unwrap();
-    assert_eq!(
-        state.fault.as_deref(),
-        Some(CLAIMED_STAGED_SETTLEMENT_FAILED)
-    );
-    assert!(state
-        .current
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &handle)));
-    assert_eq!(
-        state.queue.len(),
-        1,
-        "the follower remains behind the fault"
-    );
-    drop(state);
-
-    let engine = Engine::new();
-    engine.notification_workers.lock().unwrap().insert(
-        recipient,
-        NotificationWorker {
-            worker,
-            task: test_worker_task(),
-        },
-    );
-    let diagnostics = engine.notification_worker_diagnostics();
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(
-        diagnostics[0].code,
-        "notification_settlement_storage_failed"
-    );
-    assert_eq!(diagnostics[0].notification_attempt, context.attempt_id());
-    assert_eq!(
-        injector.submitted.lock().unwrap().as_slice(),
-        &[("%1".to_string(), "C-c".to_string())],
-        "persistent storage failure does not repeat clear or send Enter"
-    );
-}
-
 #[tokio::test]
 async fn failed_prewrite_block_append_keeps_the_exact_fifo_owner() {
     let (_scratch, store, context, handle, recipient) =
@@ -2549,6 +2249,7 @@ fn readiness_block_persistence_records_route_baseline_and_reopens_once() {
                 fyi: false,
                 client_key: None,
                 supersedes: None,
+                raw: false,
             },
         )
         .unwrap();
@@ -2737,300 +2438,12 @@ fn a_socket_claim_does_not_retire_the_operator_notification_prewrite_block() {
     ));
 }
 
-#[tokio::test]
-async fn clean_restart_recovery_settles_without_clear_or_enter() {
-    let (scratch, store, context, handle, recipient) =
-        notification_fixture("claimed-clean-restart");
-    let staged = prepare_claimed_staged(&store, &context, recipient);
-    let message_id = context.message_id().clone();
-    let attempt_id = context.attempt_id();
-    let binding = staged.binding.clone();
-    drop(handle);
-    drop(context);
-    drop(store);
-
-    let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-    let root = StateRoot::open_or_create(&scratch.0).unwrap();
-    let reopened = MessageStore::open(
-        &root,
-        Path::new("workspaces/current/messages.ndjson"),
-        workspace,
-        "boot-recovered",
-    )
-    .unwrap();
-    let store = Arc::new(StdMutex::new(reopened));
-    let recovered = store
-        .lock()
-        .unwrap()
-        .projection()
-        .claimed_notification_barrier(recipient)
-        .cloned()
-        .expect("restart retains the claimed staged attempt");
-    assert_eq!(recovered.attempt_id, attempt_id);
-    assert_eq!(recovered.binding, binding);
-
-    let manifest = Manifest::parse(
-        r#"
-[agent]
-id = "codex"
-display_name = "codex"
-
-[[rule]]
-id = "composer_clean"
-state = "idle"
-composer_semantic = "clean"
-priority = 1000
-region = "bottom_non_empty_lines(3)"
-line_regex = ['^❯$']
-line_regex_esc = ['^❯$']
-
-[injection]
-composer_trailer_regex = ['^status$']
-composer_trailer_regex_esc = ['^status$']
-composer_trailer_required_prefix = 1
-composer_prompt_regex = '^❯(?P<content>.*)$'
-composer_continuation_regex = '^  (?P<content>.*)$'
-unstyled_composer_proof = 'structural_trailer'
-"#,
-        Path::new("clean.toml"),
-    )
-    .unwrap();
-    let capture = "transcript\n❯\nstatus";
-    let expected = cyclops_proto::render_doorbell_v1(&message_id);
-    assert_eq!(
-        classify_claimed_staged_composer(
-            &manifest,
-            capture,
-            StagingTarget::ExactRow(&expected),
-            &expected,
-        ),
-        ClaimedStagedComposer::Clean
-    );
-    assert_eq!(
-        claimed_staged_action(
-            ClaimedStagedComposer::Clean,
-            ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
-        ),
-        ClaimedStagedAction::SettleOnly
-    );
-
-    let injector = MockInjector::new(vec![capture]);
-    let observed = injector.capture_joined_escaped("%1").await.unwrap();
-    assert_eq!(observed, capture);
-    let context = NotificationContext::new(store.clone(), message_id, recipient, attempt_id);
-    let settled = settle_claimed_staged_after_clear(&context).unwrap();
-    assert_eq!(settled.state, NotificationState::WithdrawnAfterStaging);
-    assert!(injector.submitted.lock().unwrap().is_empty());
-    assert!(injector.pasted.lock().unwrap().is_empty());
-    assert!(store
-        .lock()
-        .unwrap()
-        .projection()
-        .active_notification_barriers()
-        .is_empty());
-
-    let unsupported = Manifest::parse(
-        r#"
-[agent]
-id = "unsupported"
-display_name = "unsupported"
-[[rule]]
-id = "composer_clean"
-state = "idle"
-composer_semantic = "clean"
-priority = 1000
-region = "bottom_non_empty_lines(1)"
-line_regex = ['^❯$']
-line_regex_esc = ['^❯$']
-"#,
-        Path::new("unsupported.toml"),
-    )
-    .unwrap();
-    assert!(!clean_composer_proof(&unsupported, "❯"));
-    assert!(!clean_composer_proof(&manifest, "transcript\n❯"));
-    assert!(clean_composer_proof(
-        &manifest,
-        "❯\ntranscript echo\n❯\nstatus"
-    ));
-    assert!(!clean_composer_proof(
-        &manifest,
-        "❯\ntranscript echo\n❯\nstatus\nunexpected"
-    ));
-    assert!(!clean_composer_proof(&manifest, "❯human draft\nstatus"));
-
-    let chip_manifest = composer_manifest();
-    let chip = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #1]\n? for shortcuts";
-    assert_eq!(
-        exact_composer_content_for_state(
-            &chip_manifest,
-            chip,
-            AgentState::Idle,
-            Some(ComposerSemantic::Clean),
-        ),
-        ComposerContentProof::Hidden
-    );
-    assert!(!clean_composer_proof(&chip_manifest, chip));
-}
-
-#[test]
-fn claimed_stage_policy_clears_only_exact_bytes_and_refuses_human_input() {
-    let manifest = sentinel_manifest();
-    let message_id = MessageId::new("m-claimed-policy").unwrap();
-    let expected = cyclops_proto::render_doorbell_v1(&message_id);
-    let exact = format!("\u{1b}[39m❯ {expected}\n{CHROME}");
-    let human = format!("\u{1b}[39m❯ {expected} plus my draft\n{CHROME}");
-
-    assert_eq!(
-        classify_claimed_staged_composer(
-            &manifest,
-            &exact,
-            StagingTarget::ExactRow(&expected),
-            &expected,
-        ),
-        ClaimedStagedComposer::ExactDoorbell
-    );
-    assert_eq!(
-        claimed_staged_action(
-            ClaimedStagedComposer::ExactDoorbell,
-            ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
-        ),
-        ClaimedStagedAction::ClearThenSettle
-    );
-    assert_eq!(
-        classify_claimed_staged_composer(
-            &manifest,
-            &human,
-            StagingTarget::ExactRow(&expected),
-            &expected,
-        ),
-        ClaimedStagedComposer::Ambiguous
-    );
-    assert_eq!(
-        claimed_staged_action(
-            ClaimedStagedComposer::Ambiguous,
-            ClaimedStagedReconciliation::Recovered(ClaimedNotificationBarrier::Staged),
-        ),
-        ClaimedStagedAction::Refuse
-    );
-}
-
-#[tokio::test]
-async fn claim_after_submit_reservation_waits_for_submit_success() {
-    let (_scratch, store, context, handle, recipient) =
-        notification_fixture("claim-after-reservation");
-    context.record_gating().unwrap();
-    context
-        .record_writing(
-            ProcessInstanceId::new(3999, 817_999).unwrap(),
-            ProcessInstanceId::new(4000, 818_000).unwrap(),
-            ProcessInstanceId::new(4242, 818_221).unwrap(),
-            "codex",
-            NotificationTransport::Doorbell,
-            None,
-        )
-        .unwrap();
-    context.record_staged().unwrap();
-    assert_eq!(
-        context.reserve_submit().unwrap(),
-        SubmitReservation::Reserved
-    );
-
-    let first = store
-        .lock()
-        .unwrap()
-        .claim(recipient, context.message_id().clone())
-        .unwrap();
-    let crate::mailbox::ClaimOutcome::Claimed {
-        entry: first_entry,
-        message: first_message,
-        withdrawn_attempt,
-        consumed_doorbell_attempt,
-        ..
-    } = first
-    else {
-        panic!("first claim must append one claim fact");
-    };
-    assert_eq!(first_entry.message_id, *context.message_id());
-    assert_eq!(first_message.message_id, *context.message_id());
-    assert_eq!(withdrawn_attempt, None);
-    assert_eq!(consumed_doorbell_attempt, None);
-    assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        NotificationState::Submitting,
-        "a socket claim cannot prove that Enter was sent"
-    );
-
-    let sequence_before_reclaim = store.lock().unwrap().projection().last_sequence();
-    let repeated = store
-        .lock()
-        .unwrap()
-        .claim(recipient, context.message_id().clone())
-        .unwrap();
-    let crate::mailbox::ClaimOutcome::AlreadyClaimed {
-        entry: repeated_entry,
-        message: repeated_message,
-        withdrawn_attempt,
-        consumed_doorbell_attempt,
-        ..
-    } = repeated
-    else {
-        panic!("repeat claim must return the original mailbox task");
-    };
-    assert_eq!(repeated_entry.message_id, first_entry.message_id);
-    assert_eq!(repeated_message.message_id, first_message.message_id);
-    assert_eq!(withdrawn_attempt, None);
-    assert_eq!(consumed_doorbell_attempt, None);
-    assert_eq!(
-        store.lock().unwrap().projection().last_sequence(),
-        sequence_before_reclaim,
-        "reclaim must not append a second task"
-    );
-    assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        NotificationState::Submitting
-    );
-
-    let doorbell = cyclops_proto::render_doorbell_v1(context.message_id());
-    assert_eq!(handle.payload(), doorbell);
-    let injector = MockInjector::new(Vec::new());
-    let turn = crate::turnkey::TurnKey::for_test(&["session-1", "turn-1"]);
-    {
-        let mut state = handle.state.lock().unwrap();
-        state.state = DeliveryState::Staged;
-        state.early_ack = Some(PendingAck {
-            edge_ms: 91,
-            turn: Some(turn.clone()),
-            evidence: PendingAckEvidence::Receipt,
-        });
-    }
-    injector.submit(&handle.pane_id, "Enter").await.unwrap();
-    assert_eq!(
-        injector.submitted.lock().unwrap().as_slice(),
-        &[(handle.pane_id.clone(), "Enter".to_string())],
-        "the reserved terminal key submits the same attempt's doorbell"
-    );
-    context.record_submitted().unwrap();
-    handle.state.lock().unwrap().state = DeliveryState::Submitted;
-    let early = take_accepted_early_ack(&handle).expect("hook receipt survives to worker");
-    assert!(context.settle_submitted_claim().unwrap());
-    let step = early_ack_step(early);
-    assert_eq!(step.next, DeliveryState::DeliveredVerified);
-    assert_eq!(step.cause, Some("hook_ack"));
-    assert_eq!(step.verified_by, Some(VerifiedBy::Hook));
-    assert_eq!(step.turn_edge_ms, Some(91));
-    assert_eq!(step.turn, Some(turn));
-    assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        NotificationState::Notified
-    );
-}
-
 #[test]
 fn notified_state_without_the_exact_claim_does_not_settle_a_claim_race() {
     let (_scratch, _store, context, _handle, _recipient) =
         notification_fixture("notified-without-claim");
     prepare_notification_receipt(&context);
-    context.record_notified().unwrap();
+    context.record_notified(None).unwrap();
     assert!(
         !context.settle_submitted_claim().unwrap(),
         "Notified proves receipt, not an exact mailbox claim"
@@ -3138,21 +2551,21 @@ fn notification_gate_admission_is_idempotent_for_worker_reentry() {
 
 #[test]
 fn notification_faults_map_to_the_closed_attention_taxonomy() {
+    // Only a physical post-write failure names a cause; everything else
+    // the transport can report after the write is an unknown outcome.
     for (cause, expected) in [
         ("paste_failed", NotificationAttentionCause::PasteFailed),
-        ("verify_failed", NotificationAttentionCause::VerifyFailed),
         (
             "pane_rebound_after_paste",
             NotificationAttentionCause::PaneReboundAfterPaste,
         ),
         ("submit_failed", NotificationAttentionCause::SubmitFailed),
         (
-            "receipt_occupant_changed",
-            NotificationAttentionCause::ReceiptOccupantChanged,
-        ),
-        ("ack_timeout", NotificationAttentionCause::AckTimeout),
-        (
             NOTIFICATION_RECORD_FAILED,
+            NotificationAttentionCause::TransportOutcomeUnknown,
+        ),
+        (
+            "future_failure",
             NotificationAttentionCause::TransportOutcomeUnknown,
         ),
     ] {
@@ -3160,8 +2573,10 @@ fn notification_faults_map_to_the_closed_attention_taxonomy() {
     }
 }
 
+/// An unprovable staging read-back is not a failure: the paste happened
+/// once, Enter follows, and the journal says the write was unverified.
 #[tokio::test(start_paused = true)]
-async fn failed_staging_proof_records_attention_without_retrying_the_paste() {
+async fn failed_staging_proof_submits_unverified_without_retrying_the_paste() {
     let (_scratch, store, context, handle, recipient) = notification_fixture("verify-fault");
     context.record_gating().unwrap();
     let manifest = sentinel_manifest();
@@ -3195,36 +2610,60 @@ async fn failed_staging_proof_records_attention_without_retrying_the_paste() {
     assert_eq!(capture, "transcript\n❯\n? for shortcuts");
     assert_eq!(injector.pasted.lock().unwrap().len(), 1);
 
-    context
-        .record_attention(notification_attention_cause("verify_failed"))
-        .unwrap();
-    let attention = notification_state(&store, recipient, context.message_id());
+    context.record_submitted_unverified().unwrap();
+    let submitted = notification_state(&store, recipient, context.message_id());
     assert_eq!(
-        attention.state,
-        cyclops_proto::NotificationState::AttentionRequired
+        submitted.state,
+        cyclops_proto::NotificationState::SubmittedUnverified
     );
+    assert_eq!(submitted.cause, None);
+    assert!(submitted.binding.is_some());
+    let notified = context.record_notified(None).unwrap();
+    assert_eq!(notified.state, cyclops_proto::NotificationState::Notified);
+    assert_eq!(notified.verified_by, None);
     assert_eq!(
-        attention.cause,
-        Some(NotificationAttentionCause::VerifyFailed)
+        notification_state_count_for(&store, recipient, context.message_id()),
+        (1, 0),
+        "one unverified submit, no attention"
     );
-    assert!(attention.binding.is_some());
+}
+
+fn notification_state_count_for(
+    store: &Arc<StdMutex<MessageStore>>,
+    recipient: RecipientKey,
+    message_id: &MessageId,
+) -> (usize, usize) {
+    let store = store.lock().unwrap();
+    let lines = store.writer.read_after(0).unwrap();
+    let count = |state: &str| {
+        lines
+            .iter()
+            .filter(|line| {
+                line.id == message_id.as_str()
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_transition"
+                            && data["state"] == state
+                            && data["recipient"] == serde_json::to_value(recipient).unwrap()
+                    })
+            })
+            .count()
+    };
+    (count("submitted_unverified"), count("attention_required"))
 }
 
 /// A refusal at the write boundary stops the write and costs no
 /// transport budget.
 ///
 /// The callback is the last thing between a proof and the pane taking
-/// the payload, and it is where the barrier is claimed and the pane's
-/// binding is compared again. Both of the things it can refuse for,
-/// somebody else holding the composer and the pane becoming another
-/// program, are the world moving rather than transport failing:
-/// nothing was written, so the delivery goes back to the gate instead
-/// of spending a retry or summoning a human.
+/// the payload, and it is where the barrier is claimed. Somebody else
+/// holding the composer is the world moving rather than transport
+/// failing: nothing was written, so the delivery goes back to the gate
+/// instead of spending a retry or summoning a human.
 #[tokio::test]
 async fn a_refused_write_boundary_never_pastes_and_never_spends_budget() {
     let m = composer_manifest();
     let (_scratch, _store, _context, handle, _recipient) = notification_fixture("refused-write");
-    for cause in ["barrier_held", "binding_changed"] {
+    for cause in ["barrier_held"] {
         let mock = MockInjector::new(vec!["transcript\n\u{1b}[39m❯\u{a0}\n? for shortcuts"]);
         let payload = handle.payload();
         mock.spool(&payload).await.expect("spool");
@@ -3252,7 +2691,7 @@ async fn a_refused_write_boundary_never_pastes_and_never_spends_budget() {
             "{cause} must not be treated as possibly-written"
         );
         assert!(
-            failure.regate_cause().is_some(),
+            failure.regate.is_some(),
             "{cause} belongs back at the gate, not in the retry budget"
         );
     }
@@ -3500,46 +2939,6 @@ fn receipt_refresh_freezes_only_for_unobservable_safety_facts() {
         ReceiptRefresh::Resolved,
         "a receipt committed during refresh wins over transport loss"
     );
-}
-
-#[test]
-fn notification_liveness_protects_only_positive_human_input() {
-    let detection = Detection {
-        state: AgentState::Idle,
-        readings: vec![cyclops_proto::SensorReading {
-            sensor: cyclops_proto::Sensor::Screen,
-            state: AgentState::Idle,
-            rule: "runtime_idle".to_string(),
-            ts: 1,
-        }],
-        disagreement: false,
-        decided_by: "runtime_idle".to_string(),
-        unknown_reason: None,
-        stale: false,
-        write_ready: false,
-        write_block: Some("composer_hold".to_string()),
-        composer_semantic: Some(ComposerSemantic::HumanInput),
-    };
-
-    assert!(
-        !unproven_composer_is_eligible(&detection),
-        "a lower-priority composer rule already proved human input"
-    );
-    assert!(unproven_composer_is_eligible(&Detection {
-        composer_semantic: None,
-        write_block: Some("no_write_safe_composer_evidence".into()),
-        ..detection.clone()
-    }));
-    assert!(unproven_composer_is_eligible(&Detection {
-        state: AgentState::Working,
-        composer_semantic: Some(ComposerSemantic::Ambiguous),
-        write_block: Some("no_write_safe_composer_evidence".into()),
-        ..detection.clone()
-    }));
-    assert!(!unproven_composer_is_eligible(&Detection {
-        composer_semantic: Some(ComposerSemantic::HumanInput),
-        ..detection
-    }));
 }
 
 #[test]
@@ -4720,96 +4119,6 @@ composer_trailer_required_prefix = 1
             "recheck must detect draft row above doorbell and withhold enter"
         );
     }
-
-    #[tokio::test(start_paused = true)]
-    async fn exact_staging_recheck_waits_out_a_partial_repaint_but_not_a_draft() {
-        let manifest = sentinel_manifest();
-        let message_id = MessageId::new("m-3f9c2a").expect("valid message id");
-        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
-        let exact = format!("\u{1b}[39m❯ {doorbell}\n{CHROME}");
-        let (id_staged, payload_at_proof) = exact_staging_proof(
-            &manifest,
-            &exact,
-            StagingTarget::ExactRow(&doorbell),
-            &doorbell,
-        )
-        .expect("baseline exact proof");
-
-        // A terminal repaint can expose only the cleared prompt for one
-        // capture. A later complete frame with the same exact bytes is safe
-        // to use; this helper only reads and never widens the proof.
-        let partial_repaint = "\u{1b}[39m❯\n";
-        let repainting = MockInjector::new(vec![partial_repaint, exact.as_str()]);
-        assert_eq!(
-            recheck_exact_staging_snapshot(
-                &repainting,
-                "%1",
-                &manifest,
-                StagingTarget::ExactRow(&doorbell),
-                &doorbell,
-                id_staged,
-                &payload_at_proof,
-            )
-            .await,
-            Ok(exact.clone()),
-            "a partial redraw must not manufacture verify_failed after an exact paste proof"
-        );
-
-        // A stable human edit never becomes the earlier exact doorbell, so
-        // the bounded re-read still refuses to send Enter.
-        let human_draft = format!("\u{1b}[39m❯ {doorbell} human edit\n{CHROME}");
-        let edited = MockInjector::new(vec![human_draft.as_str(); VERIFY_DELAYS_MS.len()]);
-        assert_eq!(
-            recheck_exact_staging_snapshot(
-                &edited,
-                "%1",
-                &manifest,
-                StagingTarget::ExactRow(&doorbell),
-                &doorbell,
-                id_staged,
-                &payload_at_proof,
-            )
-            .await,
-            Err(ExactStagingRecheck::Mismatch),
-            "a durable human edit must still withhold Enter"
-        );
-    }
-
-    #[test]
-    fn submit_binding_rejects_reused_pid_generations() {
-        let proven = fusion::Binding {
-            pane_root: crate::identity::ProcId { pid: 39, birth: 79 },
-            leader: crate::identity::ProcId { pid: 40, birth: 80 },
-            agent: crate::identity::ProcId { pid: 41, birth: 81 },
-            manifest: "claude".to_string(),
-        };
-        assert!(binding_is_exact(Some(&proven), &proven));
-
-        let reused_pane_root = fusion::Binding {
-            pane_root: crate::identity::ProcId { pid: 39, birth: 80 },
-            ..proven.clone()
-        };
-        assert!(!binding_is_exact(Some(&reused_pane_root), &proven));
-
-        let reused_leader = fusion::Binding {
-            leader: crate::identity::ProcId { pid: 40, birth: 82 },
-            ..proven.clone()
-        };
-        assert!(!binding_is_exact(Some(&reused_leader), &proven));
-
-        let replaced_agent = fusion::Binding {
-            agent: crate::identity::ProcId { pid: 41, birth: 83 },
-            ..proven.clone()
-        };
-        assert!(!binding_is_exact(Some(&replaced_agent), &proven));
-
-        let replaced_manifest = fusion::Binding {
-            manifest: "codex".to_string(),
-            ..proven.clone()
-        };
-        assert!(!binding_is_exact(Some(&replaced_manifest), &proven));
-        assert!(!binding_is_exact(None, &proven));
-    }
 }
 
 #[cfg(test)]
@@ -5235,18 +4544,4 @@ mod composer_content_proof {
             ComposerContentProof::Unsupported
         );
     }
-}
-
-#[tokio::test]
-async fn delivery_engine_spawns_injector_for_buffer() {
-    let tmux = cyclops_testrig::TmuxServer::new("enginetest");
-    let spool = cyclops_proto::scratch::scratch_dir("cyc-enginetest-spool");
-    let cfg = cyclops_tmux::ControlConfig::new_session("enginetest")
-        .on_socket(tmux.socket())
-        .with_config_file("/dev/null")
-        .with_buffer_spool_dir(&spool);
-    let (client, _rx) = ControlClient::spawn(cfg).await.expect("tmux spawns");
-    let engine = DeliveryEngine::new(Arc::new(client));
-    let injector = engine.injector("cyc-test-buf");
-    assert_eq!(injector.buffer, "cyc-test-buf");
 }

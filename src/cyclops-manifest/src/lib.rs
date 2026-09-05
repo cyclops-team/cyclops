@@ -47,8 +47,6 @@ fn enabled_by_default() -> bool {
     true
 }
 
-pub mod mailbox_capability;
-
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("read {path}: {source}")]
@@ -227,10 +225,14 @@ pub struct Manifest {
     source_digest: [u8; 32],
 }
 
+/// The `[messaging]` table. Nothing in it is read any more; the one key
+/// it ever held is tolerated so a 1.0 manifest still loads.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Messaging {
+    /// Retired in 1.1.0: the daemon no longer proves a mailbox capability
+    /// file. Kept only so old files parse; `Manifest::retired_keys` names it.
     #[serde(default)]
-    pub mailbox_capability_file: Option<PathBuf>,
+    mailbox_capability_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -884,6 +886,16 @@ fn clear_key_name(key: &str) -> bool {
 }
 
 impl Manifest {
+    /// Keys this manifest carries that no longer mean anything. A loader
+    /// warns once per key; the file still loads.
+    pub fn retired_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.messaging.mailbox_capability_file.is_some() {
+            keys.push("messaging.mailbox_capability_file");
+        }
+        keys
+    }
+
     pub fn load(path: &Path) -> Result<Manifest, ManifestError> {
         let text = std::fs::read_to_string(path).map_err(|e| ManifestError::Io {
             path: path.into(),
@@ -1000,17 +1012,6 @@ impl Manifest {
             &raw.injection.composer_continuation_regex,
             "injection.composer_continuation_regex",
         )?;
-        if let Some(capability_file) = &raw.messaging.mailbox_capability_file {
-            let shown = capability_file.to_string_lossy();
-            let path_is_supported =
-                capability_file.is_absolute() || shown == "~" || shown.starts_with("~/");
-            if !path_is_supported {
-                return Err(ManifestError::BadMessaging {
-                    id: raw.agent.id.clone(),
-                    why: "mailbox_capability_file must be absolute or start with ~/".into(),
-                });
-            }
-        }
         if composer_prompt.is_some() != composer_continuation.is_some() {
             return Err(ManifestError::BadInjection {
                 id: raw.agent.id.clone(),
@@ -1442,28 +1443,17 @@ unsafe_states = ["blocked_modal"]
     }
 
     #[test]
-    fn mailbox_capability_is_generic_manifest_data() {
+    fn a_retired_messaging_key_still_loads_and_is_named() {
         let body = format!(
             "{MINI}\n[messaging]\nmailbox_capability_file = \"/agent/skills/cyclops/SKILL.md\"\n"
         );
         let manifest = Manifest::parse(&body, Path::new("capable.toml")).unwrap();
-        let capability_file = manifest
-            .messaging
-            .mailbox_capability_file
-            .expect("manifest declares mailbox capability evidence");
         assert_eq!(
-            capability_file,
-            PathBuf::from("/agent/skills/cyclops/SKILL.md")
+            manifest.retired_keys(),
+            vec!["messaging.mailbox_capability_file"]
         );
-
-        let malformed = body.replace(
-            "/agent/skills/cyclops/SKILL.md",
-            "relative/skills/cyclops/SKILL.md",
-        );
-        assert!(matches!(
-            Manifest::parse(&malformed, Path::new("bad-capability.toml")),
-            Err(ManifestError::BadMessaging { .. })
-        ));
+        let manifest = Manifest::parse(MINI, Path::new("plain.toml")).unwrap();
+        assert!(manifest.retired_keys().is_empty());
     }
 
     #[test]

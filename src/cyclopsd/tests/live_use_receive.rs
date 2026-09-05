@@ -1,4 +1,4 @@
-//! A socket pull remains usable when a foreground watch gates pane delivery.
+//! A socket pull remains usable while a foreground watch runs.
 
 mod common;
 
@@ -57,7 +57,7 @@ impl CommandFifo {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn foreground_watch_gates_the_doorbell_but_socket_pull_claims_the_message() {
+async fn a_socket_pull_claims_the_message_while_a_foreground_watch_runs() {
     if !tmux_available() {
         return;
     }
@@ -117,41 +117,13 @@ async fn foreground_watch_gates_the_doorbell_but_socket_pull_claims_the_message(
                     .is_some_and(|areas| areas.iter().any(|area| area == "messages"))
         })
         .await;
-    wait_for_notification_state(&rig, &message_id, "gating").await;
-
+    // The watch runs in the agent's own process group, so the pane's
+    // foreground is still the agent and a running turn is not a hold: the
+    // doorbell goes out. The payload stays in the mailbox either way.
+    wait_for_notification_state(&rig, &message_id, "writing").await;
     let capture = rig.tmux.capture(&pane);
-    assert!(
-        !capture.contains(&message_id),
-        "doorbell reached pane: {capture}"
-    );
     assert!(!capture.contains(secret), "payload reached pane: {capture}");
-
-    let processes = Command::new("ps")
-        .args(["-axo", "pid=,pgid=,tpgid=,comm=,args="])
-        .output()
-        .expect("read fixture process table");
-    let processes = String::from_utf8_lossy(&processes.stdout);
-    let fixture_processes: Vec<_> = processes
-        .lines()
-        .filter(|line| line.contains(path(&dir)))
-        .collect();
-    assert!(
-        fixture_processes
-            .iter()
-            .any(|line| { line.contains(&format!("{} watch --from gemini", watch.display())) }),
-        "watch fixture missing from process table: {fixture_processes:?}"
-    );
-
     let status = rig.ctl.request("status", json!({})).await;
-    let diagnostics = status["result"]["diagnostics"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no diagnostics in {status}; processes: {fixture_processes:?}"));
-    assert_eq!(diagnostics.len(), 1, "unexpected diagnostics: {status}");
-    assert_eq!(diagnostics[0]["code"], "deadlock_risk");
-    assert_eq!(diagnostics[0]["message_id"], message_id);
-    assert_eq!(diagnostics[0]["recipient_label"], "codex-test");
-    assert_eq!(diagnostics[0]["pane_id"], pane);
-    assert_eq!(diagnostics[0]["recipient"]["pane_id"], pane);
     assert!(!status.to_string().contains(subject));
     assert!(!status.to_string().contains(secret));
 

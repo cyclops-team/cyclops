@@ -161,8 +161,6 @@ pub(crate) enum NotificationEnqueueRefusal {
     WorkerFaulted,
     WorkerSupervisorExited,
     AttemptUnowned,
-    ClassificationUnavailable,
-    PayloadUnavailable,
 }
 
 /// The loop child owns normal FIFO work. The supervisor owns its task and
@@ -278,29 +276,7 @@ pub(crate) async fn notification_worker_loop(
                 // Quiesce may have atomically returned this same handle to
                 // the FIFO. In that case its attempt index remains active.
                 if worker.finish(&handle) {
-                    let retired = inner.engine.retire_notification_run(&handle);
-                    if retired
-                        && handle
-                            .claimed_notification_rerun_requested
-                            .swap(false, Ordering::SeqCst)
-                    {
-                        if let Some(messaging) = inner.workspace_messaging() {
-                            if let Err(error) =
-                                messaging.notification_head_changed(handle.notification.recipient())
-                            {
-                                error!(
-                                    id = %handle.msg_id,
-                                    %error,
-                                    "cannot reschedule claimed notification after readiness edge"
-                                );
-                            }
-                        } else {
-                            error!(
-                                id = %handle.msg_id,
-                                "cannot reschedule claimed notification without workspace messaging"
-                            );
-                        }
-                    }
+                    inner.engine.retire_notification_run(&handle);
                 }
             }
             Err(error) => {
@@ -404,14 +380,6 @@ pub(crate) fn recover_failed_job(
                 }
                 worker.finish(handle);
                 inner.engine.retire_notification_run(handle);
-                true
-            }
-            NotificationState::Staged
-                if recovery == 0
-                    && notification
-                        .claimed_notification_barrier()
-                        .is_ok_and(|barrier| barrier.is_some()) =>
-            {
                 true
             }
             NotificationState::Writing
@@ -538,24 +506,6 @@ pub(crate) async fn process(
     handle: &Arc<DeliveryHandle>,
 ) {
     let notification = &handle.notification;
-    match notification.claimed_notification_barrier() {
-        Ok(Some(barrier)) => {
-            if let AttemptOutcome::Failed(failure) =
-                reconcile_recovered_claimed_notification_barrier(inner, handle, barrier).await
-            {
-                inject_pause(inner, "post_claimed_notification_refusal").await;
-                if !fault_notification_worker(worker, &failure) {
-                    let _ = fail_attempt(inner, worker, handle, &failure).await;
-                }
-            }
-            return;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            error!(id = %handle.msg_id, %error, "cannot classify staged claim recovery");
-            return;
-        }
-    }
     // retry_queued alongside queued: an attempt parked by a quiesce
     // re-enters here in that state.
     if !advance(
@@ -579,9 +529,9 @@ pub(crate) async fn process(
             return;
         }
     }
-    let mut regate_hold = None;
+    let mut regate = None;
     loop {
-        let gate_outcome = gate(inner, handle, regate_hold.take()).await;
+        let gate_outcome = gate(inner, handle, regate.take()).await;
         match notification.ensure_current_gating() {
             Ok(()) => {}
             Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
@@ -608,18 +558,7 @@ pub(crate) async fn process(
                 notify_notification_deferred(inner, handle, &cause);
                 return;
             }
-            GateOutcome::Park { hint } => {
-                park_recipient(inner, handle, hint).await;
-                return;
-            }
-            GateOutcome::Proceed {
-                manifest_id,
-                pane_pid,
-                regate_evidence_changed,
-            } => {
-                if regate_evidence_changed {
-                    reset_immediate_regates(handle);
-                }
+            GateOutcome::Proceed(admission) => {
                 // A quiesce that landed while this notification was at
                 // the gate: nothing may cross the paste boundary now. Park
                 // pre-paste and hand the job back; it re-enters when the
@@ -649,25 +588,26 @@ pub(crate) async fn process(
                 ) {
                     return;
                 }
-                match attempt_delivery(inner, handle, &manifest_id, pane_pid).await {
+                let outcome = match admission {
+                    Admission::Doorbell { binding, .. } => {
+                        attempt_delivery(inner, handle, &binding).await
+                    }
+                    Admission::Raw => attempt_raw_delivery(inner, handle).await,
+                };
+                match outcome {
                     AttemptOutcome::Done => return,
                     // The mailbox fact records why this attempt is no longer
                     // current. This worker only proves it never wrote.
                     AttemptOutcome::NoLongerCurrentBeforeWrite => return,
                     AttemptOutcome::Failed(failure) => {
-                        if fault_notification_worker(worker, &failure) {
-                            return;
-                        }
                         // Readiness moved between the gate's proof and
                         // the write. Nothing was written and no transport
                         // was spent, so this is not a retry: it goes back
                         // to the gate, which waits on the barrier's own
-                        // release rather than on a budget.
-                        if let Some(regate_cause) = failure.regate_cause() {
-                            let action = regate_action(handle, regate_cause);
-                            // The legal path back to the gate runs through
-                            // RetryQueued. A race that cannot be re-proven
-                            // settles as a durable pre-write block.
+                        // release rather than on a budget. The legal path
+                        // back runs through RetryQueued.
+                        if let Some(cause) = failure.regate.clone() {
+                            handle.state.lock().expect("handle state lock").regates += 1;
                             if !advance(
                                 inner,
                                 handle,
@@ -684,23 +624,7 @@ pub(crate) async fn process(
                             ) {
                                 return;
                             }
-                            match action {
-                                RegateAction::ImmediateReproof => {}
-                                RegateAction::Hold => {
-                                    regate_hold = Some(failure.cause.clone());
-                                }
-                                RegateAction::BlockPreWrite => {
-                                    persist_notification_prewrite_block(
-                                        inner,
-                                        worker,
-                                        handle,
-                                        NotificationPreWriteCause::WriteReadinessChanged,
-                                        None,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
+                            regate = Some(cause);
                             continue;
                         }
                         if !fail_attempt(inner, worker, handle, &failure).await {
@@ -720,12 +644,4 @@ pub(crate) async fn process(
             }
         }
     }
-}
-
-pub(crate) fn fault_notification_worker(worker: &Worker, failure: &AttemptFailure) -> bool {
-    if !failure.faults_notification_worker() {
-        return false;
-    }
-    worker.set_fault(CLAIMED_STAGED_SETTLEMENT_FAILED);
-    true
 }

@@ -450,34 +450,15 @@ impl App {
 
         let detail = self.detail.as_ref()?;
         let frozen = detail.target().clone();
-        // One read per open. Fresh recovery follows daemon authorization.
-        // An uncertain intent opens the exact attempt for inspection.
-        // Only a matching durable terminal-accepted fact can expose
-        // no-key reconciliation of that recorded verb.
-        let (request, claims) = match frozen.attempt {
-            Some(attempt_id)
-                if detail.can_manage_attention()
-                    || detail.resolution_intent().is_some()
-                    || detail.resolution_action_accepted().is_some()
-                    || detail.resolution_consumption_observed().is_some() =>
-            {
-                (ActionRequest::OpenAttention { attempt_id }, false)
-            }
-            _ => {
-                // Claim only what is genuinely yours and still waiting,
-                // and only on the first open. Observing somebody else's
-                // mailbox must not take it, and a reload is a read.
-                let claims = matches!(detail.stage(), crate::detail::Stage::Opening)
-                    && detail.direction() == Direction::Inbound
-                    && detail.mailbox() == MailboxWord::Pending;
-                (
-                    ActionRequest::OpenMessage {
-                        message_id: frozen.target.message_id.clone(),
-                        claim: claims,
-                    },
-                    claims,
-                )
-            }
+        // One read per open. Claim only what is genuinely yours and still
+        // waiting, and only on the first open. Observing somebody else's
+        // mailbox must not take it, and a reload is a read.
+        let claims = matches!(detail.stage(), crate::detail::Stage::Opening)
+            && detail.direction() == Direction::Inbound
+            && detail.mailbox() == MailboxWord::Pending;
+        let request = ActionRequest::OpenMessage {
+            message_id: frozen.target.message_id.clone(),
+            claim: claims,
         };
         Some((
             RequestToken::new(frozen, RequestKind::Read { claims }),
@@ -520,12 +501,6 @@ impl App {
             // evidence they were shown.
             (Some(attempt_id), Action::ClearAlarm) => {
                 crate::action::ActionRequest::ClearAlarm { attempt_id }
-            }
-            (Some(attempt_id), Action::AttentionComplete) => {
-                crate::action::ActionRequest::AttentionComplete { attempt_id }
-            }
-            (Some(attempt_id), Action::AttentionDiscard) => {
-                crate::action::ActionRequest::AttentionDiscard { attempt_id }
             }
             // An attention verb with no attempt frozen never becomes a
             // request.

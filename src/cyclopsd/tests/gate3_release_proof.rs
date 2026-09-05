@@ -111,7 +111,28 @@ async fn multi_alarm_clear_is_one_fact_after_complete_validation() {
     rig.label(&p1, "worker1").await;
     rig.label(&p2, "worker2").await;
 
-    // Send messages that get stuck in swallowing composers, raising alarms
+    // An alarm is a physical post-write failure. Park every doorbell after
+    // its paste, swap each pane's occupant for a shell, and release: the
+    // pre-Enter occupant check refuses and each attempt closes to attention.
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_seam = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let release = Arc::clone(&release_seam);
+        Box::pin(async move {
+            if phase != "pre_submit" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            release
+                .acquire_owned()
+                .await
+                .expect("seam release")
+                .forget();
+        })
+    });
+
     let m0 = rig
         .daemon
         .msg_send(
@@ -162,6 +183,39 @@ async fn multi_alarm_clear_is_one_fact_after_complete_validation() {
         .as_str()
         .unwrap()
         .to_string();
+
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .expect("every doorbell reached the pre-submit seam")
+            .expect("seam channel open");
+    }
+    for pane in [&p0, &p1, &p2] {
+        rig.tmux.run_ok(&["respawn-pane", "-k", "-t", pane, "sh"]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let swapped = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .filter(|row| {
+                ["sh", "bash", "dash"].contains(&row["current_command"].as_str().unwrap_or(""))
+            })
+            .count();
+        if swapped == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shells never took the panes: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    release.add_permits(3);
 
     let a0 = wait_for_alarm(&mut rig, &m0).await;
     let a1 = wait_for_alarm(&mut rig, &m1).await;
@@ -617,7 +671,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
     rig.label(&p0, "worker").await;
     rig.label(&p1, "worker_unrelated").await;
 
-    // Pause once at post_final_prewrite on the target worker, learn the attempt id,
+    // Pause once at pre_paste on the target worker, learn the attempt id,
     // arm the exact attempt scoped fault, then release.
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::watch::channel(false);
@@ -626,7 +680,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         let entered_tx = entered_tx.clone();
         let mut release_rx = release_rx.clone();
         Box::pin(async move {
-            if current == "post_final_prewrite" {
+            if current == "pre_paste" {
                 let _ = entered_tx.send(());
                 let _ = release_rx.wait_for(|&ready| ready).await;
             }
@@ -647,7 +701,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         async {
             tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
                 .await
-                .expect("reached post_final_prewrite")
+                .expect("reached pre_paste")
                 .expect("channel open");
 
             // Inspect the exact in-flight attempt owned by the worker
@@ -875,7 +929,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Verify journal transitions for first_id: exactly one writing, one staged, one submitted
+    // Verify journal transitions for first_id: exactly one writing, one submitted
     let writing_count = lines
         .iter()
         .filter(|l| {
@@ -889,16 +943,6 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         writing_count, 1,
         "exactly one writing transition in journal"
     );
-    let staged_count = lines
-        .iter()
-        .filter(|l| {
-            l.id == first_id
-                && l.data
-                    .as_ref()
-                    .is_some_and(|d| d.get("state") == Some(&json!("staged")))
-        })
-        .count();
-    assert_eq!(staged_count, 1, "exactly one staged transition in journal");
     let submitted_count = lines
         .iter()
         .filter(|l| {

@@ -30,9 +30,6 @@ pub const RESTART_PREDATES_FIX: &str =
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\" --summary \"First sentence. Second sentence.\"), or pass --to or --all.";
 
-pub const ATTENTION_DIFF_UNAVAILABLE: &str =
-    "diff unavailable: exact visible composer extraction failed";
-
 pub const ALARM_CLEAR_JSON_REQUIRES_CONFIRMATION: &str = "alarm clear --older-than requires interactive confirmation; use alarm preview --json, then alarm clear with its exact ids";
 
 pub const ALARM_CLEAR_TERMINAL_REQUIRED: &str = "alarm clear --older-than requires an interactive terminal; use alarm preview, then alarm clear with its exact ids";
@@ -61,7 +58,7 @@ pub fn alarm_cleared_consequence(
     cause: &str,
 ) -> String {
     format!(
-        "  acknowledged only · at clearance, attempt {id} was {state} ({cause}) · clearance did not change message {message_id} to {recipient}; while pending, it can hold that recipient's queue · next: recipient retrieves the durable payload with cyclops inbox claim {message_id} · admin may inspect current state with cyclops attention show {id} --diff, then complete or discard when its checks authorize the action · neither clearance nor payload retrieval alone proves a post-write composer barrier retired"
+        "  acknowledged only · at clearance, attempt {id} was {state} ({cause}) · clearance did not change message {message_id} to {recipient}; while pending, it can hold that recipient's queue · next: recipient retrieves the durable payload with cyclops inbox claim {message_id} · admin may restart the wake with cyclops requeue {message_id} · neither clearance nor payload retrieval alone proves the recipient read the message"
     )
 }
 
@@ -70,7 +67,7 @@ pub fn alarm_cleared_consequence(
 /// clearance does not resolve the notification or message.
 pub fn alarm_cleared_without_summary(id: &str) -> String {
     format!(
-        "  acknowledged only · the daemon did not return the locked summary for attempt {id} · inspect current state with cyclops attention show {id} --diff, or update and restart the matched Cyclops pair"
+        "  acknowledged only · the daemon did not return the locked summary for attempt {id} · inspect current state with cyclops messages, or update and restart the matched Cyclops pair"
     )
 }
 
@@ -86,46 +83,6 @@ pub fn no_unresolved_alarms(older_than: &str) -> String {
 
 pub fn alarm_clear_confirmation_unreadable(error: &std::io::Error) -> String {
     format!("could not read alarm clearance confirmation: {error}")
-}
-
-pub fn attention_resolution_verb(
-    resolution: cyclops_proto::NotificationResolution,
-) -> &'static str {
-    match resolution {
-        cyclops_proto::NotificationResolution::Complete => "submitted",
-        cyclops_proto::NotificationResolution::Discard => "discarded",
-    }
-}
-
-pub fn attention_check_rows(checks: &cyclops_proto::AttentionChecks) -> [(&'static str, bool); 5] {
-    [
-        ("notification exact", checks.notification_exact),
-        ("trailer anchored", checks.trailer_anchored),
-        ("process binding matches", checks.process_matches),
-        ("manifest matches", checks.manifest_matches),
-        ("terminal action safe", checks.terminal_action_safe),
-    ]
-}
-
-pub fn attention_check_value(passed: bool) -> &'static str {
-    if passed {
-        "yes"
-    } else {
-        "no"
-    }
-}
-
-pub fn attention_action_uncertain(
-    resolution: cyclops_proto::NotificationResolution,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-) -> String {
-    let (action, command) = match resolution {
-        cyclops_proto::NotificationResolution::Complete => ("submit", "complete"),
-        cyclops_proto::NotificationResolution::Discard => ("discard", "discard"),
-    };
-    format!(
-        "{action} action outcome uncertain; safe reconcile: cyclops attention {command} {attempt_id}; this rechecks without sending a second key"
-    )
 }
 
 /// Empty roster invites the next action, and names the command that fills
@@ -163,7 +120,6 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "requeue",
             "notification",
             "alarm",
-            "attention",
             "history",
             "thread",
             "wait",
@@ -702,58 +658,6 @@ pub fn theme_not_saved(path: &std::path::Path, cause: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn attention_copy_owns_resolution_and_check_vocabulary() {
-        assert_eq!(
-            attention_resolution_verb(cyclops_proto::NotificationResolution::Complete),
-            "submitted"
-        );
-        assert_eq!(
-            attention_resolution_verb(cyclops_proto::NotificationResolution::Discard),
-            "discarded"
-        );
-        let checks = cyclops_proto::AttentionChecks {
-            notification_exact: true,
-            trailer_anchored: true,
-            process_matches: true,
-            manifest_matches: true,
-            terminal_action_safe: true,
-        };
-        let labels: Vec<_> = attention_check_rows(&checks)
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                "notification exact",
-                "trailer anchored",
-                "process binding matches",
-                "manifest matches",
-                "terminal action safe",
-            ]
-        );
-        assert_eq!(attention_check_value(true), "yes");
-        assert_eq!(attention_check_value(false), "no");
-        let attempt =
-            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
-                .unwrap();
-        assert_eq!(
-            attention_action_uncertain(
-                cyclops_proto::NotificationResolution::Complete,
-                attempt
-            ),
-            "submit action outcome uncertain; safe reconcile: cyclops attention complete att-00000000-0000-4000-8000-000000000001; this rechecks without sending a second key"
-        );
-        assert_eq!(
-            attention_action_uncertain(
-                cyclops_proto::NotificationResolution::Discard,
-                attempt
-            ),
-            "discard action outcome uncertain; safe reconcile: cyclops attention discard att-00000000-0000-4000-8000-000000000001; this rechecks without sending a second key"
-        );
-    }
 
     /// The surfaces that still name the pin command say it byte for byte.
     /// A reader who has seen it once must not have to compare spellings.

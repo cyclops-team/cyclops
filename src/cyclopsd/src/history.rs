@@ -1564,6 +1564,7 @@ mod tests {
             )
             .unwrap(),
             supersedes: None,
+            raw: false,
         };
         let reader = |identity: &MailboxIdentity| {
             HistoryReader::workspace(identity.label.clone(), identity.key)
@@ -2042,6 +2043,7 @@ mod tests {
                     fyi: false,
                     client_key: None,
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap();

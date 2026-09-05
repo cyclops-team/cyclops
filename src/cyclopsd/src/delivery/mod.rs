@@ -20,24 +20,23 @@
 //! Zero-polling shape: workers sleep on queue notifies and wake on watcher
 //! or fusion events. Every timer is a one-shot tied to one notification: the
 //! paste verification re-reads, the tier-1 ACK window, the screen-evidence
-//! checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
-//! deadline, the gate's single wedged-hold ping, and the two deadlines a
-//! caller asked for (`receipt_block_ms`, and `timeout_ms` on a wait). Nothing
-//! runs on an interval.
+//! checkpoints, the decline-key spacing, the two bounded re-observations of
+//! a hold that announces no event, the gate's single wedged-hold ping, and
+//! the two deadlines a caller asked for (`receipt_block_ms`, and `timeout_ms`
+//! on a wait). Nothing runs on an interval.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_manifest::{strip_csi, AckEvidence, Manifest, UnstyledComposerProof};
 use cyclops_proto::{
-    AgentState, ComposerSemantic, ComposerState, DeliveryState, Detection, Event, Kind, LedgerLine,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    AgentState, ComposerSemantic, DeliveryState, Detection, Event, Kind, LedgerLine,
+    NotificationAttemptId, NotificationAttentionCause, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
-    NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
-    ProcessInstanceId, QuiesceResult, RecipientKey, StatusDiagnostic, VerifiedBy, WaitUntil,
-    WireError,
+    NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey,
+    StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -47,9 +46,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::messaging::{MessagingPreWriteBlock, MessagingPreWriteBlockOutcome};
-use crate::notification_adapter::{
-    ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
-};
+use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
 
 pub(crate) mod gate;
@@ -103,7 +100,6 @@ pub(crate) const QUIESCE_HOLD_FALLBACK_MS: u64 = 30_000;
 pub(crate) const ACK_REGISTRY_CAP: usize = 32;
 pub(crate) const NO_LONGER_CURRENT_BEFORE_WRITE: &str = "notification_no_longer_current";
 pub(crate) const NOTIFICATION_RECORD_FAILED: &str = "notification_record_failed";
-pub(crate) const CLAIMED_STAGED_SETTLEMENT_FAILED: &str = "claimed_staged_settlement_failed";
 
 /// Delivery engine state. Lives in [`Inner`]; all behavior is free
 /// functions taking the daemon state so nothing here holds locks across
@@ -468,9 +464,7 @@ impl Engine {
                 let handle = state.current.as_ref().or_else(|| state.queue.front())?;
                 let notification = &handle.notification;
                 Some(StatusDiagnostic {
-                    code: if fault == CLAIMED_STAGED_SETTLEMENT_FAILED {
-                        "notification_settlement_storage_failed"
-                    } else if fault.starts_with("notification pre-write block storage failed:") {
+                    code: if fault.starts_with("notification pre-write block storage failed:") {
                         "notification_prewrite_storage_failed"
                     } else if fault.starts_with("notification recovery failed:") {
                         "notification_recovery_storage_failed"
@@ -600,15 +594,9 @@ pub(crate) struct DeliveryHandle {
     pub(crate) write_boundary_crossed: AtomicBool,
     /// One automatic supervisor recovery is allowed for this exact run.
     pub(crate) worker_recoveries: AtomicU64,
-    /// A readiness edge observed while this claimed-barrier run was active.
-    /// Consumed only after the attempt index releases this handle.
-    pub(crate) claimed_notification_rerun_requested: AtomicBool,
-    /// This ordinary notification was admitted immediately before paste while
-    /// the pane was visibly Working and its composer was positively clean or
-    /// ghosted. The staged doorbell naturally reads as input afterward, so
-    /// this one-attempt capability carries the pre-paste proof to the final
-    /// exact-byte submit check. It is never restored or used by recovery.
-    pub(crate) working_clean_submit_admitted: AtomicBool,
+    /// The sender asked for a raw write: the whole message, no composer
+    /// check, no receipt. Read once from the message at enqueue.
+    pub(crate) raw: bool,
 }
 
 /// Evidence from a vendor hook that landed before the worker consumed it.
@@ -649,10 +637,6 @@ pub(crate) struct HandleState {
     /// remain append-only, so retry accounting subtracts this cumulative
     /// count rather than charging a refusal as transport work.
     pub(crate) regates: u32,
-    /// Binding receives one immediate re-proof after an exact pane or
-    /// readiness edge. Repeated refusal under unchanged evidence settles as
-    /// a durable pre-write block.
-    pub(crate) regate_reproof_used: bool,
     /// The barrier claim this notification currently holds. Set only when a
     /// claim was granted, and compared before any later settlement so a
     /// receipt cannot release a barrier this notification no longer owns.
@@ -704,6 +688,7 @@ impl DeliveryHandle {
         notification: NotificationContext,
     ) -> Arc<Self> {
         let (state_tx, _) = watch::channel(DeliveryState::Queued);
+        let raw = notification.raw_transport();
         Arc::new(DeliveryHandle {
             msg_id: notification.message_id().to_string(),
             to: to.to_string(),
@@ -720,7 +705,6 @@ impl DeliveryHandle {
                 held_by: None,
                 early_ack: None,
                 regates: 0,
-                regate_reproof_used: false,
                 barrier: None,
             }),
             state_tx,
@@ -732,8 +716,7 @@ impl DeliveryHandle {
             submitted_manifest: StdMutex::new(None),
             write_boundary_crossed: AtomicBool::new(false),
             worker_recoveries: AtomicU64::new(0),
-            claimed_notification_rerun_requested: AtomicBool::new(false),
-            working_clean_submit_admitted: AtomicBool::new(false),
+            raw,
         })
     }
 
@@ -759,30 +742,6 @@ impl DeliveryHandle {
             .notification_transport
             .lock()
             .expect("notification transport lock")
-    }
-
-    pub(crate) fn set_working_clean_submit_admitted(&self, admitted: bool) {
-        self.working_clean_submit_admitted
-            .store(admitted, Ordering::SeqCst);
-    }
-
-    pub(crate) fn working_clean_submit_admitted(&self) -> bool {
-        self.working_clean_submit_admitted.load(Ordering::SeqCst)
-    }
-
-    /// Resume a claimed `staged` doorbell from its durable record: the
-    /// exact bytes the earlier run wrote, the barrier it owns, and the
-    /// write boundary already crossed.
-    pub(crate) fn restore_claimed_notification_barrier(&self, staged: String) {
-        let attempt_id = self.notification.attempt_id();
-        {
-            let mut state = self.state.lock().expect("handle state lock");
-            state.state = DeliveryState::Staged;
-            state.barrier = Some(attempt_id.to_string());
-        }
-        self.state_tx.send_replace(DeliveryState::Staged);
-        self.set_attempt_payload(staged, Some(NotificationTransport::Doorbell));
-        self.write_boundary_crossed.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn state(&self) -> DeliveryState {
@@ -1050,7 +1009,6 @@ pub(crate) fn enqueue_notification_attempt(
 ) -> Result<Arc<DeliveryHandle>, NotificationEnqueueRefusal> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
-    let claimed_barrier = notification.claimed_notification_barrier();
     let mut active = inner
         .engine
         .notification_attempts
@@ -1063,11 +1021,6 @@ pub(crate) fn enqueue_notification_attempt(
             let refusal = inner
                 .engine
                 .notification_worker_refusal(recipient, attempt_id);
-            if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
-                handle
-                    .claimed_notification_rerun_requested
-                    .store(true, Ordering::SeqCst);
-            }
             return if let Some(refusal) = refusal {
                 Err(refusal)
             } else {
@@ -1075,39 +1028,8 @@ pub(crate) fn enqueue_notification_attempt(
             };
         }
     }
-    let claimed_barrier = match claimed_barrier {
-        Ok(barrier) => barrier,
-        Err(error) => {
-            error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
-            return Err(NotificationEnqueueRefusal::ClassificationUnavailable);
-        }
-    };
-    let staged = if claimed_barrier.is_some() {
-        let record = match notification.current_record() {
-            Ok(record) => record,
-            Err(error) => {
-                error!(message_id = %notification.message_id(), %error, "cannot rebuild claimed staged notification");
-                return Err(NotificationEnqueueRefusal::PayloadUnavailable);
-            }
-        };
-        // Recovery owns the durable error result. An empty handle payload is
-        // never written on this path; it lets the worker append one exact
-        // attention cause for a missing message or unsupported format.
-        Some(
-            notification
-                .message_line()
-                .ok()
-                .and_then(|message| expected_notification_payload(&record, &message))
-                .unwrap_or_default(),
-        )
-    } else {
-        None
-    };
     let handle =
         DeliveryHandle::for_notification(display_recipient, pane_id, session_idx, notification);
-    if let Some(staged) = staged {
-        handle.restore_claimed_notification_barrier(staged);
-    }
     active.insert(attempt_id, Arc::downgrade(&handle));
     drop(active);
     inner.engine.track(&handle);

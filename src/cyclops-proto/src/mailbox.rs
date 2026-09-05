@@ -283,6 +283,10 @@ pub struct MessageMetadata {
     pub request_digest: RequestDigest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<MessageId>,
+    /// The sender asked for a raw write: the whole message is pasted and
+    /// submitted with no composer check and no receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw: bool,
 }
 
 /// Human-readable labels bound to authoritative message identities.

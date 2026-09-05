@@ -281,9 +281,6 @@ enum Cmd {
     /// Preview or clear delivery alarms.
     #[command(hide = true)]
     Alarm(AlarmArgs),
-    /// Inspect or resolve an exact staged notification attempt.
-    #[command(hide = true)]
-    Attention(AttentionArgs),
     /// Messages from the record, newest last. Filter by agent or direction.
     #[command(hide = true)]
     History(HistoryArgs),
@@ -616,7 +613,7 @@ struct SendArgs {
     /// One line the recipient sees first.
     #[arg(long)]
     subject: String,
-    /// One-line preview shown beside the recipient's inbox claim (auto-derived from body if omitted).
+    /// One-line preview shown beside the recipient's inbox claim (the daemon derives one from the subject if omitted).
     #[arg(long)]
     summary: Option<String>,
     /// Message body text.
@@ -625,6 +622,10 @@ struct SendArgs {
     /// Read the body from a file; - reads stdin.
     #[arg(long)]
     body_file: Option<String>,
+    /// Paste the whole message into the pane and press Enter, skipping every
+    /// composer check; the journal records an unverified raw write.
+    #[arg(long)]
+    raw: bool,
     /// More recipients, comma separated.
     #[arg(long, value_delimiter = ',')]
     to: Vec<String>,
@@ -693,7 +694,7 @@ struct ReplyArgs {
     /// Message identifier being answered, attempt token m-att_..., or '-' / '--last'.
     #[arg(default_value = "--last")]
     message_id: String,
-    /// One-line preview shown beside the recipient's inbox claim (auto-derived from body if omitted).
+    /// One-line preview shown beside the recipient's inbox claim (the daemon derives one from the subject if omitted).
     #[arg(long)]
     summary: Option<String>,
     /// Reply body text.
@@ -702,6 +703,10 @@ struct ReplyArgs {
     /// Read the reply body from a file; - reads stdin.
     #[arg(long)]
     body_file: Option<String>,
+    /// Paste the whole message into the pane and press Enter, skipping every
+    /// composer check; the journal records an unverified raw write.
+    #[arg(long)]
+    raw: bool,
     /// Sender-scoped idempotency key.
     #[arg(long)]
     client_key: Option<String>,
@@ -765,34 +770,6 @@ enum AlarmCmd {
             conflicts_with = "ids"
         )]
         older_than: Option<String>,
-    },
-}
-
-#[derive(clap::Args)]
-struct AttentionArgs {
-    #[command(subcommand)]
-    cmd: AttentionCmd,
-}
-
-#[derive(Subcommand)]
-enum AttentionCmd {
-    /// Report all safety checks without changing terminal or journal state.
-    Show {
-        /// Notification attempt id, or a message id with one unresolved attempt.
-        id: String,
-        /// Print a local expected-versus-observed line diff.
-        #[arg(long)]
-        diff: bool,
-    },
-    /// Submit the exact staged notification.
-    Complete {
-        /// Notification attempt id, or a message id with one unresolved attempt.
-        id: String,
-    },
-    /// Clear the exact staged notification without submitting it.
-    Discard {
-        /// Notification attempt id, or a message id with one unresolved attempt.
-        id: String,
     },
 }
 
@@ -1260,7 +1237,6 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::Requeue(_)
         | Cmd::Notification(_)
         | Cmd::Alarm(_)
-        | Cmd::Attention(_)
         | Cmd::Hooks { .. } => {
             let mut c = match connect() {
                 Ok(c) => c,
@@ -1292,7 +1268,6 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Requeue(args) => cmd_requeue(&mut c, cli, &style, args),
                 Cmd::Notification(args) => cmd_notification(&mut c, cli, &style, args),
                 Cmd::Alarm(args) => cmd_alarm(&mut c, cli, &style, args),
-                Cmd::Attention(args) => cmd_attention(&mut c, cli, &style, args),
                 Cmd::Hooks {
                     cmd: HooksCmd::Verify { target },
                 } => hookset::run_verify(&mut c, cli.json, &style, target),
@@ -1934,97 +1909,6 @@ fn cmd_read(
     0
 }
 
-fn auto_derive_summary(body: &str, fallback_subject: &str) -> String {
-    let source = if body.trim().is_empty() {
-        fallback_subject.trim()
-    } else {
-        body.trim()
-    };
-    if source.is_empty() {
-        return "Message sent. The payload is ready.".to_string();
-    }
-    let flat: String = source
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let flat: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let mut sentences: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = flat.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        current.push(chars[i]);
-        if matches!(chars[i], '.' | '!' | '?') {
-            while i + 1 < chars.len() && matches!(chars[i + 1], '.' | '!' | '?') {
-                i += 1;
-                current.push(chars[i]);
-            }
-            if i + 1 == chars.len() || chars[i + 1].is_whitespace() {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    sentences.push(trimmed);
-                }
-                current.clear();
-            }
-        }
-        i += 1;
-    }
-    let rest = current.trim();
-    if !rest.is_empty() {
-        sentences.push(format!("{rest}."));
-    }
-
-    let summary = if sentences.len() >= 2 {
-        format!("{} {}", sentences[0], sentences[1])
-    } else if sentences.len() == 1 {
-        format!("{} The message is ready.", sentences[0])
-    } else {
-        "Message sent. The payload is ready.".to_string()
-    };
-
-    if summary.chars().count() > 230 {
-        let s1 = &sentences[0];
-        if s1.chars().count() < 180 {
-            let max_s2 = 230 - s1.chars().count() - 2;
-            let s2 = if sentences.len() >= 2 {
-                &sentences[1]
-            } else {
-                "The message is ready."
-            };
-            let mut cut = max_s2.min(s2.len());
-            while !s2.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let s2_cut = s2[..cut].trim_end();
-            let s2_clean =
-                if s2_cut.ends_with('.') || s2_cut.ends_with('?') || s2_cut.ends_with('!') {
-                    s2_cut.to_string()
-                } else {
-                    format!("{s2_cut}.")
-                };
-            format!("{s1} {s2_clean}")
-        } else {
-            let mut cut = 180.min(s1.len());
-            while !s1.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let s1_cut = s1[..cut].trim_end();
-            let s1_clean =
-                if s1_cut.ends_with('.') || s1_cut.ends_with('?') || s1_cut.ends_with('!') {
-                    s1_cut.to_string()
-                } else {
-                    format!("{s1_cut}.")
-                };
-            format!("{s1_clean} Done.")
-        }
-    } else {
-        summary
-    }
-}
-
 fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     let mut to: Vec<String> = Vec::new();
     if args.all {
@@ -2070,11 +1954,13 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
             }
         }
     };
-    let summary = match &args.summary {
-        Some(s) if !s.trim().is_empty() => s.clone(),
-        _ => auto_derive_summary(&body, &args.subject),
-    };
-    if let Err(error) = cyclops_proto::validate_message_summary(&summary) {
+    // Optional: the daemon derives a summary, subject first, when none
+    // is given.
+    let summary = args.summary.clone().filter(|s| !s.trim().is_empty());
+    if let Some(error) = summary
+        .as_deref()
+        .and_then(|summary| cyclops_proto::validate_message_summary(summary).err())
+    {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
@@ -2097,7 +1983,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         recipient_keys: None,
         expected_caller: None,
         subject: args.subject.clone(),
-        summary: Some(summary),
+        summary,
         body,
         fyi: args.fyi,
         client_key: args.client_key.clone(),
@@ -2105,6 +1991,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         supersedes,
         wait: None,
         require_wake: args.require_wake,
+        raw: args.raw,
     })
     .expect("msg.send params serialize");
     let asked = if to.len() == 1 {
@@ -2722,26 +2609,14 @@ fn held_release_action(head: &HeldHead) -> String {
             }
             action
         }
-        HeldCauseKind::Attention => match head.attempt_id {
-            Some(attempt_id) => format!(
-                "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin: cyclops attention show {attempt_id} --diff, then complete or discard when its checks authorize the action",
-                head.message_id
-            ),
-            None => format!(
-                "next: recipient retrieves the durable payload with cyclops inbox claim {}",
-                head.message_id
-            ),
-        },
-        HeldCauseKind::AttentionResolutionPending => match head.attempt_id {
-            Some(attempt_id) => format!(
-                "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin inspects cyclops attention show {attempt_id} --diff; do not repeat a terminal action",
-                head.message_id
-            ),
-            None => format!(
-                "next: recipient retrieves the durable payload with cyclops inbox claim {}; do not repeat a terminal action",
-                head.message_id
-            ),
-        },
+        HeldCauseKind::Attention => format!(
+            "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin: cyclops requeue {}",
+            head.message_id, head.message_id
+        ),
+        HeldCauseKind::AttentionResolutionPending => format!(
+            "next: recipient retrieves the durable payload with cyclops inbox claim {}; do not repeat a terminal action",
+            head.message_id
+        ),
     }
 }
 
@@ -2887,19 +2762,8 @@ fn message_recipient_cell(
                         "terminal accepted, task start unproven; no retry or reconciliation available"
                             .to_string()
                     } else {
-                        match recipient.notification.attempt_id {
-                            Some(attempt_id) => {
-                                includes_attempt = true;
-                                format!(
-                                    "terminal accepted the action key; {}",
-                                    copy::attention_action_uncertain(intent, attempt_id)
-                                )
-                            }
-                            None => {
-                                "terminal accepted the action key; exact attempt unavailable for reconciliation"
-                                    .to_string()
-                            }
-                        }
+                        "terminal accepted the action key; no retry or reconciliation available"
+                            .to_string()
                     }
                 }
                 None => {
@@ -3061,11 +2925,11 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
             }
         }
     };
-    let summary = match &args.summary {
-        Some(s) if !s.trim().is_empty() => s.clone(),
-        _ => auto_derive_summary(&body, "Reply"),
-    };
-    if let Err(error) = cyclops_proto::validate_message_summary(&summary) {
+    let summary = args.summary.clone().filter(|s| !s.trim().is_empty());
+    if let Some(error) = summary
+        .as_deref()
+        .and_then(|summary| cyclops_proto::validate_message_summary(summary).err())
+    {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
@@ -3075,9 +2939,10 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     };
     let params = serde_json::to_value(cyclops_proto::ReplyParams {
         message_id,
-        summary: Some(summary),
+        summary,
         body,
         client_key: args.client_key.clone(),
+        raw: args.raw,
     })
     .expect("msg.reply params serialize");
     let result = match c.request("msg.reply", params) {
@@ -3629,125 +3494,6 @@ fn cmd_alarm(c: &mut Client, cli: &Cli, style: &Style, args: &AlarmArgs) -> i32 
             }
         }
     }
-}
-
-fn cmd_attention(c: &mut Client, cli: &Cli, style: &Style, args: &AttentionArgs) -> i32 {
-    match &args.cmd {
-        AttentionCmd::Show { id, diff } => {
-            let params = serde_json::to_value(cyclops_proto::AttentionShowParams {
-                id: id.clone(),
-                diff: *diff,
-            })
-            .expect("attention.show params serialize");
-            let result: cyclops_proto::AttentionShowResult = match ask(
-                c,
-                "attention.show",
-                params,
-                cli.json,
-                None,
-                serde_json::from_value,
-            ) {
-                Ok(Some(result)) => result,
-                Ok(None) => return 0,
-                Err(code) => return code,
-            };
-            print_attention_checks(style, &result);
-            if *diff {
-                match (result.expected.as_deref(), result.observed.as_deref()) {
-                    (Some(expected), Some(observed)) => {
-                        print!("{}", local_line_diff(expected, observed))
-                    }
-                    _ => println!("{}", copy::ATTENTION_DIFF_UNAVAILABLE),
-                }
-            }
-            0
-        }
-        AttentionCmd::Complete { id } => resolve_attention(c, cli, style, id, "attention.complete"),
-        AttentionCmd::Discard { id } => resolve_attention(c, cli, style, id, "attention.discard"),
-    }
-}
-
-fn resolve_attention(c: &mut Client, cli: &Cli, style: &Style, id: &str, method: &str) -> i32 {
-    let params = serde_json::to_value(cyclops_proto::AttentionResolveParams { id: id.to_string() })
-        .expect("attention resolution params serialize");
-    let result: cyclops_proto::AttentionResolveResult =
-        match ask(c, method, params, cli.json, None, serde_json::from_value) {
-            Ok(Some(result)) => result,
-            Ok(None) => return 0,
-            Err(code) => return code,
-        };
-    let verb = copy::attention_resolution_verb(result.resolution);
-    println!("{verb} {}", style.accent(&result.attempt_id.to_string()));
-    0
-}
-
-fn print_attention_checks(style: &Style, result: &cyclops_proto::AttentionShowResult) {
-    println!(
-        "{} · {} · {}",
-        style.accent(&result.attempt_id.to_string()),
-        result.recipient,
-        result.message_id
-    );
-    for (name, passed) in copy::attention_check_rows(&result.checks) {
-        println!("  {name}: {}", copy::attention_check_value(passed));
-    }
-    if let Some(line) = attention_verify_failure_line(result.verify_outcome) {
-        println!("  {line}");
-    }
-}
-
-fn attention_verify_failure_line(
-    outcome: Option<cyclops_proto::NotificationVerifyOutcome>,
-) -> Option<String> {
-    outcome.map(|outcome| {
-        let kind = wire_word(serde_json::to_value(outcome.kind).unwrap_or(Value::Null));
-        let composer =
-            wire_word(serde_json::to_value(outcome.observed_composer).unwrap_or(Value::Null));
-        format!("verification failure: {kind} · composer {composer}")
-    })
-}
-
-/// Compact line diff computed by the client. The daemon never receives it.
-fn local_line_diff(expected: &str, observed: &str) -> String {
-    let expected: Vec<_> = expected.split('\n').collect();
-    let observed: Vec<_> = observed.split('\n').collect();
-    let mut prefix = 0;
-    while prefix < expected.len() && prefix < observed.len() && expected[prefix] == observed[prefix]
-    {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < expected.len().saturating_sub(prefix)
-        && suffix < observed.len().saturating_sub(prefix)
-        && expected[expected.len() - 1 - suffix] == observed[observed.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let mut out = String::from("--- expected\n+++ composer\n");
-    let context_start = prefix.saturating_sub(2);
-    for line in &expected[context_start..prefix] {
-        out.push_str("  ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in &expected[prefix..expected.len().saturating_sub(suffix)] {
-        out.push_str("- ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in &observed[prefix..observed.len().saturating_sub(suffix)] {
-        out.push_str("+ ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    let suffix_start = expected.len().saturating_sub(suffix);
-    for line in expected.iter().skip(suffix_start).take(2) {
-        out.push_str("  ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
 }
 
 /// cyclops wait <target> --until idle|turn-ended|blocked [--timeout 60s].
@@ -4632,34 +4378,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn attention_commands_require_one_explicit_target() {
-        assert!(Cli::try_parse_from(["cyclops", "attention", "show"]).is_err());
-        let shown =
-            Cli::try_parse_from(["cyclops", "attention", "show", "att-1", "--diff"]).unwrap();
-        let Some(Cmd::Attention(AttentionArgs {
-            cmd: AttentionCmd::Show { id, diff },
-        })) = shown.cmd
-        else {
-            panic!("attention show command")
-        };
-        assert_eq!(id, "att-1");
-        assert!(diff);
-
-        for verb in ["complete", "discard"] {
-            assert!(Cli::try_parse_from(["cyclops", "attention", verb]).is_err());
-            assert!(Cli::try_parse_from(["cyclops", "attention", verb, "m-1"]).is_ok());
-        }
-    }
-
-    #[test]
-    fn attention_diff_is_computed_locally() {
-        assert_eq!(
-            local_line_diff("same\nold\ntail", "same\nnew\ntail"),
-            "--- expected\n+++ composer\n  same\n- old\n+ new\n  tail\n"
-        );
-    }
-
     /// Preview needs an explicit age, and requeue an explicit message.
     /// Neither operator command has a default that acts on everything.
     #[test]
@@ -4742,6 +4460,7 @@ mod tests {
                     operator_withdrawn: None,
                     attempt_id: None,
                     cause,
+                    verified_by: None,
                     verify_outcome: None,
                     pre_write_cause: None,
                     pre_write_pane_width: None,
@@ -4882,7 +4601,7 @@ mod tests {
         assert_eq!(
             held_queue_lines(&heads),
             vec![
-                "held queue · reviewer · head m-head · verify_failed · 2 waiting · next: recipient retrieves the durable payload with cyclops inbox claim m-head; or admin: cyclops attention show att-00000000-0000-4000-8000-000000000001 --diff, then complete or discard when its checks authorize the action".to_string()
+                "held queue · reviewer · head m-head · verify_failed · 2 waiting · next: recipient retrieves the durable payload with cyclops inbox claim m-head; or admin: cyclops requeue m-head".to_string()
             ]
         );
 
@@ -5001,12 +4720,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(line.contains("cyclops inbox claim m-attention"), "{line}");
-        assert!(
-            line.contains("cyclops attention show att-00000000-0000-4000-8000-000000000003 --diff"),
-            "{line}"
-        );
-        assert!(line.contains("complete or discard"), "{line}");
-        assert!(!line.contains("requeue"), "{line}");
+        assert!(line.contains("cyclops requeue m-attention"), "{line}");
 
         let mut resolving = attention.clone();
         resolving.recipients[0].notification.resolution_intent =
@@ -5017,7 +4731,6 @@ mod tests {
             .unwrap();
         assert!(line.contains("attention_resolution_pending"), "{line}");
         assert!(line.contains("do not repeat a terminal action"), "{line}");
-        assert!(!line.contains("then complete or discard"), "{line}");
 
         attention.recipients[0].notification.resolution =
             Some(cyclops_proto::NotificationResolution::Complete);
@@ -5046,22 +4759,15 @@ mod tests {
             "clearance did not change message m-head to codey",
             "while pending, it can hold that recipient's queue",
             "recipient retrieves the durable payload with cyclops inbox claim m-head",
-            "cyclops attention show att-1 --diff",
+            "cyclops requeue m-head",
             "neither clearance nor payload retrieval alone proves",
         ] {
             assert!(line.contains(needle), "missing {needle:?} in {line}");
         }
-        assert!(
-            !line.contains("requeue"),
-            "a cleared attempt is not eligible for requeue: {line}"
-        );
 
         let fallback = copy::alarm_cleared_without_summary("att-old");
         assert!(fallback.contains("acknowledged only"), "{fallback}");
-        assert!(
-            fallback.contains("attention show att-old --diff"),
-            "{fallback}"
-        );
+        assert!(fallback.contains("cyclops messages"), "{fallback}");
     }
 
     #[test]
@@ -5104,6 +4810,7 @@ mod tests {
                     operator_withdrawn: None,
                     attempt_id: Some(attempt),
                     cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    verified_by: None,
                     verify_outcome: Some(cyclops_proto::NotificationVerifyOutcome {
                         kind: cyclops_proto::NotificationVerifyFailureKind::Mismatch,
                         observed_composer: cyclops_proto::ComposerState::HumanDraft,
@@ -5149,10 +4856,6 @@ mod tests {
             "mismatch"
         );
         assert!(json.get("body").is_none());
-        assert_eq!(
-            attention_verify_failure_line(row.recipients[0].notification.verify_outcome).as_deref(),
-            Some("verification failure: mismatch · composer human_draft")
-        );
 
         let mut not_started = row.recipients[0].clone();
         not_started.fifo_position = Some(1);
@@ -5164,6 +4867,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
@@ -5191,6 +4895,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: Some(attempt),
             cause: None,
+            verified_by: None,
             verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,

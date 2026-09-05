@@ -24,6 +24,8 @@ pub struct MailboxSend {
     pub fyi: bool,
     pub client_key: Option<String>,
     pub supersedes: Option<MessageId>,
+    /// Paste the whole message and press Enter with no composer check.
+    pub raw: bool,
 }
 
 pub struct MailboxDirectory {

@@ -252,89 +252,6 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-    let manifest = claude_unkeyed_dispatch_manifest();
-    let mut rig = Rig::new(
-        "claude-human-prompt-hold",
-        &manifest,
-        &manual_lifecycle_composer_pane(),
-        "ack_timeout_ms = 3000\n",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "keyed").await;
-    wait_pane_state(&mut rig, "idle").await;
-
-    let human = report(
-        &rig,
-        "UserPromptSubmit",
-        json!({
-            "session_id": "human-session",
-            "prompt": "a human prompt that is not a Cyclops notification",
-        }),
-    )
-    .await;
-    assert_eq!(human["matched"], false, "{human}");
-    assert_eq!(human["state"], "working", "{human}");
-    rig.ev
-        .wait_event(Duration::from_secs(10), |event| {
-            event["event"] == "state"
-                && event["data"]["pane_id"] == pane.as_str()
-                && event["data"]["state"] == "working"
-                && event["data"]["working_confirmed"] == false
-        })
-        .await;
-
-    // Claude can accept a prompt before it paints output. A later clean frame
-    // is still neutral, so elapsed time cannot make the pane write-ready.
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let status = rig.ctl.request("status", json!({})).await;
-    let pane_status = status["result"]["sessions"][0]["panes"]
-        .as_array()
-        .and_then(|panes| panes.iter().find(|row| row["pane_id"] == pane.as_str()))
-        .unwrap_or_else(|| panic!("pane missing after delayed prompt start: {status}"));
-    assert_eq!(pane_status["state"], "working", "{status}");
-    assert_eq!(pane_status["working_confirmed"], false, "{status}");
-
-    let (sent, _) = rig
-        .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
-        .await;
-    let id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_delivery_state(&mut rig, &id, "gating").await;
-    assert_eq!(notification_state(&rig, &id).as_deref(), Some("gating"));
-    assert!(
-        !rig.tmux.capture(&pane).contains(&id),
-        "the unrelated delivery wrote while the human turn was working"
-    );
-
-    // Visual output confirms only the pane runtime. The unmatched human
-    // prompt did not claim any Cyclops notification receipt.
-    send_fixture_key(&rig, &pane, "C-t");
-    rig.ev
-        .wait_event(Duration::from_secs(10), |event| {
-            event["event"] == "state"
-                && event["data"]["pane_id"] == pane.as_str()
-                && event["data"]["state"] == "working"
-                && event["data"]["working_confirmed"] == true
-        })
-        .await;
-    assert_eq!(notification_state(&rig, &id).as_deref(), Some("gating"));
-    assert!(
-        !rig.tmux.capture(&pane).contains(&id),
-        "visual confirmation released a delivery before the turn ended"
-    );
-
-    send_fixture_key(&rig, &pane, "C-y");
-    wait_pane_state(&mut rig, "idle").await;
-    wait_submitted(&mut rig, &id).await;
-    rig.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
@@ -512,7 +429,7 @@ async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claude_blocked_dispatch_never_becomes_a_receipt() {
+async fn claude_blocked_dispatch_never_becomes_a_verified_receipt() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -550,16 +467,26 @@ async fn claude_blocked_dispatch_never_becomes_a_receipt() {
     );
     send_fixture_key(&rig, &pane, "C-l");
 
-    wait_notification_state(&rig, &id, &["attention_required"]).await;
+    // No receipt is not an alarm: the record closes as Notified with no
+    // verifier, and the unconfirmed dispatch never became that verifier.
+    wait_notification_state(&rig, &id, &["notified"]).await;
+    let notified = workspace_lines(&rig)
+        .into_iter()
+        .find(|line| {
+            line.id == id
+                && line.data.as_ref().is_some_and(|data| {
+                    data["type"] == "notification_transition" && data["state"] == "notified"
+                })
+        })
+        .expect("notified transition");
+    assert!(
+        notified.data.as_ref().unwrap().get("verified_by").is_none(),
+        "a blocked dispatch became a verified receipt: {notified:?}"
+    );
     let screen = rig.tmux.capture(&pane);
     assert!(
         screen.contains(&doorbell_for(&rig, &id)),
         "blocked doorbell left the composer: {screen}"
-    );
-    assert_ne!(
-        notification_state(&rig, &id).as_deref(),
-        Some("notified"),
-        "a blocked dispatch became a receipt"
     );
     rig.shutdown().await;
 }

@@ -11,14 +11,13 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use cyclops_proto::{
-    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams,
-    AttentionResolveParams, AttentionShowParams, DaemonShutdownParams, DaemonShutdownResult, Event,
-    FrameContract, FrameSize, Hello, InboxClaimParams, InboxListParams, MessagesFollowParams,
-    MessagesSnapshotParams, MsgSendParams, NotificationAttemptId, NotificationResolution,
-    NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
-    ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
-    RequeueResult, Response, SessionStatus, StateReportParams, StatusParams, StatusResult,
-    StreamBackfillParams, SubscribeParams, WireError, PROTOCOL_VERSION,
+    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams, DaemonShutdownParams,
+    DaemonShutdownResult, Event, FrameContract, FrameSize, Hello, InboxClaimParams,
+    InboxListParams, MessagesFollowParams, MessagesSnapshotParams, MsgSendParams,
+    NotificationAttemptId, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
+    PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
+    Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
+    StatusParams, StatusResult, StreamBackfillParams, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use cyclops_proto::{AlarmPreviewResult, NotificationAttentionCause, TmuxPaneId};
@@ -537,22 +536,6 @@ pub(crate) async fn dispatch(
         "notification.withdraw" => (notification_withdraw(inner, id, req.params, peer), None),
         "alarm.preview" => (alarm_preview(inner, id, req.params, peer), None),
         "alarm.clear" => (alarm_clear(inner, id, req.params, peer), None),
-        "attention.show" => (attention_show(inner, id, req.params, peer).await, None),
-        "attention.complete" => (
-            attention_resolve(
-                inner,
-                id,
-                req.params,
-                peer,
-                NotificationResolution::Complete,
-            )
-            .await,
-            None,
-        ),
-        "attention.discard" => (
-            attention_resolve(inner, id, req.params, peer, NotificationResolution::Discard).await,
-            None,
-        ),
         "msg.history" => {
             // cursor2 travels outside the HistoryParams struct (wire-additive;
             // the struct is shared with clients that predate the field).
@@ -801,93 +784,6 @@ pub(crate) async fn dispatch(
             crate::workspace_ui::workspace_ui_set(&inner.workspace_ui, &params);
             (Response::ok(id, json!({"saved": true})), None)
         }
-        "notification.force_submit.get" => {
-            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
-                return (
-                    Response {
-                        id,
-                        result: None,
-                        error: Some(error),
-                    },
-                    None,
-                );
-            }
-            let (enabled, delay_ms) = inner.force_submit.get();
-            let result = cyclops_proto::ForceSubmitSettings {
-                enabled,
-                delay_seconds: u8::try_from(delay_ms / 1_000).unwrap_or(20).min(20),
-            };
-            (
-                Response::ok(
-                    id,
-                    serde_json::to_value(result).expect("force-submit settings serialize"),
-                ),
-                None,
-            )
-        }
-        "notification.force_submit.set" => {
-            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
-                return (
-                    Response {
-                        id,
-                        result: None,
-                        error: Some(error),
-                    },
-                    None,
-                );
-            }
-            let params: cyclops_proto::ForceSubmitSettingsSetParams =
-                match decode_params(&id, req.params, "notification.force_submit.set params") {
-                    Ok(params) => params,
-                    Err(response) => return (response, None),
-                };
-            if params.delay_seconds > 20 {
-                return (
-                    Response::err(
-                        id,
-                        "bad_request",
-                        "force-submit delay must be between 0 and 20 seconds",
-                    ),
-                    None,
-                );
-            }
-            let delay_ms = u64::from(params.delay_seconds) * 1_000;
-            if let Err(error) = inner
-                .force_submit
-                .save_and_set(params.enabled, delay_ms, || {
-                    crate::config::save_force_notification_submit(
-                        &inner.cfg.home,
-                        params.enabled,
-                        delay_ms,
-                    )
-                })
-            {
-                return (
-                    Response::err(
-                        id,
-                        "storage_failed",
-                        format!("cannot save force-submit setting: {error}"),
-                    ),
-                    None,
-                );
-            }
-            if params.enabled {
-                if let Some(messaging) = inner.workspace_messaging() {
-                    messaging.force_submit_enabled();
-                }
-            }
-            let result = cyclops_proto::ForceSubmitSettings {
-                enabled: params.enabled,
-                delay_seconds: params.delay_seconds,
-            };
-            (
-                Response::ok(
-                    id,
-                    serde_json::to_value(result).expect("force-submit settings serialize"),
-                ),
-                None,
-            )
-        }
         method => {
             if let Some((_, milestone)) = UNIMPLEMENTED.iter().find(|(m, _)| *m == method) {
                 (
@@ -1005,6 +901,7 @@ async fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> 
             params.summary,
             params.body,
             params.client_key,
+            params.raw,
         )
         .await
     {
@@ -1198,136 +1095,10 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     }
 }
 
-async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
-    let params: AttentionShowParams = match decode_params(&id, params, "attention.show params") {
-        Ok(params) => params,
-        Err(response) => return response,
-    };
-    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
-        Ok(caller) => caller,
-        Err(error) => return wire_error_response(id, error),
-    };
-    attention_show_for_caller(inner, id, params, &messaging, caller.key).await
-}
-
-async fn attention_show_for_caller(
-    inner: &Arc<Inner>,
-    id: Value,
-    params: AttentionShowParams,
-    messaging: &crate::messaging::WorkspaceMessaging,
-    caller: RecipientKey,
-) -> Response {
-    // Diff mode returns the exact payload selected at the write boundary.
-    // Direct compatibility attempts can therefore include message content,
-    // which is why only the administrator and the attempt's own recipient,
-    // who may already claim that body, can ask. Neither diff input is
-    // logged or stored.
-    match crate::attention_resolution::show(inner, messaging, caller, &params.id, params.diff).await
-    {
-        Ok(result) => Response::ok(
-            id,
-            serde_json::to_value(result).expect("attention show result serializes"),
-        ),
-        Err(error) => wire_error_response(id, messaging_attention_error(error)),
-    }
-}
-
-async fn attention_resolve(
-    inner: &Arc<Inner>,
-    id: Value,
-    params: Value,
-    peer: Peer,
-    resolution: NotificationResolution,
-) -> Response {
-    let params: AttentionResolveParams =
-        match decode_params(&id, params, "attention resolution params") {
-            Ok(params) => params,
-            Err(response) => return response,
-        };
-    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
-        Ok(caller) => caller,
-        Err(error) => return wire_error_response(id, error),
-    };
-    match crate::attention_resolution::resolve(
-        inner, &messaging, caller.key, &params.id, resolution,
-    )
-    .await
-    {
-        Ok(result) => Response::ok(
-            id,
-            serde_json::to_value(result).expect("attention resolution result serializes"),
-        ),
-        Err(error) => wire_error_response(id, attention_resolve_error(error)),
-    }
-}
-
 fn messaging_attention_error(error: crate::messaging::MessagingAttentionError) -> WireError {
     match error {
         crate::messaging::MessagingAttentionError::Denied => mailbox_admin_required(),
-        crate::messaging::MessagingAttentionError::Ambiguous {
-            message,
-            candidates,
-        } => WireError {
-            code: "ambiguous_attention".to_string(),
-            message,
-            data: Some(json!({
-                "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
-            })),
-        },
         crate::messaging::MessagingAttentionError::Mailbox(error) => mailbox_service_error(error),
-    }
-}
-
-fn attention_action_error(error: crate::attention_resolution::AttentionActionError) -> WireError {
-    use crate::attention_resolution::AttentionActionError;
-
-    match error {
-        AttentionActionError::Store(error) => mailbox_service_error(error),
-        AttentionActionError::ResolutionInProgress => WireError {
-            code: "conflict".to_string(),
-            message: error.to_string(),
-            data: None,
-        },
-        AttentionActionError::Evidence(result) => WireError {
-            code: "attention_evidence_failed".to_string(),
-            message: "the staged notification did not pass every safety check".to_string(),
-            data: Some(serde_json::to_value(result).expect("attention evidence serializes")),
-        },
-        AttentionActionError::DiscardUnsupported => WireError {
-            code: "discard_unsupported".to_string(),
-            message: error.to_string(),
-            data: None,
-        },
-        AttentionActionError::Uncertain => WireError {
-            code: "attention_action_uncertain".to_string(),
-            message: error.to_string(),
-            data: None,
-        },
-        AttentionActionError::ForceRefused(_) => WireError {
-            code: "force_submit_refused".to_string(),
-            message: error.to_string(),
-            data: None,
-        },
-    }
-}
-
-fn attention_resolve_error(error: crate::attention_resolution::AttentionResolveError) -> WireError {
-    match error {
-        crate::attention_resolution::AttentionResolveError::Selection(error) => {
-            messaging_attention_error(error)
-        }
-        crate::attention_resolution::AttentionResolveError::Action(error) => {
-            attention_action_error(error)
-        }
-    }
-}
-
-fn require_workspace_messaging_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
-    let (_, identity) = workspace_messaging_caller(inner, peer)?;
-    if identity.key.is_admin() {
-        Ok(())
-    } else {
-        Err(mailbox_admin_required())
     }
 }
 
@@ -1532,8 +1303,6 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                 | MailboxError::NotificationAttemptClaimLocatorConflict(_)
                 | MailboxError::NotificationClearRequiresAttention
                 | MailboxError::NotificationRequeueRequiresAttention
-                | MailboxError::NotificationRequeueBarrierBindingIncomplete(_)
-                | MailboxError::NotificationRequeueExactComposerBarrier(_)
                 | MailboxError::NotificationWithdrawalRequiresPreWrite
                 | MailboxError::NotificationWithdrawalRecipientMismatch { .. } => {
                     ("conflict", error.to_string())
@@ -2982,7 +2751,6 @@ mod tests {
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
-            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
@@ -2990,9 +2758,6 @@ mod tests {
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: std::sync::OnceLock::new(),
-            composer_recovery: Arc::new(StdMutex::new(
-                crate::composer_recovery::RecoveryCoordinator::default(),
-            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -3290,6 +3055,7 @@ mod tests {
                             label: "reviewer".into(),
                         }],
                     },
+                    raw: false,
                 },
             )
             .unwrap();
@@ -3395,6 +3161,7 @@ mod tests {
                                 label: "admin".into(),
                             }],
                         },
+                        raw: false,
                     },
                 )
                 .unwrap();
@@ -3482,6 +3249,7 @@ mod tests {
                     fyi: false,
                     client_key: None,
                     supersedes: None,
+                    raw: false,
                 },
             )
             .unwrap();
@@ -3806,52 +3574,6 @@ mod tests {
         std::fs::remove_dir_all(path).ok();
     }
 
-    #[tokio::test]
-    async fn attention_show_endpoint_admits_the_exact_recipient_without_leaking_other_ids() {
-        let (inner, path, attempt_id, _) = inner_with_alarm(
-            "cyc-attention-show-recipient",
-            NotificationAttentionCause::VerifyFailed,
-        );
-        let workspace: cyclops_proto::WorkspaceId =
-            "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let session: cyclops_proto::SessionInstanceId =
-            "00000000-0000-0000-0000-000000000002".parse().unwrap();
-        let recipient =
-            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
-        let stranger = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%2").unwrap());
-        let messaging = inner.workspace_messaging().unwrap();
-        let params = AttentionShowParams {
-            id: attempt_id.to_string(),
-            diff: true,
-        };
-
-        let shown =
-            attention_show_for_caller(&inner, json!(1), params.clone(), &messaging, recipient)
-                .await;
-        assert!(shown.error.is_none(), "{:?}", shown.error);
-        let shown: cyclops_proto::AttentionShowResult =
-            serde_json::from_value(shown.result.unwrap()).unwrap();
-        assert_eq!(shown.attempt_id, attempt_id);
-
-        let denied =
-            attention_show_for_caller(&inner, json!(2), params, &messaging, stranger).await;
-        assert_eq!(denied.error.unwrap().code, "denied");
-
-        let hidden = attention_show_for_caller(
-            &inner,
-            json!(3),
-            AttentionShowParams {
-                id: "att-00000000-0000-4000-8000-000000000099".into(),
-                diff: true,
-            },
-            &messaging,
-            stranger,
-        )
-        .await;
-        assert_eq!(hidden.error.unwrap().code, "denied");
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
     /// Item 5: the status eye counts durable mailbox attention through a
     /// mailbox half kept apart from the legacy ledger fold: one row per
     /// attempt, exact recipient and attempt id on the row, stable across
@@ -3957,50 +3679,6 @@ mod tests {
         );
         assert_eq!(cyclops_proto::Attention::from_status(&res).count(), 1);
         std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn attention_show_is_read_only_and_failed_resolution_writes_nothing() {
-        let (inner, path, attempt_id, _) = inner_with_alarm(
-            "cyc-attention-show-read-only",
-            NotificationAttentionCause::VerifyFailed,
-        );
-        let journal = path.join("workspaces/current/messages.ndjson");
-        let before = std::fs::read_to_string(&journal).unwrap();
-
-        let response = ask_inner(
-            &inner,
-            "attention.show",
-            json!({"id": attempt_id.to_string(), "diff": true}),
-        )
-        .await;
-        let shown: cyclops_proto::AttentionShowResult =
-            serde_json::from_value(response.result.unwrap()).unwrap();
-        assert_eq!(shown.attempt_id, attempt_id);
-        assert!(!shown.checks.all_pass());
-        assert!(shown.expected.is_some());
-        assert!(shown.observed.is_none());
-        assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
-
-        let response = ask_inner(
-            &inner,
-            "attention.complete",
-            json!({"id": attempt_id.to_string()}),
-        )
-        .await;
-        assert_eq!(response.error.unwrap().code, "attention_evidence_failed");
-        assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn a_post_intent_failure_is_never_reported_as_a_safe_refusal() {
-        let error =
-            attention_action_error(crate::attention_resolution::AttentionActionError::Uncertain);
-        assert_eq!(error.code, "attention_action_uncertain");
-        assert!(error.message.contains("outcome is uncertain"));
-        assert!(error.message.contains("no second key"));
-        assert!(error.message.contains("required durable evidence"));
     }
 
     /// Preview names why an attempt needs attention, so an operator can
@@ -4829,10 +4507,7 @@ mod tests {
             ("msg_requeue", "notification_withdraw", true),
             ("notification_withdraw", "alarm_preview", true),
             ("alarm_preview", "alarm_clear", true),
-            ("alarm_clear", "attention_show", true),
-            ("attention_show", "attention_show_for_caller", true),
-            ("attention_show_for_caller", "attention_resolve", false),
-            ("attention_resolve", "messaging_attention_error", true),
+            ("alarm_clear", "messaging_attention_error", true),
         ] {
             let marker = format!("fn {name}(");
             let next_marker = format!("fn {next}(");
@@ -4858,7 +4533,6 @@ mod tests {
                 "schedule_recipient",
                 "service.alarms_at_or_before",
                 "service.clear_alarms",
-                "service.attention_target",
                 "alarm_summary",
             ] {
                 assert!(
@@ -4866,30 +4540,6 @@ mod tests {
                     "{name} recovered forbidden messaging knowledge: {forbidden}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn force_submit_settings_authenticate_through_workspace_messaging() {
-        let source = include_str!("server.rs");
-        let settings = source
-            .split_once("        \"notification.force_submit.get\" => {")
-            .expect("force-submit get dispatch arm")
-            .1
-            .split_once("        method => {")
-            .expect("dispatch fallback after force-submit settings")
-            .0;
-        assert_eq!(
-            settings
-                .matches("require_workspace_messaging_admin(inner, peer)")
-                .count(),
-            2
-        );
-        for forbidden in ["require_mailbox_admin", "mailbox_caller", "inner.mailbox"] {
-            assert!(
-                !settings.contains(forbidden),
-                "force-submit settings recovered {forbidden}"
-            );
         }
     }
 

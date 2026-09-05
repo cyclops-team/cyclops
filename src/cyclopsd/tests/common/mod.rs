@@ -300,10 +300,8 @@ composer_continuation_regex = '^(?P<content>.*)$'
 /// lifecycle-evidence idle rule at all. A clean composer proves only that
 /// the composer is clean; runtime idle needs an admitting hook edge from
 /// the current daemon boot. Panes under this manifest start as `unknown`
-/// with the `hook_admission_unproven` write block until a `SessionStart`
-/// (or a configured `UserPromptSubmit` start) is reported for the current
-/// occupant, which is exactly the recovery path the hook admission tests
-/// exercise.
+/// until a `SessionStart` (or a configured `UserPromptSubmit` start) is
+/// reported for the current occupant.
 pub const LIVENESS_MANIFEST: &str = r#"
 [agent]
 id = "fix"

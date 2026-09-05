@@ -94,13 +94,7 @@ async fn benchmark_cyclops_vs_raw_tmux_and_smux() {
     println!("        CYCLOPS VS RAW TMUX VS SHAWNPANA/SMUX PROTOCOL BENCHMARK & ARCHITECTURAL COMPARISON              ");
     println!("=========================================================================================================\n");
 
-    let mut rig = Rig::new(
-        "comm-bench",
-        CAT_MANIFEST,
-        &composer_pane(),
-        "delivery.force_submit_delay_ms = 0\n",
-    )
-    .await;
+    let mut rig = Rig::new("comm-bench", CAT_MANIFEST, &composer_pane(), "").await;
 
     let target_pane = "%0";
     let sender_label = "admin";

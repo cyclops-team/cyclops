@@ -25,8 +25,6 @@ pub enum Action {
     WithdrawNotification,
     /// Acknowledge an alarm.
     ClearAlarm,
-    AttentionComplete,
-    AttentionDiscard,
 }
 
 impl Action {
@@ -35,8 +33,6 @@ impl Action {
             Action::Reply => "reply",
             Action::WithdrawNotification => "withdraw pre-write wake",
             Action::ClearAlarm => "clear alarm",
-            Action::AttentionComplete => "submit staged notification",
-            Action::AttentionDiscard => "discard staged notification",
         }
     }
 
@@ -407,15 +403,6 @@ impl Detail {
     /// happened. The draft is kept, because a reply retried under the
     /// same key is safe.
     pub fn uncertain(&mut self, action: Option<Action>, why: impl Into<String>) {
-        // Only a terminal verb poisons the terminal pair. A reply, a
-        // clear, or a claiming read that went unanswered says nothing
-        // about whether this attempt was resolved.
-        if matches!(
-            action,
-            Some(Action::AttentionComplete) | Some(Action::AttentionDiscard)
-        ) {
-            self.terminal_unknown = true;
-        }
         if action == Some(Action::WithdrawNotification) {
             // The exact withdrawal is idempotent, but a timeout still owes a
             // fresh snapshot before the UI offers any mutation again.
@@ -607,13 +594,6 @@ impl Detail {
         {
             return Vec::new();
         }
-        if let Some(action) = self.reconciliation_action() {
-            return if self.target.attempt.is_some() && !self.evidence_stale {
-                vec![action]
-            } else {
-                Vec::new()
-            };
-        }
         let mut out = Vec::new();
         if self.can_withdraw_notification
             && self.target.attempt.is_some()
@@ -634,14 +614,6 @@ impl Detail {
         // this the reader could confirm against checks measured before
         // the facts moved.
         if self.can_manage_attention && self.target.attempt.is_some() && !self.evidence_stale {
-            // Every check must pass before the two that mutate a pane are
-            // even offered. The daemon repeats this.
-            let checks_pass =
-                !self.loaded.checks.is_empty() && self.loaded.checks.iter().all(|c| c.passed);
-            if checks_pass && !self.resolved && !self.terminal_unknown {
-                out.push(Action::AttentionComplete);
-                out.push(Action::AttentionDiscard);
-            }
             // Requeue is deliberately absent. msg.requeue acts on every
             // uncleared alarm of a message, so on a broadcast it reaches
             // recipients this confirmation never named. It stays in the
@@ -682,40 +654,7 @@ impl Detail {
 
     /// Human copy for an action in this detail's current mode.
     pub fn action_word(&self, action: Action) -> &'static str {
-        if self.reconciliation_action() == Some(action) {
-            match action {
-                Action::AttentionComplete => "reconcile prior uncertain submit",
-                Action::AttentionDiscard if self.resolution_action_accepted.is_none() => {
-                    "reconcile exact-empty discard without a key"
-                }
-                Action::AttentionDiscard => "reconcile prior uncertain discard",
-                _ => unreachable!("only terminal actions have durable intents"),
-            }
-        } else {
-            action.word()
-        }
-    }
-
-    fn reconciliation_action(&self) -> Option<Action> {
-        if self.wake != WakeWord::ResolutionIncomplete || self.resolved {
-            return None;
-        }
-        let intent = self.resolution_intent?;
-        match intent {
-            NotificationResolution::Complete
-                if self.resolution_action_accepted == Some(intent)
-                    && self.resolution_consumption_observed.is_some() =>
-            {
-                Some(Action::AttentionComplete)
-            }
-            NotificationResolution::Discard
-                if self.resolution_action_accepted.is_none()
-                    || self.resolution_action_accepted == Some(intent) =>
-            {
-                Some(Action::AttentionDiscard)
-            }
-            _ => None,
-        }
+        action.word()
     }
 
     /// Ask for an action. Returns what the caller must do next.
@@ -735,9 +674,6 @@ impl Detail {
     /// Say yes to the confirmation on screen.
     /// A mutation succeeded. A terminal verb that landed retires both.
     pub fn done(&mut self, action: Action, note: impl Into<String>) {
-        if matches!(action, Action::AttentionComplete | Action::AttentionDiscard) {
-            self.resolved = true;
-        }
         // A reply that landed is not a draft any more. Keeping it left
         // the detail asserting both that the text was sent and that it
         // was still unsent, and worse, a second send of the same bytes
@@ -793,18 +729,6 @@ impl Detail {
             "{} ({})",
             self.target.target.recipient, self.recipient_label
         );
-        if self.reconciliation_action() == Some(action) {
-            let attempt = self
-                .target
-                .attempt
-                .expect("a reconciliation action requires one exact attempt");
-            return format!(
-                "{} for {recipient} using {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
-                self.action_word(action),
-                attempt,
-                self.target.watermark
-            );
-        }
         // The exact thing the action will name, which for the attention
         // verbs is the attempt and NOT the message. Once identity became
         // the row, naming the row here would have asked the operator to
@@ -820,9 +744,7 @@ impl Detail {
                     self.target.watermark
                 );
             }
-            (Some(attempt), Action::ClearAlarm)
-            | (Some(attempt), Action::AttentionComplete)
-            | (Some(attempt), Action::AttentionDiscard) => attempt.to_string(),
+            (Some(attempt), Action::ClearAlarm) => attempt.to_string(),
             _ => self.target.target.id(),
         };
         format!(

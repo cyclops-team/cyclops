@@ -1014,7 +1014,6 @@ fn relocated_codex_home_drives_wiring_seeding_and_setup_check() {
         "{codex}"
     );
     assert_eq!(codex["skill"]["state"], "current", "{codex}");
-    assert_eq!(codex["mailbox"]["doorbell_ready"], true, "{codex}");
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&user);
@@ -2002,8 +2001,6 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
         assert_eq!(consumer["installed"], true, "{consumer}");
         assert_eq!(consumer["manifest"]["state"], "current", "{consumer}");
         assert_eq!(consumer["skill"]["state"], "current", "{consumer}");
-        assert_eq!(consumer["mailbox"]["doorbell_ready"], true, "{consumer}");
-        assert_eq!(consumer["mailbox"]["transport"], "doorbell", "{consumer}");
     }
     assert_eq!(consumers[0]["hook"]["state"], "current");
     assert_eq!(consumers[0]["hook"]["required_receipt_tier"], 1);
@@ -2129,16 +2126,6 @@ fn setup_check_reports_direct_fallback_for_an_edited_claim_skill() {
     let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
     let codex = &report["consumers"][1];
     assert_eq!(codex["skill"]["state"], "edited", "{codex}");
-    assert_eq!(codex["mailbox"]["doorbell_ready"], false, "{codex}");
-    assert_eq!(codex["mailbox"]["transport"], "direct_payload", "{codex}");
-    assert_eq!(
-        codex["mailbox"]["capability_path"],
-        skill.display().to_string(),
-        "{codex}"
-    );
-
-    let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "check"]);
-    assert!(stdout(&human).contains("mailbox   direct payload"));
 
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&user);

@@ -2,28 +2,6 @@
 
 use super::*;
 
-/// High-level delivery injection engine managing the spool file lifecycle,
-/// bracketed paste submission, and composer verification.
-#[derive(Clone)]
-#[allow(dead_code)]
-pub(crate) struct DeliveryEngine {
-    pub(crate) client: Arc<ControlClient>,
-}
-
-#[allow(dead_code)]
-impl DeliveryEngine {
-    pub(crate) fn new(client: Arc<ControlClient>) -> Self {
-        Self { client }
-    }
-
-    pub(crate) fn injector(&self, buffer: impl Into<String>) -> TmuxInjector {
-        TmuxInjector {
-            client: Arc::clone(&self.client),
-            buffer: buffer.into(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Inject and verify
 // ---------------------------------------------------------------------------
@@ -70,13 +48,6 @@ pub(crate) trait Injector {
     async fn discard(&self);
     /// Press the submit key.
     async fn submit(&self, pane_id: &str, key: &str) -> Result<(), String>;
-    /// Send one measured whole-composer clear sequence.
-    async fn clear(&self, pane_id: &str, keys: &[String]) -> Result<(), String> {
-        for key in keys {
-            self.submit(pane_id, key).await?;
-        }
-        Ok(())
-    }
     /// Read one escaped snapshot with tmux physical wraps joined. Exact
     /// composer extraction compares these logical rows with the bytes that
     /// were spooled.
@@ -177,14 +148,6 @@ impl Injector for TmuxInjector {
         self.client.send_keys(pane_id, &[key]).await.map_err(|e| {
             warn!(error = %e, "submit key failed");
             "submit_failed".to_string()
-        })
-    }
-
-    async fn clear(&self, pane_id: &str, keys: &[String]) -> Result<(), String> {
-        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-        self.client.send_keys(pane_id, &keys).await.map_err(|e| {
-            warn!(error = %e, "composer clear failed");
-            "claim_clear_failed".to_string()
         })
     }
 
@@ -615,77 +578,6 @@ pub(crate) fn visible_single_line_payload_matches(visible: &str, expected: &str)
         }
     }
     offsets.binary_search(&expected.len()).is_ok()
-}
-
-/// Re-prove the same exact normalized composer bytes selected earlier.
-///
-/// This comparison is used on both sides of the durable `Submitting`
-/// reservation. A second valid-looking payload is still a mismatch.
-pub(crate) fn exact_staging_snapshot_matches(
-    manifest: &Manifest,
-    screen: &str,
-    target: StagingTarget<'_>,
-    expected_payload: &str,
-    id_staged: bool,
-    payload_at_proof: &str,
-) -> bool {
-    let current = exact_staging_proof(manifest, screen, target, expected_payload);
-    current.as_ref().map(|(_, proof)| proof.as_str()) == Some(payload_at_proof)
-        && current.map(|(matched, _)| matched) == Some(id_staged)
-}
-
-/// Why the final exact-staging reread did not produce an owned doorbell.
-///
-/// A renderer can expose a partial frame while it clears and repaints. That
-/// is distinguishable from a broken capture pipe: if at least one capture
-/// completed but none restored the exact proof, the pane changed or remained
-/// ambiguous and Enter stays withheld.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactStagingRecheck {
-    Mismatch,
-    Unobservable,
-}
-
-/// Read the exact staged composer through the same bounded frame schedule as
-/// the post-paste proof. This is a re-observation only: it never writes, and
-/// it accepts only the same normalized payload and staging representation
-/// already proven for this notification.
-pub(crate) async fn recheck_exact_staging_snapshot<I: Injector>(
-    injector: &I,
-    pane_id: &str,
-    manifest: &Manifest,
-    target: StagingTarget<'_>,
-    expected_payload: &str,
-    id_staged: bool,
-    payload_at_proof: &str,
-) -> Result<String, ExactStagingRecheck> {
-    let mut last_delay = 0;
-    let mut observed = false;
-    for delay in VERIFY_DELAYS_MS {
-        if delay > last_delay {
-            tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
-        }
-        last_delay = delay;
-        let Ok(screen) = injector.capture_joined_escaped(pane_id).await else {
-            continue;
-        };
-        observed = true;
-        if exact_staging_snapshot_matches(
-            manifest,
-            &screen,
-            target,
-            expected_payload,
-            id_staged,
-            payload_at_proof,
-        ) {
-            return Ok(screen);
-        }
-    }
-    Err(if observed {
-        ExactStagingRecheck::Mismatch
-    } else {
-        ExactStagingRecheck::Unobservable
-    })
 }
 
 /// Closed screen-representation outcomes for the Gate 7 component harness.

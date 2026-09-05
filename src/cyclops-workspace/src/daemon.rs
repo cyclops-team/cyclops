@@ -60,32 +60,6 @@ pub(crate) fn stream_backfill(
         .map_err(|error| format!("cyclopsd sent an unreadable stream backfill: {error}"))
 }
 
-pub(crate) fn force_submit_settings(
-    home: &Path,
-) -> Result<cyclops_proto::ForceSubmitSettings, String> {
-    let value = request(home, "notification.force_submit.get", json!({}))?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("cyclopsd sent unreadable force-submit settings: {error}"))
-}
-
-pub(crate) fn set_force_submit_settings(
-    home: &Path,
-    enabled: bool,
-    delay_seconds: u8,
-) -> Result<cyclops_proto::ForceSubmitSettings, String> {
-    let value = request(
-        home,
-        "notification.force_submit.set",
-        json!({
-            "enabled": enabled,
-            "delay_seconds": delay_seconds,
-            "protocol_version": cyclops_proto::PROTOCOL_VERSION,
-        }),
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("cyclopsd sent unreadable force-submit settings: {error}"))
-}
-
 /// The request/response half of [`request`], on an already-open
 /// connection. Split out because [`theme_reload`] has to tell "nothing
 /// answered on the socket" apart from "a daemon answered and refused".
@@ -250,6 +224,7 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         supersedes: None,
         wait: None,
         require_wake: false,
+        raw: false,
     }) {
         Ok(params) => params,
         Err(error) => {

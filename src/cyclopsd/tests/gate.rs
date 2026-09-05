@@ -665,13 +665,21 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     wait_pane_state(&mut rig, "idle_with_input").await;
 
-    // A notification against typed text is a durable pre-write block:
-    // human wins, and the refusal is recorded rather than waited out.
+    // A notification against typed text holds in the gate: human wins,
+    // and the hold is a gate line, not a write.
     let (result, _) = rig
         .send(json!({"to": ["codexy"], "subject": "hold this", "body": "payload-body"}))
         .await;
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
-    wait_notification_state(&rig, &msg_id, &["blocked_pre_write"]).await;
+    let held = rig
+        .ev
+        .wait_event(Duration::from_secs(10), |e| {
+            e["event"] == "gate"
+                && e["data"]["id"] == msg_id.as_str()
+                && e["data"]["action"] == "hold"
+        })
+        .await;
+    assert_eq!(held["data"]["cause"], "composer_hold", "{held}");
     assert!(
         !rig.tmux.capture(&pane).contains("[cyclops"),
         "row pasted over typed human text"
@@ -687,10 +695,7 @@ async fn escaped_capture_flips_typed_text_to_idle_with_input_and_gates() {
         !rig.tmux.capture(&pane).contains("[cyclops"),
         "row pasted over a composer still under hold"
     );
-    assert_eq!(
-        notification_state(&rig, &msg_id).as_deref(),
-        Some("blocked_pre_write")
-    );
+    assert_eq!(notification_state(&rig, &msg_id).as_deref(), Some("gating"));
 
     // A turn is the evidence the hold waits for. Running one, then coming
     // back to a clean composer, releases the hold and admits the row.
@@ -757,7 +762,7 @@ async fn pane_rebound_before_paste_never_pastes_into_the_new_occupant() {
     assert!(
         matches!(
             rebound["data"]["cause"].as_str(),
-            Some("pane_pid_changed" | "route_binding_changed" | "binding_unprovable" | "pane_gone")
+            Some("occupant_unprovable" | "binding_changed" | "no_such_pane" | "pane_dead")
         ),
         "{rebound}"
     );
@@ -811,8 +816,8 @@ async fn pane_rebound_before_submit_withholds_the_submit_key() {
     assert!(
         notification_states(&rig, &msg_id)
             .iter()
-            .any(|state| state == "staged"),
-        "the pre-swap paste never staged: {:?}",
+            .any(|state| state == "writing"),
+        "the pre-swap paste never crossed the write boundary: {:?}",
         notification_states(&rig, &msg_id)
     );
 
