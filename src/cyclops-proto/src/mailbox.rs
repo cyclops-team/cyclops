@@ -79,9 +79,6 @@ impl MessageId {
     /// Construct and validate a message identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, MailboxTypeError> {
         let value = value.into();
-        if value == "--last" || value == "-" {
-            return Ok(Self(value));
-        }
         let suffix = value
             .strip_prefix("m-")
             .ok_or_else(|| MailboxTypeError::InvalidMessageId(value.clone()))?;

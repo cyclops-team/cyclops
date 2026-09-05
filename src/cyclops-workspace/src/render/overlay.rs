@@ -17,7 +17,7 @@ use crate::copy;
 use crate::dialog::{
     Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker, ViewRow, ViewSwitches,
 };
-use crate::input::mouse::{HitMap, HitTarget, MenuState};
+use crate::input::mouse::{HitLayer, HitMap, HitTarget, MenuState};
 use crate::theme::{self, Paint};
 
 /// Columns between a box's border and its content, on both sides. One
@@ -65,8 +65,8 @@ const FIELD_MAX_ROWS: u16 = 6;
 /// under it carries no control of its own (the hint on the keybinds
 /// sheet, the question on a plain one), so claiming it costs nothing and
 /// doubles the reach. The settings card's section chips are the one
-/// control on that row; they are pushed after the strip so each wins its
-/// own cells and the rest of the row still drags.
+/// control on that row; on the same layer and pushed after the strip,
+/// each wins its own cells and the rest of the row still drags.
 const DIALOG_GRAB_ROWS: u16 = 2;
 
 /// Move a centered box by however far the operator has dragged it, and keep
@@ -132,7 +132,7 @@ fn paint_title_bar(
     if grip_x > bar.x {
         super::overlay_text(buf, bar, grip_x, bar.y, PANE_GRIP, style);
     }
-    hits.push(grab, HitTarget::DialogTitleBar);
+    hits.push(grab, HitLayer::Overlay, HitTarget::DialogTitleBar);
 }
 
 /// `text` broken into the visual lines a field `width` columns wide shows,
@@ -582,7 +582,7 @@ fn paint_dialog_buttons(
             theme::dialog_secondary(paint)
         };
         super::overlay_text(buf, inner, bx, button_y, &text, style);
-        hits.push(rect, target);
+        hits.push(rect, HitLayer::Overlay, target);
         bx = bx.saturating_add(bw + DIALOG_BUTTON_GAP);
     }
 }
@@ -706,9 +706,10 @@ fn paint_settings_dialog(
         }
     }
     paint_title_bar(buf, dialog_area, Some(copy::SETTINGS_TITLE), paint, hits);
-    // After the title bar on purpose: the chips share its second row, and
-    // `HitMap::hit` answers with the last region pushed over a cell, so a
-    // chip wins its own cells and the rest of the row still drags.
+    // After the title bar on purpose: the chips share its second row and
+    // its layer, and within a layer `HitMap::hit` answers with the last
+    // region pushed, so a chip wins its own cells and the rest of the row
+    // still drags.
     paint_section_chips(buf, inner, left, usable_w, section, paint, hits, hover);
 }
 
@@ -771,7 +772,7 @@ fn paint_settings_rows(
         buf.set_style(rect, style);
         let mark = if checked { copy::MENU_CHECK } else { " " };
         super::overlay_text(buf, inner, list.x, y, &format!("{mark} {label}"), style);
-        hits.push(rect, HitTarget::SettingsRow { index });
+        hits.push(rect, HitLayer::Overlay, HitTarget::SettingsRow { index });
     }
 }
 
@@ -855,7 +856,7 @@ fn paint_close_row(
         theme::dialog_primary(paint)
     };
     super::overlay_text(buf, inner, rect.x, rect.y, &close, style);
-    hits.push(rect, HitTarget::DialogCancel);
+    hits.push(rect, HitLayer::Overlay, HitTarget::DialogCancel);
 
     let Some((start, end)) = showing else {
         return;
@@ -901,7 +902,11 @@ fn paint_section_chips(
             theme::menu_hint(paint)
         };
         super::overlay_text(buf, inner, x, inner.y, &text, style);
-        hits.push(rect, HitTarget::SettingsSection { section });
+        hits.push(
+            rect,
+            HitLayer::Overlay,
+            HitTarget::SettingsSection { section },
+        );
         x = x.saturating_add(w + DIALOG_BUTTON_GAP);
     }
 }
@@ -1352,7 +1357,11 @@ pub fn paint_menu(
             (_, _) => "  ".into(),
         };
         super::overlay_text(buf, inner, inner.x, y, &format!(" {mark}{label}"), style);
-        hits.push(rect, HitTarget::MenuItem { action: *action });
+        hits.push(
+            rect,
+            HitLayer::Overlay,
+            HitTarget::MenuItem { action: *action },
+        );
     }
 }
 

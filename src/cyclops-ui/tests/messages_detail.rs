@@ -316,19 +316,30 @@ fn every_daemon_authorized_unwritten_wake_offers_withdrawal() {
     }
 }
 
+/// Both quota words replay from a 1.0 journal only. They still read, they
+/// say which daemon wrote them, and neither offers an action: a held
+/// attempt points at the claim, a reset-observed one at the admin verb.
 #[test]
-fn quota_detail_explains_wait_and_the_message_wide_admin_command() {
+fn quota_detail_names_the_older_daemon_and_offers_no_action() {
     let mut held_row = outbound();
     held_row.wake = WakeWord::QuotaHeld;
     held_row.attention = Some(attempt(9));
     let held = opened(&held_row, Loaded::default());
     assert!(held.allowed().is_empty());
     let held_text = render(&held, 160, 40).join("\n");
-    assert!(held_text.contains("wait for a quota reset"), "{held_text}");
+    assert!(
+        held_text.contains("recorded by an older daemon"),
+        "{held_text}"
+    );
     assert!(
         held_text.contains("will not resume automatically"),
         "{held_text}"
     );
+    assert!(
+        held_text.contains("`cyclops inbox claim m-001`"),
+        "{held_text}"
+    );
+    assert!(!held_text.contains("wait for a quota reset"), "{held_text}");
 
     let mut reset_row = held_row;
     reset_row.wake = WakeWord::QuotaResetObserved;
@@ -343,6 +354,91 @@ fn quota_detail_explains_wait_and_the_message_wide_admin_command() {
         reset_text.contains("every eligible recipient on the message"),
         "{reset_text}"
     );
+    assert!(
+        reset_text.contains("recorded by an older daemon"),
+        "{reset_text}"
+    );
+}
+
+/// A 1.0 journal replays the operator complete/discard facts a 1.1
+/// daemon never writes. The detail names the record once, whatever
+/// combination of the three facts it carries, and never the retired
+/// verbs, their reconciliation, or an action for them.
+#[test]
+fn a_replayed_resolution_record_reads_once_and_offers_nothing() {
+    let neutral = "resolution record from an older daemon; no action is available for it";
+    let mut row = outbound();
+    row.wake = WakeWord::ResolutionIncomplete;
+    row.attention = Some(attempt(9));
+    row.can_manage_attention = true;
+    let plain = render(&opened(&row, Loaded::default()), 160, 40).join("\n");
+    assert!(!plain.contains(neutral), "no record, no line: {plain}");
+
+    let combinations = [
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            None,
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Complete),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            true,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Discard),
+            Some(cyclops_proto::NotificationResolution::Discard),
+            false,
+        ),
+        (
+            Some(cyclops_proto::NotificationResolution::Discard),
+            Some(cyclops_proto::NotificationResolution::Complete),
+            false,
+        ),
+        (
+            None,
+            Some(cyclops_proto::NotificationResolution::Discard),
+            false,
+        ),
+        (None, None, true),
+    ];
+    for (intent, accepted, consumed) in combinations {
+        let mut row = row.clone();
+        row.resolution_intent = intent;
+        row.resolution_action_accepted = accepted;
+        row.resolution_consumption_observed = consumed.then_some(
+            cyclops_proto::NotificationResolutionConsumptionObservation {
+                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
+                observed_at_ms: 4,
+            },
+        );
+        let detail = opened(&row, Loaded::default());
+        let text = render(&detail, 160, 40).join("\n");
+        assert_eq!(
+            text.matches(neutral).count(),
+            1,
+            "{intent:?}/{accepted:?}/{consumed}: {text}"
+        );
+        for retired in [
+            "terminal accepted",
+            "intent recorded",
+            "reconciliation",
+            "submit",
+            "discard",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{intent:?}/{accepted:?}/{consumed}: {retired:?} in {text}"
+            );
+        }
+        // The alarm the daemon still authorizes is the only verb left.
+        assert_eq!(detail.allowed(), vec![Action::ClearAlarm]);
+    }
 }
 
 /// Anything that changes what an agent sees is confirmed by name first,
@@ -1350,7 +1446,7 @@ mod token_matching {
         let (token, _) = app.take_detail_read().expect("owes a read");
         app.apply_action(token, alarm_checks());
 
-        app.handle_key(Key::Char('3'));
+        app.handle_key(Key::Char('1'));
         app.handle_key(Key::Char('y'));
         let (in_flight, _) = app.take_pending().expect("a request is waiting");
         assert!(app.in_flight().is_some());
@@ -1399,7 +1495,6 @@ mod token_matching {
             },
         );
         let d = app.detail.as_ref().unwrap();
-        assert!(d.is_resolved());
         assert_eq!(d.allowed(), vec![Action::ClearAlarm]);
 
         let mut app = armed();
@@ -1709,10 +1804,13 @@ mod audit {
 
         // The answer still lands, so the detail records that it happened.
         app.apply_action(token, ActionOutcome::Done("alarm cleared".into()));
-        assert!(
-            app.detail.as_ref().unwrap().is_resolved(),
-            "the answer was discarded and the attempt looks unresolved"
+        let detail = app.detail.as_ref().unwrap();
+        assert_eq!(
+            detail.loaded().claim_note.as_deref(),
+            Some("alarm cleared"),
+            "the answer was discarded"
         );
+        assert_eq!(*detail.stage(), Stage::Open);
     }
 
     /// Both guards used to sit above the composer, and both can arm with

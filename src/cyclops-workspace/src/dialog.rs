@@ -1092,8 +1092,6 @@ mod tests {
         switch_settings_section(&mut dialog, 1);
         move_settings_selection(&mut dialog, -1);
         switch_settings_section(&mut dialog, 1);
-        move_settings_selection(&mut dialog, 1);
-        switch_settings_section(&mut dialog, 1);
         let Dialog::Settings {
             section,
             themes,

@@ -18,7 +18,7 @@
 //! What is watched is the SELECTION, both halves of it: the config key
 //! that picks a theme and the file that theme is. `cyclops theme <name>`
 //! writes the key, so a watch that only knew its own file would leave a
-//! running `cyclops ui` on the old palette forever.
+//! running `cyclops watch` on the old palette forever.
 //!
 //! ```mermaid
 //! flowchart TD

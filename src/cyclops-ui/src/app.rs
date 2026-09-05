@@ -407,7 +407,7 @@ impl App {
                 }
                 None => detail.loaded_ok(crate::detail::Loaded::default()),
             },
-            ActionOutcome::Refused { code, message } => detail.refused(action, &code, message),
+            ActionOutcome::Refused { message, .. } => detail.refused(action, message),
             ActionOutcome::NotSent(why) => detail.not_sent(action, why),
             // A read is not automatically harmless. An open that claims
             // is a mutation, so its unanswered request is unknown rather

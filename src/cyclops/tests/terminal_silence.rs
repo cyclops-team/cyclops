@@ -7,7 +7,7 @@
 //! - `cyclops hook` must write nothing at all, on stdout or stderr. It
 //!   runs inside a vendor CLI's hook budget, and anything it prints lands
 //!   in that CLI's output.
-//! - `cyclops ui` must say what is wrong with the theme once. It loads the
+//! - `cyclops watch` must say what is wrong with the theme once. It loads the
 //!   theme itself; a second load in the CLI's dispatch said it twice.
 //! - A one-shot command must say it in one line. The warning quotes a TOML
 //!   parse error, and toml's own Display is a diagnostic block.
@@ -182,7 +182,7 @@ fn ui_reports_a_broken_theme_once() {
     // connection until it is killed. The warning is what is measured.
     let sock = std::os::unix::net::UnixListener::bind(home.join("sock")).expect("bind sock");
     let (master, slave) = pty();
-    let mut child = spawn_on_a_terminal(&home, &["ui"], &slave);
+    let mut child = spawn_on_a_terminal(&home, &["watch"], &slave);
     std::thread::sleep(Duration::from_millis(1500));
     let _ = child.kill();
     let _ = child.wait();

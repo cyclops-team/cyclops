@@ -8,8 +8,9 @@
 //! `copy.rs` words). Structured daemon reads and direct mutations take
 //! `--json` and print exactly the socket answer, which keeps rendering
 //! optional. Guarded age-selected alarm clearance is interactive because it
-//! must confirm a frozen preview. `update`, `daemon log`, and `cyclops ui`
-//! remain text; the machine stream is `cyclops watch --json`.
+//! must confirm a frozen preview. `update`, `daemon log`, and the
+//! interactive `cyclops watch` remain text; the machine stream is
+//! `cyclops watch --json`.
 //!
 //! Three things here are not that shape and say why:
 //!
@@ -26,7 +27,7 @@
 //! - Any decision. A verb asks the daemon and prints the answer; it does
 //!   not compute state, and it does not judge what needs a human (that is
 //!   `cyclops_proto::attention`, which `render.rs` reads).
-//! - The stream. `cyclops ui` dispatches into `cyclops-ui`.
+//! - The stream. `cyclops watch` dispatches into `cyclops-ui`.
 //! - The voice of a state cell, a badge, or the clock gutter. Those are
 //!   `cyclops_ui::grid`, which this crate calls rather than copies. A copy
 //!   lived here once and drifted.
@@ -306,16 +307,6 @@ enum Cmd {
         #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
         timeout: String,
     },
-    #[cfg_attr(
-        feature = "full-ui",
-        doc = " Deprecated alias for `cyclops watch`. Use `cyclops watch` instead."
-    )]
-    #[cfg_attr(
-        not(feature = "full-ui"),
-        doc = " Deprecated interactive alias. This build supports `cyclops watch --json` instead."
-    )]
-    #[command(hide = true)]
-    Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     #[command(hide = true)]
     Hook {
@@ -678,7 +669,8 @@ enum InboxCmd {
         /// Maximum duration to wait (e.g. 5s, 1m). Exits 2 if no message arrives.
         #[arg(long, default_value = "5s")]
         timeout: String,
-        /// Only messages from this sender label.
+        /// Only messages from this sender: the canonical sender key from
+        /// `cyclops inbox list --json`, not a display label.
         #[arg(long)]
         from: Option<String>,
     },
@@ -691,9 +683,11 @@ enum InboxCmd {
 
 #[derive(clap::Args)]
 struct ReplyArgs {
-    /// Message identifier being answered, attempt token m-att_..., or '-' / '--last'.
-    #[arg(default_value = "--last")]
-    message_id: String,
+    /// Message identifier being answered, or its attempt token m-att_....
+    /// Omit it and pass --last to answer the message you claimed most
+    /// recently.
+    #[arg(required_unless_present = "last")]
+    message_id: Option<String>,
     /// One-line preview shown beside the recipient's inbox claim (the daemon derives one from the subject if omitted).
     #[arg(long)]
     summary: Option<String>,
@@ -710,8 +704,8 @@ struct ReplyArgs {
     /// Sender-scoped idempotency key.
     #[arg(long)]
     client_key: Option<String>,
-    /// Reply to the most recently claimed message in this pane.
-    #[arg(long)]
+    /// Reply to the message you claimed most recently.
+    #[arg(long, conflicts_with = "message_id")]
     last: bool,
 }
 
@@ -1027,9 +1021,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // The stream UI owns its own daemon connections, terminal, and
         // theme (cyclops-ui's Theme::detect); dispatch only hands the
         // flags over. Building a Style here warned about the same file
-        // twice.
-        Cmd::Ui(args) => cmd_ui(cli, args),
-        Cmd::Watch { kinds, ui } => cmd_watch(cli, &style_for(cli), kinds, ui),
+        // twice (`terminal_silence` measures it), so only the JSON branch
+        // builds one.
+        Cmd::Watch { kinds, ui } => cmd_watch(cli, kinds, ui),
         // The workspace verbs talk to tmux, and reach the daemon only for
         // the labels. A down daemon costs them the names, not the verb, so
         // they must not go through connect().
@@ -1282,7 +1276,6 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Daemon { .. }
                 | Cmd::Wait { .. }
                 | Cmd::Hooks { .. }
-                | Cmd::Ui(_)
                 | Cmd::Watch { .. }
                 | Cmd::Start(_)
                 | Cmd::Setup { .. }
@@ -1304,10 +1297,11 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
 }
 
 /// cyclops watch: stream TUI by default; `--json` is the machine stream.
-fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
+fn cmd_watch(cli: &Cli, kinds: &[String], ui: &UiArgs) -> i32 {
     // Display filters belong to the TUI. Refuse them in JSON mode instead of
     // accepting options the machine stream does not apply.
     if cli.json {
+        let style = &style_for(cli);
         if ui.with.is_some() || ui.from.is_some() || ui.to.is_some() {
             println!(
                 "{}",
@@ -1400,27 +1394,6 @@ fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filt
         from: resolve(&ui.from),
         to: resolve(&ui.to),
     })
-}
-
-/// cyclops ui: deprecated alias for `cyclops watch`.
-#[cfg(feature = "full-ui")]
-fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
-    if cli.json {
-        eprintln!("{}", copy::UI_NO_JSON);
-        return EXIT_USAGE;
-    }
-    eprintln!("{}", copy::UI_DEPRECATED);
-    let filters = match preflight_watch_filters(args) {
-        Ok(filters) => filters,
-        Err(code) => return code,
-    };
-    run_stream_ui(cli, args, filters)
-}
-
-#[cfg(not(feature = "full-ui"))]
-fn cmd_ui(_cli: &Cli, _args: &UiArgs) -> i32 {
-    eprintln!("{}", copy::WATCH_NOT_INCLUDED);
-    EXIT_USAGE
 }
 
 #[cfg(feature = "full-ui")]
@@ -2509,6 +2482,9 @@ fn held_cause(
         None => {}
     }
     if notification.state == cyclops_proto::MessageNotificationState::AttentionRequired {
+        // Replay only: the intent fact a 1.0 operator action wrote. It is
+        // read here for one reason, the daemon refuses `msg.requeue` while
+        // it is open, so the release action has to say so.
         if notification.resolution_intent.is_some() {
             return Some((
                 "attention_resolution_pending".to_string(),
@@ -2589,8 +2565,11 @@ fn held_queue_lines(heads: &HeldHeads) -> Vec<String> {
 
 fn held_release_action(head: &HeldHead) -> String {
     match head.kind {
+        // A 1.0 daemon wrote these; a 1.1 daemon holds quota at the gate
+        // and observes no reset, so a held head never becomes requeue
+        // eligible on its own. The claim retrieves the body regardless.
         HeldCauseKind::QuotaHeld => format!(
-            "next: wait for quota reset, then admin: cyclops requeue {}",
+            "next: recipient retrieves the durable payload with cyclops inbox claim {}; recorded by an older daemon, no automatic resume",
             head.message_id
         ),
         HeldCauseKind::QuotaResetObserved => {
@@ -2613,8 +2592,10 @@ fn held_release_action(head: &HeldHead) -> String {
             "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin: cyclops requeue {}",
             head.message_id, head.message_id
         ),
+        // The daemon refuses to requeue an attempt that still carries a
+        // 1.0 resolution record, so the claim is the only way forward.
         HeldCauseKind::AttentionResolutionPending => format!(
-            "next: recipient retrieves the durable payload with cyclops inbox claim {}; do not repeat a terminal action",
+            "next: recipient retrieves the durable payload with cyclops inbox claim {}; an older daemon left a resolution record on this attempt, so it cannot be requeued",
             head.message_id
         ),
     }
@@ -2686,13 +2667,26 @@ fn message_recipient_cell(
         match recipient.notification.resolution {
             Some(cyclops_proto::NotificationResolution::Complete) => "wake submitted".to_string(),
             Some(cyclops_proto::NotificationResolution::Discard) => "wake discarded".to_string(),
+            // Replay only: a 1.0 daemon parked quota holds as attempts of
+            // their own, and a 1.1 daemon holds quota at the gate instead
+            // and never writes these. Nothing observes a reset any more, so
+            // a held attempt stays held; the claim is the way to the body.
+            // A reset-observed attempt is still requeue-eligible.
             None => match recipient.notification.quota_state {
                 Some(cyclops_proto::MessageQuotaState::Held) => {
-                    "quota held · wait for quota reset · no automatic resume".to_string()
+                    let mut held =
+                        "quota held · recorded by an older daemon · no automatic resume"
+                            .to_string();
+                    if recipient.direction == cyclops_proto::MessageDirection::Inbound
+                        && matches!(recipient.mailbox, cyclops_proto::MailboxEntryState::Pending)
+                    {
+                        held.push_str(&format!(" · next: cyclops inbox claim {message_id}"));
+                    }
+                    held
                 }
                 Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
-                "quota reset observed · admin next: cyclops requeue {message_id} · message wide"
-            ),
+                    "quota reset observed · recorded by an older daemon · admin next: cyclops requeue {message_id} · message wide"
+                ),
                 None => match message_wake_block_reason(&recipient.notification) {
                     Some(reason) => {
                         let mut blocked = format!("wake blocked before write: {reason}");
@@ -2749,48 +2743,12 @@ fn message_recipient_cell(
             },
         }
     };
+    // The replayed `resolution_intent`, `resolution_action_accepted` and
+    // `resolution_consumption_observed` fields are deliberately not read:
+    // they belonged to the operator complete/discard actions a 1.0 daemon
+    // offered, and nothing can act on them now. The line names the state
+    // the JSON names, and the cause and verify outcome say why it is there.
     if recipient.notification.resolution.is_none() {
-        if let Some(intent) = recipient.notification.resolution_intent {
-            notification = match recipient.notification.resolution_action_accepted {
-                Some(accepted) if accepted == intent => {
-                    if intent == cyclops_proto::NotificationResolution::Complete
-                        && recipient
-                            .notification
-                            .resolution_consumption_observed
-                            .is_none()
-                    {
-                        "terminal accepted, task start unproven; no retry or reconciliation available"
-                            .to_string()
-                    } else {
-                        "terminal accepted the action key; no retry or reconciliation available"
-                            .to_string()
-                    }
-                }
-                None => {
-                    let action = match intent {
-                        cyclops_proto::NotificationResolution::Complete => "submit",
-                        cyclops_proto::NotificationResolution::Discard => "discard",
-                    };
-                    format!(
-                        "{action} intent recorded; terminal acceptance unproven; no retry or reconciliation available"
-                    )
-                }
-                Some(_) => "terminal action records disagree; no retry or reconciliation available"
-                    .to_string(),
-            };
-        } else if recipient.notification.resolution_action_accepted.is_some() {
-            notification =
-                "terminal acceptance recorded without a matching intent; no retry or reconciliation available"
-                    .to_string();
-        } else if recipient
-            .notification
-            .resolution_consumption_observed
-            .is_some()
-        {
-            notification =
-                "task start evidence recorded without matching terminal action facts; no retry or reconciliation available"
-                    .to_string();
-        }
         if let Some(cause) = recipient.notification.cause {
             notification.push(':');
             notification.push_str(&wire_word(
@@ -2887,22 +2845,62 @@ fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
     println!("[cyclops:end {}]", message.message_id);
 }
 
+/// Settled rows `--last` reads back before giving up. A claimed message
+/// with nothing open on it is a settled row, and the snapshot returns the
+/// most recent settled rows only, so the window has to be wide enough to
+/// hold whatever an agent claimed and is now answering. Five hundred is a
+/// generous guess, not a measurement: the read is body-free, so a wide
+/// window costs little.
+const REPLY_LAST_SETTLED_WINDOW: u32 = 500;
+
+/// The message `cyclops reply --last` answers: the one the caller claimed
+/// most recently, by claim time, the higher journal seq breaking a tie.
+///
+/// The snapshot names the caller on newer daemons; an older one leaves
+/// it out, and there the recipient row's direction says which rows are
+/// the caller's own mailbox.
+fn most_recently_claimed(
+    snapshot: &cyclops_proto::MessagesSnapshotResult,
+) -> Option<cyclops_proto::MessageId> {
+    snapshot
+        .rows
+        .iter()
+        .flat_map(|row| {
+            row.recipients.iter().filter_map(move |recipient| {
+                let cyclops_proto::MailboxEntryState::Claimed {
+                    claimant,
+                    claimed_at,
+                } = &recipient.mailbox
+                else {
+                    return None;
+                };
+                let own = match snapshot.caller {
+                    Some(caller) => *claimant == caller,
+                    None => matches!(
+                        recipient.direction,
+                        cyclops_proto::MessageDirection::Inbound
+                            | cyclops_proto::MessageDirection::SelfAddressed
+                    ),
+                };
+                own.then_some((*claimed_at, row.seq, &row.message_id))
+            })
+        })
+        .max_by_key(|(claimed_at, seq, _)| (*claimed_at, *seq))
+        .map(|(_, _, message_id)| message_id.clone())
+}
+
 fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
-    let raw_id = if args.last
-        || args.message_id == "--last"
-        || args.message_id == "-"
-        || args.message_id.is_empty()
-    {
-        "--last"
-    } else {
-        args.message_id.as_str()
-    };
-    let message_id = match cyclops_proto::MessageId::new(raw_id) {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("{error}");
-            return EXIT_USAGE;
-        }
+    // The positional and --last exclude each other in clap, so a given id
+    // is the whole answer and its absence means --last.
+    let given_id = match args.message_id.as_deref() {
+        Some(raw) => match cyclops_proto::MessageId::new(raw) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                eprintln!("{error}");
+                return EXIT_USAGE;
+            }
+        },
+        None => None,
     };
     let body = match (&args.body, &args.body_file) {
         (Some(body), _) => body.clone(),
@@ -2936,6 +2934,34 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
+    };
+    let message_id = match given_id {
+        Some(id) => id,
+        None => {
+            let params = serde_json::to_value(cyclops_proto::MessagesSnapshotParams {
+                recent_settled: REPLY_LAST_SETTLED_WINDOW,
+            })
+            .expect("messages.snapshot params serialize");
+            let snapshot: cyclops_proto::MessagesSnapshotResult = match ask(
+                &mut c,
+                "messages.snapshot",
+                params,
+                false,
+                None,
+                serde_json::from_value,
+            ) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => unreachable!("a non-json ask always decodes"),
+                Err(code) => return code,
+            };
+            match most_recently_claimed(&snapshot) {
+                Some(id) => id,
+                None => {
+                    eprintln!("{}", copy::NO_CLAIMED_MESSAGE_TO_REPLY);
+                    return EXIT_USAGE;
+                }
+            }
+        }
     };
     let params = serde_json::to_value(cyclops_proto::ReplyParams {
         message_id,
@@ -4288,7 +4314,12 @@ mod tests {
         ])
         .is_ok());
         assert!(Cli::try_parse_from(["cyclops", "reply", "m-parent"]).is_ok());
-        assert!(Cli::try_parse_from(["cyclops", "reply"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "reply", "--last"]).is_ok());
+        // Neither an id nor --last is a usage error at the parser, not a
+        // silent default: the old default was `--last`, and a reply that
+        // named no message went to whatever was claimed last.
+        assert!(Cli::try_parse_from(["cyclops", "reply"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "reply", "m-parent", "--last"]).is_err());
         assert!(Cli::try_parse_from([
             "cyclops",
             "reply",
@@ -4297,6 +4328,130 @@ mod tests {
             "The review is complete. No blockers remain.",
         ])
         .is_ok());
+    }
+
+    fn help_of(args: &[&str]) -> String {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("{args:?} returned a command instead of help"),
+            Err(error) => {
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                error.to_string()
+            }
+        }
+    }
+
+    /// `--raw` is the one flag that skips the composer checks, so its help
+    /// has to say exactly what it skips and what the journal records.
+    #[test]
+    fn send_and_reply_help_say_what_raw_skips_and_records() {
+        for verb in ["send", "reply"] {
+            let help = help_of(&["cyclops", verb, "--help"]);
+            assert!(help.contains("--raw"), "{verb}: {help}");
+            assert!(
+                help.contains(
+                    "the whole message into the pane and press Enter, skipping every composer \
+                     check; the journal records an unverified raw write"
+                ),
+                "{verb}: {help}"
+            );
+        }
+    }
+
+    /// The flag parses a `RecipientKey`, so the help must ask for the key
+    /// and say where to read one, not invite a display label.
+    #[test]
+    fn inbox_next_help_asks_for_the_canonical_sender_key() {
+        let help = help_of(&["cyclops", "inbox", "next", "--help"]);
+        assert!(
+            help.contains("canonical sender key from `cyclops inbox list --json`"),
+            "{help}"
+        );
+    }
+
+    /// `reply --last` answers the message the caller claimed most recently:
+    /// by claim time, not by arrival; another agent's claims and the
+    /// caller's own pending or outbound rows do not count.
+    #[test]
+    fn reply_last_picks_the_callers_most_recent_claim() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let me = cyclops_proto::RecipientKey::admin(workspace);
+        let other: cyclops_proto::RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%7"
+                .parse()
+                .unwrap();
+        let claimed = |message_id: &str, seq: u64, claimant, claimed_at| {
+            let mut row = pending_row_to(
+                me,
+                message_id,
+                seq,
+                cyclops_proto::MessageNotificationState::Notified,
+                None,
+            );
+            row.direction = cyclops_proto::MessageDirection::Inbound;
+            row.recipients[0].direction = cyclops_proto::MessageDirection::Inbound;
+            row.recipients[0].mailbox = cyclops_proto::MailboxEntryState::Claimed {
+                claimant,
+                claimed_at,
+            };
+            row
+        };
+        let mut snapshot = cyclops_proto::MessagesSnapshotResult {
+            workspace_id: workspace,
+            caller: Some(me),
+            workspace_seq: 9,
+            counts: cyclops_proto::MessagesSnapshotCounts {
+                visible_messages: 0,
+                returned_messages: 0,
+                inbox_messages: 0,
+                outbound_messages: 0,
+                work_messages: 0,
+                active_messages: 0,
+                settled_messages: 0,
+                pending_entries: 0,
+                claimed_entries: 0,
+                open_attention_entries: 0,
+            },
+            rows: vec![
+                // Arrived last, claimed first.
+                claimed("m-newest", 5, me, 100),
+                // Arrived first, claimed last: the answer.
+                claimed("m-oldest", 1, me, 300),
+                // Someone else's claim, later than any of the caller's.
+                claimed("m-theirs", 3, other, 900),
+                // Still pending: not claimed, not an answer.
+                pending_row_to(
+                    me,
+                    "m-pending",
+                    4,
+                    cyclops_proto::MessageNotificationState::Queued,
+                    None,
+                ),
+            ],
+            mailbox_attention: Vec::new(),
+        };
+        assert_eq!(
+            most_recently_claimed(&snapshot).map(|id| id.to_string()),
+            Some("m-oldest".to_string())
+        );
+
+        // Same claim time: the higher seq wins, the rule the daemon used.
+        snapshot.rows.push(claimed("m-tie", 6, me, 300));
+        assert_eq!(
+            most_recently_claimed(&snapshot).map(|id| id.to_string()),
+            Some("m-tie".to_string())
+        );
+
+        // An older daemon names no caller; direction says whose row it is.
+        snapshot.caller = None;
+        assert_eq!(
+            most_recently_claimed(&snapshot).map(|id| id.to_string()),
+            Some("m-theirs".to_string()),
+            "without a caller every inbound claim counts"
+        );
+
+        snapshot.rows.clear();
+        assert_eq!(most_recently_claimed(&snapshot), None);
     }
 
     #[test]
@@ -4651,8 +4806,10 @@ mod tests {
             .next()
             .unwrap();
         assert!(line.contains("quota_held"), "{line}");
-        assert!(line.contains("wait for quota reset"), "{line}");
-        assert!(line.contains("cyclops requeue m-quota-held"), "{line}");
+        assert!(line.contains("cyclops inbox claim m-quota-held"), "{line}");
+        assert!(line.contains("recorded by an older daemon"), "{line}");
+        assert!(!line.contains("wait for quota reset"), "{line}");
+        assert!(!line.contains("requeue"), "{line}");
         assert!(!line.contains("attention show"), "{line}");
 
         let mut quota_reset = pending_row_to(
@@ -4730,7 +4887,10 @@ mod tests {
             .next()
             .unwrap();
         assert!(line.contains("attention_resolution_pending"), "{line}");
-        assert!(line.contains("do not repeat a terminal action"), "{line}");
+        assert!(line.contains("cyclops inbox claim m-attention"), "{line}");
+        assert!(line.contains("cannot be requeued"), "{line}");
+        assert!(!line.contains("requeue m-attention"), "{line}");
+        assert!(!line.contains("terminal action"), "{line}");
 
         attention.recipients[0].notification.resolution =
             Some(cyclops_proto::NotificationResolution::Complete);
@@ -4917,13 +5077,25 @@ mod tests {
         held.available = true;
         held.notification.state = cyclops_proto::MessageNotificationState::AttentionRequired;
         held.notification.quota_state = Some(cyclops_proto::MessageQuotaState::Held);
+        // Replay-only quota phases from a 1.0 journal still read, and
+        // neither offers a verb: nothing can move them now.
         let held_cell = message_recipient_cell(&row.message_id, &held, None);
-        assert!(held_cell.contains("wait for quota reset"), "{held_cell}");
+        assert!(held_cell.contains("quota held"), "{held_cell}");
+        assert!(
+            held_cell.contains("recorded by an older daemon"),
+            "{held_cell}"
+        );
         assert!(held_cell.contains("no automatic resume"), "{held_cell}");
+        assert!(!held_cell.contains("wait for quota reset"), "{held_cell}");
+        assert!(!held_cell.contains("requeue"), "{held_cell}");
 
         let mut reset = held.clone();
         reset.notification.quota_state = Some(cyclops_proto::MessageQuotaState::ResetObserved);
         let reset_cell = message_recipient_cell(&row.message_id, &reset, None);
+        assert!(
+            reset_cell.contains("recorded by an older daemon"),
+            "{reset_cell}"
+        );
         assert!(reset_cell.contains("cyclops requeue m-1"), "{reset_cell}");
         assert!(reset_cell.contains("message wide"), "{reset_cell}");
 
@@ -4946,44 +5118,33 @@ mod tests {
             "gating"
         );
 
-        let mut uncertain = row.recipients[0].clone();
-        uncertain.notification.resolution_intent =
+        // A 1.0 journal can replay the operator complete/discard facts a
+        // 1.1 daemon no longer writes. They must not change the line: it
+        // still names the state and cause the JSON names, and never the
+        // retired verbs or their "terminal accepted" copy.
+        let mut replayed = row.recipients[0].clone();
+        replayed.notification.resolution_intent =
             Some(cyclops_proto::NotificationResolution::Complete);
-        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
-        assert!(cell.contains("terminal acceptance unproven"), "{cell}");
-        assert!(!cell.contains("cyclops attention complete"), "{cell}");
-
-        uncertain.notification.resolution_action_accepted =
+        replayed.notification.resolution_action_accepted =
             Some(cyclops_proto::NotificationResolution::Complete);
-        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
-        assert!(
-            cell.contains("terminal accepted, task start unproven"),
-            "{cell}"
-        );
-        assert!(!cell.contains("cyclops attention complete"), "{cell}");
-
-        uncertain.notification.resolution_consumption_observed = Some(
+        replayed.notification.resolution_consumption_observed = Some(
             cyclops_proto::NotificationResolutionConsumptionObservation {
                 evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::WorkingEdge,
                 observed_at_ms: 4,
             },
         );
-        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
-        assert!(cell.contains("terminal accepted the action key"), "{cell}");
-        assert!(cell.contains("cyclops attention complete"), "{cell}");
+        let cell = message_recipient_cell(&row.message_id, &replayed, None);
+        assert_eq!(
+            cell,
+            message_recipient_cell(&row.message_id, &row.recipients[0], None),
+            "replayed resolution facts changed the line"
+        );
         assert!(
-            cell.contains("rechecks without sending a second key"),
+            cell.contains("needs attention:verify_failed:verify=mismatch/human_draft:open"),
             "{cell}"
         );
-
-        uncertain.notification.resolution_intent =
-            Some(cyclops_proto::NotificationResolution::Discard);
-        uncertain.notification.resolution_action_accepted =
-            Some(cyclops_proto::NotificationResolution::Discard);
-        uncertain.notification.resolution_consumption_observed = None;
-        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
-        assert!(cell.contains("terminal accepted the action key"), "{cell}");
-        assert!(cell.contains("cyclops attention discard"), "{cell}");
+        assert!(!cell.contains("terminal accepted"), "{cell}");
+        assert!(!cell.contains("cyclops attention"), "{cell}");
 
         let mut worker_failed = gating.clone();
         worker_failed.can_withdraw_notification = true;

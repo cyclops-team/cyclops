@@ -1019,31 +1019,6 @@ fn watch_rejects_every_unknown_display_alias_before_it_waits() {
 }
 
 #[test]
-#[cfg(feature = "full-ui")]
-fn deprecated_ui_rejects_the_same_unknown_display_alias() {
-    let home = scratch_home("uuf");
-    serve_once(&home, hello(1), move |req| {
-        assert_eq!(req["method"], "status");
-        (
-            vec![json!({"id": req["id"], "result": canned_status()}).to_string()],
-            true,
-        )
-    });
-
-    let out = run_cyclops(&home, &["ui", "--from", "gemini", "--plain"]);
-
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("cyclops ui is deprecated"), "{stderr}");
-    assert!(
-        stderr.contains("unknown active display label \"gemini\""),
-        "{stderr}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
 fn watch_json_refuses_tui_only_display_filters_as_json() {
     let home = scratch_home("wjf");
 

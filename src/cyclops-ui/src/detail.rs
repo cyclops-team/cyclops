@@ -242,12 +242,6 @@ pub struct Detail {
     /// First body row drawn. A body longer than the frame is scrolled,
     /// not truncated.
     scroll: usize,
-    /// This attempt has been resolved, by this operator or another one.
-    /// Terminal actions never come back.
-    resolved: bool,
-    /// A terminal verb was attempted and its outcome is unknown. Fresh
-    /// terminal actions stay blocked. Intent alone exposes no action.
-    terminal_unknown: bool,
     /// Exact durable action intended before any terminal key.
     resolution_intent: Option<NotificationResolution>,
     /// Exact durable action key the terminal accepted.
@@ -272,29 +266,6 @@ pub struct Detail {
     pane_width_block: Option<(u32, u32)>,
     current_route: Option<MessageRecipientRoute>,
     fifo_position: Option<u64>,
-}
-
-/// Has this attempt already reached a terminal outcome?
-///
-/// The snapshot is the only place this can come from. `attention.show`
-/// returns evidence, not disposition, so a detail that asked only the
-/// daemon would offer Complete and Discard on an attempt another
-/// operator finished minutes ago. The daemon would refuse, but offering
-/// an action that cannot succeed is the defect.
-fn resolved_from(wake: WakeWord) -> bool {
-    matches!(
-        wake,
-        WakeWord::ResolvedSubmitted | WakeWord::ResolvedDiscarded
-    )
-}
-
-/// Did a terminal action cross its write boundary without an outcome?
-///
-/// Distinct from resolved: nobody knows what happened, so fresh terminal
-/// actions stay blocked. Matching durable intent and terminal acceptance
-/// may expose only exact same-action no-key reconciliation.
-fn terminal_unknown_from(wake: WakeWord) -> bool {
-    matches!(wake, WakeWord::ResolutionIncomplete)
 }
 
 impl Detail {
@@ -327,8 +298,6 @@ impl Detail {
             needs_reload: false,
             evidence_stale: false,
             scroll: 0,
-            resolved: resolved_from(row.wake),
-            terminal_unknown: terminal_unknown_from(row.wake),
             resolution_intent: row.resolution_intent,
             resolution_action_accepted: row.resolution_action_accepted,
             resolution_consumption_observed: row.resolution_consumption_observed,
@@ -425,14 +394,9 @@ impl Detail {
         };
     }
 
-    /// The daemon refused. A refusal that says the attempt is already
-    /// resolved retires both terminal verbs for good: they are not
-    /// repeatable and the state they act on is gone.
-    pub fn refused(&mut self, action: Option<Action>, code: &str, message: impl Into<String>) {
+    /// The daemon refused.
+    pub fn refused(&mut self, action: Option<Action>, message: impl Into<String>) {
         self.needs_reload = false;
-        if code == "conflict" {
-            self.resolved = true;
-        }
         if action == Some(Action::WithdrawNotification) {
             self.can_withdraw_notification = false;
         }
@@ -440,10 +404,6 @@ impl Detail {
             action,
             why: message.into(),
         };
-    }
-
-    pub fn is_resolved(&self) -> bool {
-        self.resolved
     }
 
     pub fn is_composing(&self) -> bool {
@@ -506,12 +466,8 @@ impl Detail {
                     self.needs_reload = true;
                     self.evidence_stale = true;
                 }
-                // Another operator can resolve this attempt while it is
-                // open here. Only ever tighten: a terminal verb this
-                // operator already ran has retired the same two actions,
-                // and a snapshot that predates it must not re-offer them.
-                self.resolved |= resolved_from(row.wake);
-                self.terminal_unknown |= terminal_unknown_from(row.wake);
+                // Only ever tighten: a snapshot that predates what this
+                // operator already did must not re-offer it.
                 self.can_manage_attention &= row.can_manage_attention;
                 self.can_withdraw_notification &= row.can_withdraw_notification;
             }
@@ -978,15 +934,21 @@ pub fn render_with_status(
             body.push("wake withdrawn by admin; message remains claimable".into());
             body.push(String::new());
         }
+        // Both quota words come only from a 1.0 journal: a 1.1 daemon holds
+        // quota at the gate and parks no attempt of its own, and nothing
+        // observes a reset any more, so a held attempt never resumes and
+        // the claim is the way to the body. A reset-observed attempt is
+        // still requeue-eligible, and that verb stays in the CLI.
         WakeWord::QuotaHeld => {
-            body.push(
-                "quota held: wait for a quota reset; delivery will not resume automatically".into(),
-            );
+            body.push(format!(
+                "quota held, recorded by an older daemon: delivery will not resume automatically; the recipient retrieves the message with `cyclops inbox claim {}`",
+                detail.message_id()
+            ));
             body.push(String::new());
         }
         WakeWord::QuotaResetObserved => {
             body.push(format!(
-                "quota reset observed: an administrator can run `cyclops requeue {}`",
+                "quota reset observed, recorded by an older daemon: an administrator can run `cyclops requeue {}`",
                 detail.message_id()
             ));
             body.push("this command requeues every eligible recipient on the message".into());
@@ -995,54 +957,16 @@ pub fn render_with_status(
         _ => {}
     }
 
-    if let Some(intent) = detail.resolution_intent() {
-        let action = match intent {
-            NotificationResolution::Complete => "submit",
-            NotificationResolution::Discard => "discard",
-        };
-        match detail.resolution_action_accepted() {
-            Some(accepted) if accepted == intent => {
-                if intent == NotificationResolution::Complete
-                    && detail.resolution_consumption_observed().is_none()
-                {
-                    body.push("terminal accepted, task start unproven".into());
-                    body.push("no submit or reconciliation action is available".into());
-                } else {
-                    body.push(format!(
-                        "terminal accepted the {action} action; final outcome remains uncertain"
-                    ));
-                    if intent == NotificationResolution::Complete {
-                        body.push("matching task start observed".into());
-                    }
-                    body.push(
-                        "only same-action reconciliation is available; no second key is sent"
-                            .into(),
-                    );
-                }
-            }
-            None => {
-                body.push(format!(
-                    "{action} intent recorded; terminal acceptance is unproven"
-                ));
-                if intent == NotificationResolution::Discard {
-                    body.push("exact-empty no-key discard reconciliation is available".into());
-                    body.push(
-                        "the daemon rechecks the exact binding and empty composer twice; no terminal key is sent"
-                            .into(),
-                    );
-                } else {
-                    body.push("no submit, discard, or reconciliation action is available".into());
-                }
-            }
-            Some(_) => {
-                body.push("terminal intent and accepted action records disagree".into());
-                body.push("no submit, discard, or reconciliation action is available".into());
-            }
-        }
-        body.push(String::new());
-    } else if detail.resolution_action_accepted().is_some() {
-        body.push("terminal acceptance recorded without a matching intent".into());
-        body.push("no submit, discard, or reconciliation action is available".into());
+    // A 1.0 daemon wrote these when an operator ran the complete or
+    // discard verb from this pane. Neither verb exists now, so the record
+    // is named once and nothing here reads which one it was: a line that
+    // said "only same-action reconciliation is available" would promise
+    // an action the daemon no longer offers.
+    if detail.resolution_intent().is_some()
+        || detail.resolution_action_accepted().is_some()
+        || detail.resolution_consumption_observed().is_some()
+    {
+        body.push("resolution record from an older daemon; no action is available for it".into());
         body.push(String::new());
     }
 
@@ -1057,9 +981,9 @@ pub fn render_with_status(
     if !detail.loaded().checks.is_empty() {
         body.push(String::new());
     }
-    // What the checks were measuring, for an operator about to complete
-    // or discard. A failed check names which rule broke; this names what
-    // actually differs, which is the part a person can act on.
+    // What the checks were measuring. A failed check names which rule
+    // broke; this names what actually differs, which is the part a person
+    // can act on.
     if detail.loaded().expected.is_some() || detail.loaded().observed.is_some() {
         body.push("staged".into());
         match &detail.loaded().expected {

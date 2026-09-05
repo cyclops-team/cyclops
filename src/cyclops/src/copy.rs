@@ -123,7 +123,6 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "history",
             "thread",
             "wait",
-            "ui",
             "hook",
         ],
     ),
@@ -471,16 +470,9 @@ pub fn also_watching(sessions: &[String]) -> String {
     )
 }
 
-/// `cyclops ui` refuses --json: the machine stream lives on `watch`, and
-/// pointing there beats emitting a shape nothing should rely on.
-#[cfg(feature = "full-ui")]
-pub const UI_NO_JSON: &str =
-    "cyclops ui has no --json form. The machine stream is: cyclops watch --json";
-
-/// Said on stderr every `cyclops ui` run, so scripts keep working while
-/// their authors learn the verb that replaced it.
-#[cfg(feature = "full-ui")]
-pub const UI_DEPRECATED: &str = "cyclops ui is deprecated; use cyclops watch";
+/// `cyclops reply --last` with nothing claimed. The flag names the message
+/// the caller claimed most recently, and there is none.
+pub const NO_CLAIMED_MESSAGE_TO_REPLY: &str = "no claimed message to reply to";
 
 /// `cyclops daemon log` with no log file. Not an error state: it means no
 /// detached daemon has ever run from this home, and the sentence says what
@@ -586,7 +578,7 @@ pub const THEME_NEXT_COMMAND: &str = "the next command picks it up";
 
 /// Said after a switch a running daemon did NOT take. Not a "when": the
 /// config is written and every one-shot command is already on the new
-/// theme, but the pane borders and any open `cyclops ui` are cyclopsd's to
+/// theme, but the pane borders and any open `cyclops watch` are cyclopsd's to
 /// repaint and it is painting something else. Nothing that happens on this
 /// side moves them.
 ///
