@@ -48,7 +48,15 @@ rust_tests() {
     cargo nextest run --workspace \
         -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
         --no-fail-fast || status=$?
-    cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+    # The daemon's `evidence` binary holds only #[ignore] measurements for
+    # the scheduled and release lanes, so it is not linked here, the same
+    # way the nextest filter above skips the client crates' performance
+    # binaries. Name the correctness binaries so a new one under
+    # src/cyclopsd/tests/ is a deliberate addition to this gate.
+    cargo test -p cyclopsd --lib --bins \
+        --test boot_and_sessions --test delivery --test identity \
+        --test journeys --test messaging --test scratch_override \
+        --no-fail-fast || status=$?
     cargo doc --workspace --no-deps || status=$?
     return "$status"
 }

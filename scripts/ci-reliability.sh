@@ -12,8 +12,9 @@ esac
 
 i=1
 while [ "$i" -le "$repeat" ]; do
-  cargo test -p cyclopsd --test messaging_coordinator \
-    a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt -- --exact
+  cargo test -p cyclopsd --test messaging \
+    messaging_coordinator::a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt \
+    -- --exact
   cargo test -p cyclops-testrig --test interrupted_owner \
     killing_an_owner_removes_only_its_exact_tmux_resources -- --exact
   i=$((i + 1))
@@ -23,4 +24,7 @@ cargo test -p cyclopsd --lib \
   mailbox::tests::ten_thousand_message_snapshot_uses_the_mailbox_lookup_index -- --exact
 cargo test -p cyclopsd --lib \
   mailbox::tests::follow_pages_every_settled_message_beyond_the_snapshot_tail -- --exact
-cargo test -p cyclopsd --test stage_and_clear_soak -- --nocapture
+# Every test in the evidence binary is #[ignore]; the live vendor campaign
+# additionally needs its own opt-in environment and is skipped here.
+cargo test -p cyclopsd --test evidence stage_and_clear_soak:: -- \
+  --ignored --skip live_vendor_evidence_campaign_opt_in --nocapture

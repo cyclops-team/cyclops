@@ -161,8 +161,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -253,8 +253,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -411,8 +411,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -498,8 +498,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -585,8 +585,8 @@ line_regex = ['^❯\s*$']
 # These shared fixtures exercise delivery LIFECYCLE only. They do not
 # prove INVARIANTS rule 12 and they do not prove sentinel completeness:
 # a blank pane paints no chrome under a paste, so terminality is not
-# decidable here at all. Those claims belong to the dedicated tests in
-# m1_blockers.rs and the sentinel unit tests in delivery.rs.
+# decidable here at all. Those claims belong to the gate tests in
+# tests/delivery/gate.rs and the sentinel unit tests in src/delivery/tests.rs.
 [[rule]]
 id = "composer_holds_paste"
 state = "idle_with_input"
@@ -799,6 +799,32 @@ impl TestClient {
             }
         }
     }
+
+    /// Block until a new event matching `pred` arrives, keeping every line
+    /// read for later waits; `false` when `within` elapses first.
+    ///
+    /// A wake, not a consumer: the caller re-asks the authority (status,
+    /// the ledger, the journal) after it returns. A `wait_event` that runs
+    /// later still finds everything this read, and an event that arrived
+    /// before the caller's last check cannot wake it falsely because that
+    /// check already saw its effect.
+    pub async fn wake_on<F: Fn(&Value) -> bool>(&mut self, within: Duration, pred: F) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = tokio::time::timeout(remaining, self.next_line()).await else {
+                return false;
+            };
+            if line.get("event").is_none() {
+                continue;
+            }
+            let matched = pred(&line);
+            self.pending_events.push_back(line);
+            if matched {
+                return true;
+            }
+        }
+    }
 }
 
 /// One booted rig: isolated tmux server, scratch home, in-process daemon,
@@ -968,6 +994,10 @@ impl Rig {
                 Instant::now() < deadline,
                 "daemon never attached with {panes} panes in session {idx}: {resp}"
             );
+            // No event names this answer: attach publishes `session`, but a
+            // pane arriving with an unknown verdict publishes nothing (fusion
+            // skips the first unknown), so the pane count has to be asked
+            // for. Status does not mask `attached` or the pane list.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -998,7 +1028,7 @@ impl Rig {
     /// socket `msg.send` uses once the caller is resolved. The sender is
     /// pre-resolved to `admin` because these tests are about notification
     /// and delivery; attribution has its own tests over the real socket in
-    /// `tests/sender_identity.rs`.
+    /// `tests/identity/sender_identity.rs`.
     pub async fn send(&mut self, params: Value) -> (Value, Duration) {
         let params = serde_json::from_value(params).expect("msg.send params");
         let t = Instant::now();
@@ -1159,23 +1189,57 @@ fn write_config(home: &Path, socket: &str, sessions: &[String], cfg_extra: &str)
     .expect("write config");
 }
 
-/// Poll daemon status until the first pane reports `want`.
+/// Wait until the daemon reports the first pane of session 0 in state `want`.
 ///
 /// Status is the daemon's own view, which is the one that matters: tmux
-/// can already be in a state the watcher table has not consumed yet.
+/// can already be in a state the watcher table has not consumed yet. Every
+/// change to a fused verdict publishes one `state` event
+/// (`Inner::emit_state`), so that is the wake and status is asked again
+/// after it. Two answers have no event and are re-asked after a short
+/// bounded wake instead: no pane row yet (a respawned pane leaves the table
+/// and comes back), and `status_refresh_incomplete`, status refusing to
+/// answer for the pane inside its own live-refresh budget, which reads as
+/// `unknown` and must not be believed.
 pub async fn wait_pane_state(rig: &mut Rig, want: &str) {
+    wait_pane_matching(rig, want, |panes| panes.first()).await;
+}
+
+/// [`wait_pane_state`] for one pane of session 0 by id.
+pub async fn wait_pane_id_state(rig: &mut Rig, pane_id: &str, want: &str) {
+    wait_pane_matching(rig, want, |panes| {
+        panes.iter().find(|row| row["pane_id"] == pane_id)
+    })
+    .await;
+}
+
+async fn wait_pane_matching(
+    rig: &mut Rig,
+    want: &str,
+    select: impl for<'a> Fn(&'a [Value]) -> Option<&'a Value>,
+) {
+    // How long to wait for the two answers that no event follows.
+    const UNANSWERED: Duration = Duration::from_millis(50);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let resp = rig.ctl.request("status", json!({})).await;
-        let state = resp["result"]["sessions"][0]["panes"][0]["state"].clone();
-        if state == json!(want) {
+        let row = resp["result"]["sessions"][0]["panes"]
+            .as_array()
+            .and_then(|panes| select(panes));
+        let answered = row.is_some_and(|row| row["write_block"] != "status_refresh_incomplete");
+        if answered && row.is_some_and(|row| row["state"] == json!(want)) {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "pane never reached state {want}: {resp}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let within = if answered {
+            remaining
+        } else {
+            remaining.min(UNANSWERED)
+        };
+        rig.ev.wake_on(within, |e| e["event"] == "state").await;
     }
 }
 
@@ -1205,7 +1269,13 @@ pub fn hold_then_manual_lifecycle_script(marker: &str) -> String {
 
 /// Every complete line of the workspace message journal.
 pub fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
-    let workspace = std::fs::read_dir(rig.home.join("workspaces"))
+    workspace_lines_in(&rig.home)
+}
+
+/// [`workspace_lines`] for a caller holding only the scratch home, such as
+/// a wait that has borrowed the rig's event client separately.
+pub fn workspace_lines_in(home: &Path) -> Vec<LedgerLine> {
+    let workspace = std::fs::read_dir(home.join("workspaces"))
         .expect("workspace directory")
         .next()
         .expect("one workspace")
@@ -1228,7 +1298,11 @@ pub fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
 
 /// Notification transition states recorded for one message, in journal order.
 pub fn notification_states(rig: &Rig, message_id: &str) -> Vec<String> {
-    workspace_lines(rig)
+    notification_states_in(&rig.home, message_id)
+}
+
+pub fn notification_states_in(home: &Path, message_id: &str) -> Vec<String> {
+    workspace_lines_in(home)
         .into_iter()
         .filter(|line| line.id == message_id)
         .filter_map(|line| {
@@ -1287,21 +1361,40 @@ pub fn doorbell_for(rig: &Rig, message_id: &str) -> String {
 }
 
 /// Wait until one message's notification records any of `states`.
-pub async fn wait_notification_state(rig: &Rig, message_id: &str, states: &[&str]) -> String {
+///
+/// Every journal append publishes one `messages.changed` event
+/// (`MessageChangePublisher::publish`), so that is the wake; the journal
+/// stays the authority because the transition may predate the wait.
+pub async fn wait_notification_state(rig: &mut Rig, message_id: &str, states: &[&str]) -> String {
+    let Rig { ev, home, .. } = rig;
+    wait_notification_state_on(ev, home, message_id, states).await
+}
+
+/// [`wait_notification_state`] for a caller that holds another part of the
+/// rig, such as a self-test running on `rig.daemon` inside the same join.
+pub async fn wait_notification_state_on(
+    ev: &mut TestClient,
+    home: &Path,
+    message_id: &str,
+    states: &[&str],
+) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if let Some(state) = notification_states(rig, message_id)
-            .into_iter()
+        let recorded = notification_states_in(home, message_id);
+        if let Some(state) = recorded
+            .iter()
             .find(|state| states.contains(&state.as_str()))
         {
-            return state;
+            return state.clone();
         }
         assert!(
             Instant::now() < deadline,
-            "notification {message_id} never reached {states:?}: {:?}",
-            notification_states(rig, message_id)
+            "notification {message_id} never reached {states:?}: {recorded:?}"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        ev.wake_on(deadline.saturating_duration_since(Instant::now()), |e| {
+            e["event"] == "messages.changed"
+        })
+        .await;
     }
 }
 

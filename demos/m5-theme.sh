@@ -137,14 +137,14 @@ echo "   border after:  $(border_colors)"
 # The CLI refuses a theme that would render built-in colors, so on this
 # path the daemon is never asked and says nothing. That is the outer half
 # of the rule. The daemon's half, a file going wrong under a daemon that
-# IS asked to reload, is src/cyclopsd/tests/m5_theme.rs, which reads
+# IS asked to reload, is src/cyclopsd/tests/messaging/m5_theme.rs, which reads
 # the border back off tmux the same way this does.
 if grep -q 'theme: ' "$CYCLOPS_HOME/daemon.log"; then
   echo "   what the daemon said about it:"
   grep -o 'theme: .*' "$CYCLOPS_HOME/daemon.log" | tail -1 | sed 's/^/     /'
 else
   echo "   the CLI refused it before the daemon was asked; the daemon's own"
-  echo "   half of the rule is src/cyclopsd/tests/m5_theme.rs"
+  echo "   half of the rule is src/cyclopsd/tests/messaging/m5_theme.rs"
 fi
 
 echo

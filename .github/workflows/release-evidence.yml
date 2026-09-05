@@ -53,8 +53,8 @@ jobs:
       - name: Strict, lenient, and daemon replay contracts
         run: |
           cargo test -p cyclops-ledger --all-targets --no-fail-fast
-          cargo test -p cyclopsd --test m2_history --no-fail-fast
-          cargo test -p cyclopsd --test attention_recovery --no-fail-fast
+          cargo test -p cyclopsd --test messaging m2_history:: --no-fail-fast
+          cargo test -p cyclopsd --test delivery --no-fail-fast
 
   installer-and-journeys:
     name: release installer and user journeys (${{ matrix.os }})
