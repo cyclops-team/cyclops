@@ -40,11 +40,14 @@ pub(crate) enum NotificationAdapterError {
     MessageMissing,
 }
 
-/// A doorbell or raw write may still go out after the recipient claimed the
-/// message: the wake is for the operator's eyes and the claim is what the
-/// recipient did. Only the retired direct payload was withdrawn by a claim.
-fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationTransport) -> bool {
-    state.is_pending() || (state.is_claimed() && transport != NotificationTransport::DirectPayload)
+/// Nothing is written for a message the recipient already holds. A claim
+/// before the write boundary settles the attempt as withdrawn under the
+/// same store lock, so a worker that reaches its pre-write check after a
+/// claim finds the entry claimed and stops without touching the pane. A
+/// doorbell already past Enter is receipted by the claim instead; that path
+/// never asks this question.
+fn entry_allows_notification(state: &MailboxEntryState, _transport: NotificationTransport) -> bool {
+    state.is_pending()
 }
 
 impl NotificationContext {

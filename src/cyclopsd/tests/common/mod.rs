@@ -1333,10 +1333,10 @@ pub fn notification_attempt(rig: &Rig, message_id: &str) -> Option<NotificationA
 }
 
 /// The exact row the daemon pastes for one message: the sender label, the
-/// sender-authored or derived summary, and the current attempt's claim
-/// command (Format 4). Rebuilt from the durable record the way the daemon
-/// rebuilds it, so a hook prompt or a screen capture can be compared byte
-/// for byte.
+/// recipient labels, the sender-authored or derived summary, and the
+/// current attempt's claim command (Format 4). Rebuilt from the durable
+/// record the way the daemon rebuilds it, so a hook prompt or a screen
+/// capture can be compared byte for byte.
 pub fn doorbell_for(rig: &Rig, message_id: &str) -> String {
     let message = workspace_lines(rig)
         .into_iter()
@@ -1356,8 +1356,17 @@ pub fn doorbell_for(rig: &Rig, message_id: &str) -> String {
             )
         })
         .expect("a summary derives from the body or subject");
+    let recipients = cyclops_proto::render_recipient_list(
+        &data["presentation"]["recipient_labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|presentation| presentation["label"].as_str())
+            .collect::<Vec<_>>(),
+        data["broadcast"].as_bool().unwrap_or(false),
+    );
     let attempt = notification_attempt(rig, message_id).expect("notification attempt");
-    cyclops_proto::render_doorbell_v4(sender_label, &summary, attempt)
+    cyclops_proto::render_doorbell_v4(sender_label, &recipients, &summary, attempt)
 }
 
 /// Wait until one message's notification records any of `states`.

@@ -845,6 +845,11 @@ pub struct MsgSendResult {
     /// False when a client idempotency key matched an existing message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inserted: Option<bool>,
+    /// The root of the thread the message belongs to: the message itself
+    /// for a new thread, the parent's root for a reply. Additive; older
+    /// daemons omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<crate::mailbox::MessageId>,
 }
 
 /// Why the recipient FIFO head has no live Cyclops wake owner.
@@ -1375,6 +1380,15 @@ pub enum ClaimDisposition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxClaimParams {
+    pub message_id: crate::mailbox::MessageId,
+}
+
+/// `msg.read`: the operator reads one message, body included, without
+/// claiming it. Served only to the admin origin; an agent is refused with
+/// `forbidden` because a body reaches an agent only through a claim. The
+/// result is the same [`InboxMessage`] shape `inbox.claim` returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgReadParams {
     pub message_id: crate::mailbox::MessageId,
 }
 
@@ -2024,6 +2038,7 @@ mod tests {
     fn durable_send_result_preserves_protocol_v1_receipts() {
         let result = MsgSendResult {
             msg_id: "m-compatible".into(),
+            thread_root: None,
             seq: 7,
             deliveries: vec![DeliveryReceipt {
                 to: "reviewer".into(),

@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams, DaemonShutdownParams,
     DaemonShutdownResult, Event, FrameContract, FrameSize, Hello, InboxClaimParams,
-    InboxListParams, MessagesFollowParams, MessagesSnapshotParams, MsgSendParams,
+    InboxListParams, MessagesFollowParams, MessagesSnapshotParams, MsgReadParams, MsgSendParams,
     NotificationAttemptId, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
     PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
     Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
@@ -530,6 +530,7 @@ pub(crate) async fn dispatch(
         "msg.reply" => (msg_reply(inner, id, req.params, peer).await, None),
         "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
         "inbox.claim" => (inbox_claim(inner, id, req.params, peer), None),
+        "msg.read" => (msg_read(inner, id, req.params, peer), None),
         "messages.snapshot" => (messages_snapshot(inner, id, req.params, peer), None),
         "messages.follow" => (messages_follow(inner, id, req.params, peer), None),
         "msg.requeue" => (msg_requeue(inner, id, req.params, peer), None),
@@ -950,6 +951,35 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
     )
 }
 
+/// The operator reads one message, body included, without claiming it.
+/// Only the admin origin is served: a body reaches an agent through an
+/// authenticated claim and nothing else, so an agent caller is refused
+/// before the message is even looked up. No journal line is appended.
+fn msg_read(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: MsgReadParams = match decode_params(&id, params, "msg.read params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    if !caller.key.is_admin() {
+        return Response::err(
+            id,
+            "forbidden",
+            "bodies reach an agent only through a claim",
+        );
+    }
+    match messaging.read_message(caller.key, params.message_id) {
+        Ok(message) => Response::ok(
+            id,
+            serde_json::to_value(message).expect("message read serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
+}
+
 fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
     let params: MessagesSnapshotParams =
         match decode_params(&id, params, "messages.snapshot params") {
@@ -1318,6 +1348,7 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
             }
         }
         MailboxServiceError::Store(error) => ("mailbox_error", error.to_string()),
+        MailboxServiceError::OperatorRequired => ("forbidden", error.to_string()),
         MailboxServiceError::Poisoned | MailboxServiceError::ForeignDirectory => {
             ("mailbox_error", error.to_string())
         }
@@ -3056,6 +3087,7 @@ mod tests {
                         }],
                     },
                     raw: false,
+                    broadcast: false,
                 },
             )
             .unwrap();
@@ -3162,6 +3194,7 @@ mod tests {
                             }],
                         },
                         raw: false,
+                        broadcast: false,
                     },
                 )
                 .unwrap();

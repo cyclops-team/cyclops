@@ -17,7 +17,7 @@ pub const CANONICAL_RECORD_VERSION: u32 = 1;
 /// Errors occurring during mailbox type validation and deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxTypeError {
-    #[error("message id must have 'm-' prefix followed by non-empty ASCII graphic suffix: '{0}'")]
+    #[error("message id must be 'cyc-<thread>-<message>' (two runs of 8 lowercase hex characters) or a legacy 'm-' id: '{0}'")]
     InvalidMessageId(String),
     #[error(
         "request digest must have 'v1:' prefix followed by 64 lowercase hex characters: '{0}'"
@@ -25,26 +25,18 @@ pub enum MailboxTypeError {
     InvalidRequestDigest(String),
     #[error("failed to serialize semantic payload for digest: {0}")]
     SerializationError(String),
-    #[error("message summary must be one non-empty line with no control characters (maximum {MESSAGE_SUMMARY_MAX_CHARS} characters)")]
+    #[error("message summary must be one non-empty line with no control characters")]
     InvalidMessageSummary,
 }
 
-/// Maximum preview size carried beside an exact mailbox claim.
-///
-/// The summary is deliberately small enough to remain an operator-facing
-/// preview rather than a second message body.
-pub const MESSAGE_SUMMARY_MAX_CHARS: usize = 240;
-
 /// Validate the preview line pasted beside the exact claim command.
 ///
-/// One line, no control characters, and bounded, so terminal staging and
-/// durable reconstruction see the same bytes.
+/// One non-empty line with no control characters (so no newline), so
+/// terminal staging and durable reconstruction see the same bytes. There is
+/// no length cap: the pane shows one row and a long summary simply wraps,
+/// and the CLI warns the sender when a summary runs long.
 pub fn validate_message_summary(summary: &str) -> Result<(), MailboxTypeError> {
-    if summary.is_empty()
-        || summary.trim() != summary
-        || summary.chars().count() > MESSAGE_SUMMARY_MAX_CHARS
-        || summary.chars().any(char::is_control)
-    {
+    if summary.is_empty() || summary.trim() != summary || summary.chars().any(char::is_control) {
         return Err(MailboxTypeError::InvalidMessageSummary);
     }
     Ok(())
@@ -71,7 +63,20 @@ pub fn derive_message_summary(body: &str, subject: &str) -> Option<String> {
     })
 }
 
-/// Validated unique identifier for a message record (e.g. "m-a1b2c3").
+/// Prefix of every message id the daemon mints now.
+pub const MESSAGE_ID_PREFIX: &str = "cyc-";
+/// Length of each hex run in a `cyc-<thread>-<message>` id.
+pub const MESSAGE_ID_PART_LEN: usize = 8;
+
+/// Validated unique identifier for a message record.
+///
+/// The daemon mints `cyc-<thread>-<message>`, two runs of eight lowercase
+/// hex characters: every message in one thread shares the `<thread>` run and
+/// gets its own `<message>` run, so a reader can tell from the id alone which
+/// conversation a message belongs to. Older journals hold the legacy `m-`
+/// form (`m-` plus 32 lowercase hex characters), which still replays, and
+/// the reserved `m-att_<22-character token>` locator a doorbell line carries
+/// shares this type so a positional claim client can pass it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageId(String);
 
@@ -79,6 +84,15 @@ impl MessageId {
     /// Construct and validate a message identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, MailboxTypeError> {
         let value = value.into();
+        if let Some(parts) = value.strip_prefix(MESSAGE_ID_PREFIX) {
+            let valid = parts
+                .split_once('-')
+                .is_some_and(|(thread, message)| is_id_part(thread) && is_id_part(message));
+            if !valid {
+                return Err(MailboxTypeError::InvalidMessageId(value));
+            }
+            return Ok(Self(value));
+        }
         let suffix = value
             .strip_prefix("m-")
             .ok_or_else(|| MailboxTypeError::InvalidMessageId(value.clone()))?;
@@ -93,10 +107,74 @@ impl MessageId {
         Ok(Self(value))
     }
 
+    /// Mint the id of a new thread root: fresh `<thread>` and `<message>`
+    /// runs.
+    pub fn mint_root() -> Self {
+        let random = uuid::Uuid::new_v4().simple().to_string();
+        Self(format!(
+            "{MESSAGE_ID_PREFIX}{}-{}",
+            &random[..MESSAGE_ID_PART_LEN],
+            &random[random.len() - MESSAGE_ID_PART_LEN..]
+        ))
+    }
+
+    /// Mint the id of a message inside the thread rooted at `thread_root`:
+    /// the root's `<thread>` run and a fresh `<message>` run. A legacy root
+    /// has no `<thread>` run of its own, so its replies share one derived
+    /// from the root id, which keeps every reply to it in one thread.
+    pub fn mint_in_thread(thread_root: &MessageId) -> Self {
+        let random = uuid::Uuid::new_v4().simple().to_string();
+        Self(format!(
+            "{MESSAGE_ID_PREFIX}{}-{}",
+            thread_root.thread_key(),
+            &random[..MESSAGE_ID_PART_LEN]
+        ))
+    }
+
+    /// The `<thread>` run of a `cyc-` id. None for a legacy id.
+    pub fn thread_part(&self) -> Option<&str> {
+        self.parts().map(|(thread, _)| thread)
+    }
+
+    /// The `<message>` run of a `cyc-` id. None for a legacy id.
+    pub fn message_part(&self) -> Option<&str> {
+        self.parts().map(|(_, message)| message)
+    }
+
+    /// The `<thread>` run every message in this id's thread carries when
+    /// this id is the thread root: its own run, or for a legacy root a
+    /// stable run derived from the id.
+    fn thread_key(&self) -> String {
+        match self.thread_part() {
+            Some(thread) => thread.to_string(),
+            None => {
+                let digest = Sha256::digest(self.0.as_bytes());
+                digest
+                    .iter()
+                    .take(MESSAGE_ID_PART_LEN / 2)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect()
+            }
+        }
+    }
+
+    fn parts(&self) -> Option<(&str, &str)> {
+        self.0
+            .strip_prefix(MESSAGE_ID_PREFIX)
+            .and_then(|parts| parts.split_once('-'))
+    }
+
     /// Access the underlying string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn is_id_part(part: &str) -> bool {
+    part.len() == MESSAGE_ID_PART_LEN
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl FromStr for MessageId {
@@ -284,6 +362,11 @@ pub struct MessageMetadata {
     /// submitted with no composer check and no receipt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw: bool,
+    /// The sender addressed every agent (`*`) rather than naming them, so
+    /// the doorbell header reads `to all` instead of listing the labels.
+    /// Absent on rows written before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcast: bool,
 }
 
 /// Human-readable labels bound to authoritative message identities.
@@ -436,6 +519,55 @@ mod tests {
     }
 
     #[test]
+    fn thread_aware_ids_carry_their_parts_and_legacy_ids_still_parse() {
+        let threaded = MessageId::new("cyc-1a2b3c4d-5e6f7a8b").unwrap();
+        assert_eq!(threaded.thread_part(), Some("1a2b3c4d"));
+        assert_eq!(threaded.message_part(), Some("5e6f7a8b"));
+        let json = serde_json::to_string(&threaded).unwrap();
+        assert_eq!(serde_json::from_str::<MessageId>(&json).unwrap(), threaded);
+
+        // Strict: two runs of exactly eight lowercase hex characters.
+        for invalid in [
+            "cyc-",
+            "cyc-1a2b3c4d",
+            "cyc-1a2b3c4d-",
+            "cyc-1A2B3C4D-5e6f7a8b",
+            "cyc-1a2b3c4-5e6f7a8b",
+            "cyc-1a2b3c4d-5e6f7a8b9",
+            "cyc-1a2b3c4d-5e6f7a8b-0",
+            "cyc-ghijklmn-5e6f7a8b",
+        ] {
+            assert!(MessageId::new(invalid).is_err(), "{invalid}");
+        }
+
+        // The forms an old journal and a doorbell line carry.
+        let legacy = MessageId::new("m-0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(legacy.thread_part(), None);
+        assert_eq!(legacy.message_part(), None);
+        let locator = MessageId::new("m-att_ASNFZ4mrTe-BI0VniavN7w").unwrap();
+        assert_eq!(locator.thread_part(), None);
+    }
+
+    #[test]
+    fn minted_ids_share_the_thread_run_and_mint_a_fresh_message_run() {
+        let root = MessageId::mint_root();
+        assert!(MessageId::new(root.as_str()).is_ok(), "{root}");
+        let reply = MessageId::mint_in_thread(&root);
+        assert!(MessageId::new(reply.as_str()).is_ok(), "{reply}");
+        assert_eq!(reply.thread_part(), root.thread_part());
+        assert_ne!(reply.message_part(), root.message_part());
+        assert_ne!(reply, root);
+
+        // Replies to a legacy root all land in one thread derived from it.
+        let legacy = MessageId::new("m-0123456789abcdef0123456789abcdef").unwrap();
+        let first = MessageId::mint_in_thread(&legacy);
+        let second = MessageId::mint_in_thread(&legacy);
+        assert_eq!(first.thread_part(), second.thread_part());
+        assert_eq!(first.thread_part().map(str::len), Some(MESSAGE_ID_PART_LEN));
+        assert_ne!(first.message_part(), second.message_part());
+    }
+
+    #[test]
     fn direct_delivery_is_not_a_claim() {
         let (_, recipient, _) = test_recipients();
         let attempt_id =
@@ -578,10 +710,14 @@ mod tests {
     }
 
     #[test]
-    fn message_summary_is_one_bounded_line_without_control_characters() {
+    fn message_summary_is_one_line_without_control_characters_and_no_cap() {
         assert!(validate_message_summary("Tests pass. The change is ready.").is_ok());
         assert!(validate_message_summary("One sentence only.").is_ok());
         assert!(validate_message_summary("no punctuation at all").is_ok());
+        // Length is the sender's call: the pane shows one row and the CLI
+        // warns, but the daemon accepts a long single line.
+        let long = format!("{}. Done.", "a".repeat(400));
+        assert!(validate_message_summary(&long).is_ok());
 
         for invalid in [
             "",
@@ -596,11 +732,6 @@ mod tests {
                 "accepted invalid summary: {invalid:?}"
             );
         }
-        let too_long = format!("{}. Done.", "a".repeat(MESSAGE_SUMMARY_MAX_CHARS));
-        assert_eq!(
-            validate_message_summary(&too_long),
-            Err(MailboxTypeError::InvalidMessageSummary)
-        );
     }
 
     #[test]

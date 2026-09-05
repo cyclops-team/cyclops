@@ -27,6 +27,16 @@ pub const WATCH_NOT_INCLUDED: &str = "interactive watch is not included in this 
 pub const RESTART_PREDATES_FIX: &str =
     "Stop and start it once by hand: cyclops daemon stop, then cyclops start.";
 
+/// Above this many characters the CLI says the summary runs long. The
+/// daemon accepts any one-line summary; the pane shows one row, and a
+/// long preview is a paragraph the recipient scrolls past.
+pub const SUMMARY_LONG_CHARS: usize = 160;
+
+/// The one stderr warning a long summary earns. The send still goes.
+pub fn summary_runs_long(chars: usize) -> String {
+    format!("summary is {chars} characters; keep it short, the pane shows one line")
+}
+
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\" --summary \"First sentence. Second sentence.\"), or pass --to or --all.";
 

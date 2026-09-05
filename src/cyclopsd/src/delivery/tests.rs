@@ -97,6 +97,7 @@ fn notification_fixture_full(
                     }],
                 },
                 raw,
+                broadcast: false,
             },
         )
         .unwrap();
@@ -940,7 +941,7 @@ fn a_summary_notification_renders_the_sender_summary_or_derives_one() {
 
     assert_eq!(
         selected.bytes,
-        cyclops_proto::render_doorbell_v4("admin", summary, context.attempt_id())
+        cyclops_proto::render_doorbell_v4("admin", "reviewer", summary, context.attempt_id())
     );
     assert_eq!(
         selected.doorbell_format,
@@ -953,7 +954,7 @@ fn a_summary_notification_renders_the_sender_summary_or_derives_one() {
     let selected = select_attempt_payload(&handle).unwrap();
     assert_eq!(
         selected.bytes,
-        cyclops_proto::render_doorbell_v4("admin", "Wake", context.attempt_id())
+        cyclops_proto::render_doorbell_v4("admin", "reviewer", "Wake", context.attempt_id())
     );
     let record = context.current_record().unwrap();
     let message = context.message_line().unwrap();
@@ -995,6 +996,7 @@ fn supersede_notification(
                     }],
                 },
                 raw: false,
+                broadcast: false,
             },
         )
         .unwrap();
@@ -2034,8 +2036,12 @@ async fn superseded_notification_aborts_inside_on_write_without_pasting() {
     );
 }
 
+/// A claim while the doorbell is still gating withdraws it: the recipient
+/// already holds the body, so the wake has nothing left to announce, and a
+/// worker that reaches its pre-write check afterwards stops without
+/// touching the pane.
 #[test]
-fn a_socket_claim_does_not_suppress_the_operator_visible_doorbell() {
+fn a_socket_claim_withdraws_the_gating_doorbell_before_the_write() {
     let (_scratch, store, context, _handle, recipient) = notification_fixture("claimed");
     context.record_gating().unwrap();
     let outcome = store
@@ -2049,13 +2055,16 @@ fn a_socket_claim_does_not_suppress_the_operator_visible_doorbell() {
     else {
         panic!("first claim must append a claim fact");
     };
-    assert_eq!(withdrawn_attempt, None);
-    context
-        .ensure_current_gating()
-        .expect("socket claim must not cancel the independent pane notification");
+    assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
+    assert!(matches!(
+        context.ensure_current_gating(),
+        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
+    ));
+    let record = notification_state(&store, recipient, context.message_id());
+    assert_eq!(record.state, cyclops_proto::NotificationState::Withdrawn);
     assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        cyclops_proto::NotificationState::Gating
+        record.pre_write_cause,
+        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
     );
 }
 
@@ -2391,8 +2400,11 @@ fn readiness_block_persistence_records_route_baseline_and_reopens_once() {
     assert_eq!(service.journal_lines().unwrap().len(), lines_before_repeat);
 }
 
+/// A claim while the doorbell is gating settles it as withdrawn, so a
+/// pre-write block the worker records afterwards finds nothing to block:
+/// the attempt stays withdrawn by the claim and the worker is not faulted.
 #[test]
-fn a_socket_claim_does_not_retire_the_operator_notification_prewrite_block() {
+fn a_socket_claim_settles_the_attempt_before_a_prewrite_block_can_land() {
     let (_scratch, store, context, handle, recipient) =
         notification_fixture("claim-wins-prewrite-block");
     context.record_gating().unwrap();
@@ -2424,18 +2436,19 @@ fn a_socket_claim_does_not_retire_the_operator_notification_prewrite_block() {
             required_pane_width: None,
         }),
     );
-    assert!(record.is_ok());
-    assert!(!worker.is_faulted());
-    assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        NotificationState::BlockedPreWrite
-    );
-    assert!(Arc::ptr_eq(
-        &worker
-            .current_or_next()
-            .expect("notification remains the FIFO owner"),
-        &handle
+    assert!(matches!(
+        record,
+        Err(NotificationAdapterError::TerminalConflict(
+            NotificationState::Withdrawn
+        ))
     ));
+    assert!(!worker.is_faulted());
+    let record = notification_state(&store, recipient, context.message_id());
+    assert_eq!(record.state, NotificationState::Withdrawn);
+    assert_eq!(
+        record.pre_write_cause,
+        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
+    );
 }
 
 #[test]
@@ -2509,8 +2522,11 @@ fn submitted_doorbell_claim_names_the_attempt_that_consumed_it() {
     assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
 }
 
+/// A claim while the doorbell is still queued withdraws it before the gate
+/// ever runs: the worker that picks the attempt up finds it no longer
+/// current and never writes.
 #[test]
-fn claimed_doorbell_still_enters_the_operator_notification_gate() {
+fn a_claimed_queued_doorbell_never_enters_the_gate() {
     let (_scratch, store, context, _handle, recipient) =
         notification_fixture("withdrawn-before-gate");
     let outcome = store
@@ -2524,14 +2540,17 @@ fn claimed_doorbell_still_enters_the_operator_notification_gate() {
     else {
         panic!("first claim must append a claim fact");
     };
-    assert_eq!(withdrawn_attempt, None);
+    assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
 
-    context
-        .record_gating()
-        .expect("claim and operator-visible pane notification are independent");
+    assert!(matches!(
+        context.record_gating(),
+        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
+    ));
+    let record = notification_state(&store, recipient, context.message_id());
+    assert_eq!(record.state, cyclops_proto::NotificationState::Withdrawn);
     assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        cyclops_proto::NotificationState::Gating
+        record.pre_write_cause,
+        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
     );
 }
 
@@ -3594,11 +3613,12 @@ composer_trailer_required_prefix = 1
             NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
         let expected = cyclops_proto::render_doorbell_v4(
             "implementer",
+            "reviewer",
             "Cable-carrier rounding was restored to whole sections. Review the fix and regression tests.",
             attempt,
         );
         let parts = [
-            "[cyclops from implementer] Cable-carrier rounding was restored",
+            "[cyclops from implementer to reviewer] Cable-carrier rounding was restored",
             "to whole sections. Review the fix and regression tests. | cyclops",
             "inbox claim m-att_ASNFZ4mrTe-BI0VniavN7w",
         ];
@@ -3692,13 +3712,14 @@ composer_trailer_required_prefix = 1
             NotificationAttemptId::parse("att-485beb62-3287-47b9-9a5d-5f7303e91e54").unwrap();
         let expected = cyclops_proto::render_doorbell_v4(
             "chatty",
+            "reviewer",
             "Codex is checking that Cyclops messaging works. Please acknowledge receipt when you see this.",
             attempt,
         );
         let parts = [
-            "[cyclops from chatty] Codex is checking that Cyclops",
-            "messaging works. Please acknowledge receipt when you see",
-            "this. | cyclops inbox claim",
+            "[cyclops from chatty to reviewer] Codex is checking that",
+            "Cyclops messaging works. Please acknowledge receipt when",
+            "you see this. | cyclops inbox claim",
             "m-att_SFvrYjKHR7maXV9zA-keVA",
         ];
         assert_eq!(parts.join(" "), expected);
@@ -3761,12 +3782,13 @@ composer_trailer_required_prefix = 1
             NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
         let expected = cyclops_proto::render_doorbell_v4(
             "implementer",
+            "reviewer",
             "Check the exact wrapped doorbell before submitting it to the recipient.",
             attempt,
         );
         let parts = [
-            "[cyclops from implementer] Check the exact wrapped doorbell before",
-            "submitting it to the recipient. | cyclops inbox claim",
+            "[cyclops from implementer to reviewer] Check the exact wrapped doorbell",
+            "before submitting it to the recipient. | cyclops inbox claim",
             "m-att_ASNFZ4mrTe-BI0VniavN7w",
         ];
         assert_eq!(parts.join(" "), expected);

@@ -204,7 +204,7 @@ ask for a review", and the implementer runs the command itself:
 $ cyclops send reviewer --subject "Burst path fix, ready for review" \
     --summary "The burst path fix is ready. Review gateway.rs before merging." \
     --body "gateway.rs:120. Tests pass."
-accepted m-be0129
+accepted cyc-3474be3a-cf9ff739
 ✓ accepted · wake queued
 ```
 
@@ -234,7 +234,7 @@ Reply: cyclops reply m-be0129 --summary "First sentence. Second sentence." --bod
 $ cyclops reply m-be0129 \
     --summary "The fix is approved with one nit. Check the retry path before merging." \
     --body "Approved. One nit in the retry path."
-accepted m-a94c10
+accepted cyc-3474be3a-cf9ff739
 ```
 
 A claim is atomic and recipient-authenticated. Repeating it returns the same

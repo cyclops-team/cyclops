@@ -16,8 +16,13 @@ outcomes from authoritative state instead of guessing or retrying blindly.
 
 Examples show current protocol shapes. Additive optional fields may be omitted
 when they are not relevant to the behavior being explained.
-Message ids are abbreviated for readability. Newly minted ids use `m-`
-followed by all 32 lowercase hexadecimal UUID digits.
+Message ids are abbreviated for readability. Newly minted ids are
+`cyc-<thread>-<message>`, two runs of eight lowercase hex characters: every
+message in one thread shares the `<thread>` run and gets its own `<message>`
+run, so the id alone says which conversation a message belongs to. Journals an
+older daemon wrote hold `m-` plus 32 lowercase hex characters; those ids still
+parse, replay, and can be replied to, and their replies share one `<thread>`
+run derived from the legacy root.
 
 ## Talk to it
 
@@ -125,6 +130,7 @@ alphabet.
 | `msg.reply` | Reply using routing and subject derived from a visible message |
 | `inbox.list` | List pending mailbox metadata without bodies |
 | `inbox.claim` | Atomically claim one message and return its payload |
+| `msg.read` | The operator reads one message, body included, without claiming it |
 | `messages.snapshot` | Read body-free inbox, outbound, and notification state |
 | `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
@@ -394,8 +400,13 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
     "body":"gateway.rs:120 drops the burst path"}}
 <- {"id":4,"result":{"deliveries":[{"notification_state":"queued",
     "state":"queued","to":"reviewer"}],"inserted":true,
-    "msg_id":"m-7fe0df","seq":7}}
+    "msg_id":"cyc-7fe0df31-a41c02e9","seq":7,
+    "thread_root":"cyc-7fe0df31-a41c02e9"}}
 ```
+
+`thread_root` is additive: the message itself for a new thread, the parent's
+root for a `reply_to` send, a `msg.reply`, or a replacement. A message inside
+a thread shares the root's `<thread>` run and mints a fresh `<message>` run.
 
 `to` takes several labels, or `"*"` for every named pane. Interactive clients
 may instead send `to: []` with `recipient_keys`, an array of exact durable
@@ -405,9 +416,11 @@ and the daemon snapshots their current labels only for display. A rename cannot
 retarget a selected key. `reply_to` derives its recipient from the referenced
 message and therefore permits neither selector.
 
-`summary` is optional. When present it must be one non-empty line of at most
-240 characters with no control characters; the daemon validates it before
-acceptance and includes it in the semantic request digest. When absent the
+`summary` is optional. When present it must be one non-empty line with no
+control characters; there is no length cap, because the pane shows one row
+and a long summary simply wraps, but the CLI warns the sender above 160
+characters. The daemon validates the line before acceptance and includes it
+in the semantic request digest. When absent the
 daemon derives one from the subject (the body's first line only when the
 subject is blank), cut to 200 characters. Other optional params are `fyi`
 (an announcement), `client_key` (sender-scoped exact-retry key), `supersedes`
@@ -483,13 +496,17 @@ For a non-admin recipient the daemon writes one doorbell line, recorded as
 `doorbell_format: 4` on the `writing` fact:
 
 ```text
-[cyclops from implementer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer to reviewer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The 22-character URL-safe token encodes the complete 128-bit notification
-attempt id. The `m-att_` namespace is reserved for this locator and is disjoint
-from production message ids, which are always `m-` plus 32 lowercase hex
-characters. Only the daemon's `inbox.claim` handler interprets the locator;
+The header names the sender and the recipients from the immutable acceptance
+presentation. Up to three recipients are joined by `, `; beyond three the
+header reads `<first>, <second>, +N`; a broadcast to every agent (`"*"`)
+reads `to all`. The `m-att_` locator's 22-character URL-safe token encodes
+the complete 128-bit notification attempt id. That namespace is reserved for
+the locator and is disjoint from every minted message id (`cyc-...`, or the
+legacy `m-` plus 32 lowercase hex characters). Only the daemon's `inbox.claim`
+and `msg.read` handlers interpret the locator;
 other message-id consumers do not. It resolves only the current attempt for
 that exact authenticated recipient and appends the claim under the same store
 lock. A delayed command for a replaced attempt cannot claim its replacement.
@@ -507,9 +524,11 @@ The wire states are `not_started`, `queued`, `gating`, `writing`, `submitted`,
 `submitted_unverified`, `notified`, `attention_required`, and `superseded`.
 `staged` appears only when reading a journal an older daemon wrote. A
 `blocked_pre_write` attempt reads `gating` with `pre_write_cause` set; a
-withdrawn one reads `not_started` with `notification_settlement` set. A
-doorbell claim settles the mailbox body without withdrawing a queued doorbell;
-a claim after Enter is the receipt and settles the attempt as `notified`.
+withdrawn one reads `not_started` with `notification_settlement` set. A claim
+while the attempt is `queued`, `gating`, or `blocked_pre_write` withdraws it
+with `pre_write_cause: "claimed_before_write"` and nothing is written to the
+pane; a claim after Enter is the receipt and settles the attempt as
+`notified`.
 `submitted_unverified` means Enter was pressed once after a paste whose row
 did not read back exactly; it is never pressed again. `attention_required` is
 written only for a physical write failure (`paste_failed`, `submit_failed`,
@@ -597,11 +616,40 @@ literal message claim. No other method interprets the reserved locator.
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
 `message_not_pending`; a subscribed receive client should list again within
-its original deadline. Claiming the mailbox body does not withdraw the
-independent doorbell: a claim before the write leaves the queued doorbell in
-place and the worker still writes it, while a claim after Enter is the
-receipt and settles the attempt as `notified`. A claim proves retrieval, not
-task completion.
+its original deadline. A claim before the write boundary withdraws the
+doorbell: the recipient already holds the body, so an attempt still `queued`,
+`gating`, or `blocked_pre_write` settles as `withdrawn` with
+`pre_write_cause: "claimed_before_write"`, the worker stops at its pre-write
+check, and no pane bytes are written. A claim after Enter is the receipt and
+settles the attempt as `notified`. A claim proves retrieval, not task
+completion.
+
+### msg.read
+
+The operator's read of one message, body included, with no claim and no
+journal append. Served only to the admin origin (a same-user shell outside
+every watched pane, or a shell with no agent-vendor ancestor); any agent
+caller, the message's own recipient and sender included, gets error code
+`forbidden` with message `bodies reach an agent only through a claim` before
+the message is looked up. The result is the same `InboxMessage` shape
+`inbox.claim` returns, with `thread_root` and every recipient label in
+`recipient_label`. The reserved `m-att_` locator from a doorbell line resolves
+to its message.
+
+```text
+-> {"id":7,"method":"msg.read","params":{"message_id":"cyc-7fe0df31-a41c02e9"}}
+<- {"id":7,"result":{"body":"gateway.rs:120 drops the burst path","kind":"msg",
+    "message_id":"cyc-7fe0df31-a41c02e9",
+    "recipient_label":"reviewer",
+    "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
+    "sender_label":"admin",
+    "subject":"Review the rate limiter",
+    "summary":"The rate limiter is ready for review.",
+    "thread_root":"cyc-7fe0df31-a41c02e9"}}
+```
+
+The message stays pending for its recipient; the recipient's later claim is a
+fresh claim.
 
 `messages.snapshot` returns one atomic body-free projection for the
 authenticated caller. Agents see only messages they sent or received. The

@@ -29,7 +29,7 @@ second place, that is the bug: this page is where they live.
 
 What breaks: a pane whose agent exited is still a pane, and what is sitting
 in it is a shell. Paste text into a shell and press Enter, and the shell
-runs it. A doorbell line reads `[cyclops from reviewer] ... | cyclops inbox
+runs it. A doorbell line reads `[cyclops from reviewer to implementer] ... | cyclops inbox
 claim m-att_...`, which is a command line. Every other delivery failure can
 be fixed by sending again; this one cannot be taken back.
 
@@ -276,7 +276,9 @@ The line to keep straight: message subjects and bodies DO enter the
 workspace journal. Those are what a person deliberately sent, and recording
 them is the point. The rule is about what Cyclops reads off a screen on its
 own. The body's own boundary is rule 1's cousin: a body reaches a pane only
-through `--raw`, and reaches a reader only through an authenticated claim.
+through `--raw`, an agent only through an authenticated claim, and the
+operator through `msg.read`, which is served to the admin origin alone and
+refuses every agent caller with `forbidden`.
 
 - Enforced at: `src/cyclops-proto/src/ledger.rs` (schema and the rule);
   `src/cyclops-proto/src/notification.rs`, whose facts have no field a
@@ -287,7 +289,8 @@ through `--raw`, and reaches a reader only through an authenticated claim.
   `src/cyclopsd/tests/messaging/messaging_coordinator.rs`,
   `private_body_shapes_never_reach_the_notification_pane`;
   `src/cyclopsd/tests/messaging/body_privacy.rs`,
-  `history_and_thread_release_bodies_only_after_the_exact_claim`.
+  `history_and_thread_release_bodies_only_after_the_exact_claim` and
+  `the_operator_reads_a_body_without_claiming_and_an_agent_is_refused`.
 
 ## 7. The record appends, it does not retract
 

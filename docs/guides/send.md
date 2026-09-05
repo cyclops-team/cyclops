@@ -18,15 +18,23 @@ cyclops send <agent>[,<agent>...] --subject <s> [--summary <one line>] \
 $ cyclops send reviewer --subject "Review the rate limiter" \
     --summary "The rate limiter is ready for review." \
     --body "gateway.rs:120"
-accepted m-3f9c2a
+accepted cyc-3f9c2a1b-7d0e4f62
 ✓ accepted · wake queued
 ```
 
-Message ids are abbreviated in prose examples. The daemon emits `m-` followed
-by the full 32 lowercase hexadecimal UUID digits.
+Message ids are `cyc-<thread>-<message>`: two runs of eight lowercase hex
+characters. Every message in one thread shares the `<thread>` run and gets
+its own `<message>` run, so the id alone says which conversation a message
+belongs to. A reply's receipt names the thread it joined
+(`accepted cyc-3f9c2a1b-c91a55e0 · thread cyc-3f9c2a1b-7d0e4f62`), and
+`cyclops thread <id>` lists the thread in order with each message's part.
+Journals an older daemon wrote hold `m-` plus 32 lowercase hex characters;
+those ids still work.
 
-`--summary` is optional. When you give one it must be one non-empty line of
-at most 240 characters. When you omit it the daemon derives the preview from
+`--summary` is optional. When you give one it must be one non-empty line.
+There is no length cap, but the pane shows one row, so the CLI warns above
+160 characters (`summary is <n> characters; keep it short, the pane shows
+one line`); keep it under about 100. When you omit it the daemon derives the preview from
 the subject (the first line of the body only when the subject is blank), so a
 body never reaches a pane by accident. Use `--body-file -` for stdin,
 `--client-key <key>` for an exact retry, and `--fyi` for an announcement that
@@ -87,10 +95,12 @@ response. An incomplete acceptance envelope exits 1 in both modes.
 The doorbell is one line:
 
 ```text
-[cyclops from implementer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer to reviewer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The 22-character token identifies the exact current notification attempt.
+The header names the sender and the recipients: up to three names joined by
+`, `, then `<first>, <second>, +N`, and `to all` for a broadcast. The
+22-character token identifies the exact current notification attempt.
 The daemon atomically resolves that attempt to its message and claims it for
 the authenticated recipient. A narrow pane may visually soft-wrap the line
 across terminal rows; the readback joins those rows before comparing the
@@ -150,9 +160,10 @@ message, does not poll, and never writes to the terminal composer. Exit `2`
 means no pending message arrived before the deadline. With `--json`, that
 outcome is a `timeout` object with `data.pending: false`. Every failure in JSON
 mode is one object on stdout with stable `code`, `message`, and `data` fields.
-Claiming through this socket command does not cancel the independent doorbell:
-a claim before the write leaves it queued and the worker still writes it, and
-a claim after Enter is the receipt.
+Claiming through this socket command settles the doorbell too: a claim before
+the write withdraws it (the attempt reads `withdrawn`, cause
+`claimed_before_write`, and nothing is written to the pane), and a claim
+after Enter is the receipt.
 
 To wait for one durable sender, copy its canonical `sender` key from
 `cyclops inbox list --json` and pass it to `--from`. Labels such as
@@ -195,9 +206,9 @@ cyclops reply [<message-id> | <m-att_...>] [--last] [--summary <one line>] \
 ```
 
 ```console
-$ cyclops reply m-3f9c2a \
+$ cyclops reply cyc-3f9c2a1b-7d0e4f62 \
     --body "Reviewed. One issue in the retry path."
-accepted m-a912ef
+accepted cyc-3f9c2a1b-a912ef05 · thread cyc-3f9c2a1b-7d0e4f62
 ```
 
 Use a reply or another explicit workflow fact when completion must be durable.
@@ -206,7 +217,8 @@ Pane state cannot prove which message a turn handled.
 Do not run a polling loop to approximate mailbox delivery. Return to the prompt
 for the normal human-visible doorbell. Use bounded `inbox next` only when an
 automation genuinely needs to wait for and claim the durable body over the
-socket; that claim does not replace or cancel the doorbell.
+socket; a claim before the doorbell is written withdraws it, and a claim
+after Enter is its receipt.
 
 ## The admin inbox
 
@@ -217,7 +229,7 @@ An agent can send to it normally:
 $ cyclops send admin --subject "Review needed" \
     --summary "A notification attempt needs a human before requeueing." \
     --body "Attempt n-42 needs attention."
-accepted m-c82d11
+accepted cyc-c82d11f3-6b9a0e44
 ✓ accepted · wake not started
 ```
 

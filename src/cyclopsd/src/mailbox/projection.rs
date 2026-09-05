@@ -33,6 +33,8 @@ pub struct MessageDraft {
     pub presentation: MessagePresentation,
     /// The sender asked for a raw write.
     pub raw: bool,
+    /// The sender addressed every agent (`*`); the doorbell reads `to all`.
+    pub broadcast: bool,
 }
 
 /// One active composer barrier with the durable message and mailbox facts
@@ -82,6 +84,7 @@ pub(crate) struct CanonicalDraft {
     pub(crate) supersedes: Option<MessageId>,
     pub(crate) presentation: MessagePresentation,
     pub(crate) raw: bool,
+    pub(crate) broadcast: bool,
 }
 
 /// Result of pre-append idempotency verification.
@@ -97,6 +100,9 @@ pub enum AcceptanceOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptResult {
     pub message_id: MessageId,
+    /// The thread the message belongs to: itself for a root, the parent's
+    /// root for a reply or a replacement.
+    pub thread_root: MessageId,
     pub inserted: bool,
     pub seq: u64,
     pub recipients: Vec<String>,
@@ -569,6 +575,23 @@ pub(crate) fn notification_transition_allowed(
             && record.state == NotificationState::Staged
             && next == NotificationState::Submitted
             && uses_legacy_notification_write_contract(record))
+        || (replaying
+            && withdrawn_by_claim_before_write(record)
+            && matches!(
+                next,
+                NotificationState::Gating
+                    | NotificationState::BlockedPreWrite
+                    | NotificationState::Writing
+            ))
+}
+
+/// A claim before the write boundary withdraws the doorbell. Older daemons
+/// did not withdraw it and went on to write, so their journals carry the
+/// claim followed by the write; replay admits that history from the state
+/// the claim now projects, and the write's own facts then say what happened.
+pub(crate) fn withdrawn_by_claim_before_write(record: &NotificationRecord) -> bool {
+    record.state == NotificationState::Withdrawn
+        && record.pre_write_cause == Some(NotificationPreWriteCause::ClaimedBeforeWrite)
 }
 
 pub(crate) fn notification_pre_write_width_block(
@@ -822,7 +845,7 @@ impl MailboxProjection {
             Some("notification_cleared") => self.prepare_notification_clear(line),
             Some("notifications_cleared") => self.prepare_notification_clears(line),
             Some("notification_withdrawn_before_write") => {
-                self.prepare_notification_withdrawal(line)
+                self.prepare_notification_withdrawal(line, replaying)
             }
             Some("notification_resolution_intent") => {
                 self.prepare_notification_resolution_intent(line)
@@ -1158,6 +1181,11 @@ impl MailboxProjection {
                 if state == current.state {
                     return None;
                 }
+                // The doorbell was never written: the claim is why. The
+                // retired direct payload keeps its cause-free legacy row.
+                let pre_write_cause = (state == NotificationState::Withdrawn
+                    && current.transport != NotificationTransport::DirectPayload)
+                    .then_some(NotificationPreWriteCause::ClaimedBeforeWrite);
                 Some(Box::new(NotificationProjectionUpdate {
                     key: (recipient, message_id.clone()),
                     record: NotificationRecord {
@@ -1175,7 +1203,7 @@ impl MailboxProjection {
                         cause: None,
                         verified_by: None,
                         verify_outcome: None,
-                        pre_write_cause: None,
+                        pre_write_cause,
                         wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: current.pre_write_reopen_count,
@@ -1917,6 +1945,7 @@ impl MailboxProjection {
     pub(crate) fn prepare_notification_withdrawal(
         &self,
         line: &LedgerLine,
+        replaying: bool,
     ) -> Result<PreparedMutation, MailboxError> {
         let fact: NotificationFact = serde_json::from_value(
             line.data
@@ -2003,7 +2032,12 @@ impl MailboxProjection {
                 found: attempt_id,
             });
         }
-        if !current.state.can_withdraw_before_write() {
+        // An older daemon let an operator withdraw an attempt the recipient
+        // had already claimed; that attempt now projects as withdrawn by the
+        // claim, and its journal still replays.
+        if !current.state.can_withdraw_before_write()
+            && !(replaying && withdrawn_by_claim_before_write(current))
+        {
             return Err(MailboxError::NotificationWithdrawalRequiresPreWrite);
         }
         Ok(PreparedMutation::NotificationWithdrawnBeforeWrite {
@@ -4231,6 +4265,34 @@ pub(crate) fn inbox_message(
     })
 }
 
+/// The operator's view of one message, body included: the same shape a
+/// claim returns, with every recipient label in `recipient_label`. Reading
+/// it claims nothing and appends nothing.
+pub(crate) fn operator_message(line: &LedgerLine) -> Result<InboxMessage, MailboxError> {
+    let metadata = extract_message_metadata(line)?;
+    let recipient_label = Some(
+        metadata
+            .presentation
+            .recipient_labels
+            .iter()
+            .map(|presentation| presentation.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(InboxMessage {
+        message_id: MessageId::new(&line.id)?,
+        kind: line.kind,
+        recipient_label,
+        sender: Some(metadata.sender),
+        sender_label: metadata.presentation.sender_label,
+        subject: line.subject.clone(),
+        summary: metadata.summary,
+        body: line.body.clone(),
+        reply_to: line.reply_to.as_deref().map(MessageId::new).transpose()?,
+        thread_root: metadata.thread_root,
+    })
+}
+
 pub(crate) fn projection_allows_message_body(
     projection: &MailboxProjection,
     reader: RecipientKey,
@@ -4268,8 +4330,4 @@ pub(crate) fn projection_allows_message_body(
                         MailboxEntryState::Pending | MailboxEntryState::Superseded { .. } => false,
                     })
         })
-}
-
-pub(crate) fn mint_message_id() -> MessageId {
-    MessageId::new(format!("m-{}", uuid::Uuid::new_v4().simple())).expect("UUID message id")
 }

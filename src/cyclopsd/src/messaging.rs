@@ -1076,6 +1076,16 @@ impl WorkspaceMessaging {
         self.finish_claim(claimant, outcome)
     }
 
+    /// The operator's read of one message, body included. No claim, no
+    /// state change, no journal append: one read of the projection.
+    pub(crate) fn read_message(
+        &self,
+        reader: RecipientKey,
+        message_id: MessageId,
+    ) -> Result<cyclops_proto::InboxMessage, MailboxServiceError> {
+        self.service.read_message(reader, message_id)
+    }
+
     fn finish_claim(
         &self,
         claimant: RecipientKey,
@@ -1530,6 +1540,7 @@ impl WorkspaceMessaging {
         .await?;
         Ok(MsgSendResult {
             msg_id: accepted.message_id.to_string(),
+            thread_root: Some(accepted.thread_root.clone()),
             seq: accepted.seq,
             deliveries: dispositions
                 .into_iter()
@@ -3250,7 +3261,7 @@ mod tests {}
     }
 
     #[test]
-    fn workspace_messaging_prewrite_preserves_claims_and_classifies_obsolete_work() {
+    fn workspace_messaging_prewrite_after_a_claim_is_obsolete_work() {
         let (_scratch, service, events, reviewer, _) =
             mailbox_service("workspace-messaging-prewrite-claim", 8);
         let effects = Arc::new(RecordingEffects::new(events));
@@ -3266,7 +3277,9 @@ mod tests {}
             generation: 1,
         };
 
-        assert!(matches!(
+        // The claim withdrew the gating doorbell, so the pre-write block the
+        // worker records afterwards is obsolete work, not a new fact.
+        assert_eq!(
             messaging
                 .record_notification_prewrite_block(
                     &context,
@@ -3277,12 +3290,12 @@ mod tests {}
                     "%3",
                 )
                 .unwrap(),
-            MessagingPreWriteBlockOutcome::Recorded(_)
-        ));
+            MessagingPreWriteBlockOutcome::Obsolete
+        );
         assert_eq!(
             service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
-            Some(NotificationState::BlockedPreWrite),
-            "a body claim does not retire the operator-visible notification"
+            Some(NotificationState::Withdrawn),
+            "a claim before the write withdraws the doorbell"
         );
         messaging
             .withdraw_notification(service.admin().key, reviewer, context.attempt_id())

@@ -3112,7 +3112,9 @@ fn thread_plain_renders_messages_with_bodies() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = "\x20 Jul 20 2025  codex → reviewer  Review the rate limiter      ✔ delivered · verified\n\
+    // Legacy ids have no `<message>` part, so the index names them whole.
+    let expected = "thread m-aaa · m-aaa → m-ccc\n\
+                    \x20 Jul 20 2025  codex → reviewer  Review the rate limiter      ✔ delivered · verified\n\
                     \x20              gateway.rs:120\n\
                     \n\
                     \x20 Jul 22 2025  reviewer → codex  Re: Review the rate limiter  ✔ delivered · verified\n\

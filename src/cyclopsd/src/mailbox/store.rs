@@ -122,8 +122,25 @@ impl MessageStore {
             supersedes: draft.supersedes,
             presentation: draft.presentation,
             raw: draft.raw,
+            broadcast: draft.broadcast,
         };
         self.accept_canonical_at(message_id, draft, ts)
+    }
+
+    /// Mint the id of a message that starts a thread (`thread_root` None)
+    /// or joins one: a `cyc-<thread>-<message>` id whose `<thread>` run is
+    /// the root's. Re-minted on the vanishingly rare collision so an id
+    /// never names two messages in one journal.
+    pub(crate) fn mint_message_id(&self, thread_root: Option<&MessageId>) -> MessageId {
+        loop {
+            let candidate = match thread_root {
+                Some(root) => MessageId::mint_in_thread(root),
+                None => MessageId::mint_root(),
+            };
+            if self.projection.get_message(&candidate).is_none() {
+                return candidate;
+            }
+        }
     }
 
     /// Accept a reply using routing and subject derived from the referenced message.
@@ -162,6 +179,7 @@ impl MessageStore {
                 }],
             },
             raw: draft.raw,
+            broadcast: false,
         };
         self.accept_canonical_at(message_id, canonical, ts)
     }
@@ -178,12 +196,14 @@ impl MessageStore {
                     .projection
                     .get_message(&existing)
                     .expect("idempotency index retains its message");
+                let metadata = extract_message_metadata(message)?;
                 return Ok(AcceptResult {
                     message_id: existing,
+                    thread_root: metadata.thread_root,
                     inserted: false,
                     seq: message.seq,
                     recipients: message.to.clone(),
-                    recipient_keys: extract_message_metadata(message)?.recipients,
+                    recipient_keys: metadata.recipients,
                 });
             }
             AcceptanceOutcome::New { request_digest } => request_digest,
@@ -210,11 +230,12 @@ impl MessageStore {
             recipients: draft.recipients.clone(),
             presentation: draft.presentation.clone(),
             summary: draft.summary.clone(),
-            thread_root,
+            thread_root: thread_root.clone(),
             client_key: draft.client_key.clone(),
             request_digest,
             supersedes: draft.supersedes.clone(),
             raw: draft.raw,
+            broadcast: draft.broadcast,
         };
         let (_, recipient_labels) = presentation_labels(&draft.recipients, &draft.presentation)?;
         let recipient_keys = metadata.recipients.clone();
@@ -240,6 +261,7 @@ impl MessageStore {
         self.projection.commit_line(persisted, prepared);
         Ok(AcceptResult {
             message_id,
+            thread_root,
             inserted: true,
             seq,
             recipients,
@@ -945,10 +967,17 @@ impl MessageStore {
         if operator != RecipientKey::admin(self.projection.workspace_id()) {
             return Err(MailboxError::NotificationWithdrawalOperatorInvalid.into());
         }
+        // Already withdrawn, by an operator or by the recipient's own claim
+        // before the write: nothing was written and nothing will be, which
+        // is what the operator asked for. Answer with the record, append
+        // nothing.
         if self
             .projection
             .notification_by_attempt(attempt_id)
-            .is_some_and(|record| record.state == NotificationState::WithdrawnByOperator)
+            .is_some_and(|record| {
+                record.state == NotificationState::WithdrawnByOperator
+                    || withdrawn_by_claim_before_write(record)
+            })
         {
             let current = self
                 .projection

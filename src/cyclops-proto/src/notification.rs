@@ -215,9 +215,12 @@ impl NotificationState {
 
     /// Settle notification work after the exact recipient claims the message.
     ///
-    /// Mailbox retrieval and the operator-visible doorbell are independent.
-    /// A proven submitted doorbell is consumed, but this does not prove task
-    /// completion. Only legacy direct payload work is withdrawn before write.
+    /// A claim before the write boundary withdraws the wake: the recipient
+    /// already holds the body, so the doorbell has nothing left to announce
+    /// and the pane is never touched (cause `claimed_before_write`). A
+    /// doorbell already past Enter is consumed by the claim and settles as
+    /// `notified`; that proves receipt, not task completion. An attempt in
+    /// the middle of its write keeps going and is receipted afterwards.
     pub fn settled_by_claim(self, transport: NotificationTransport) -> Self {
         use NotificationState::*;
 
@@ -226,6 +229,7 @@ impl NotificationState {
                 Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved,
                 NotificationTransport::DirectPayload,
             ) => Withdrawn,
+            (Queued | Gating | BlockedPreWrite, NotificationTransport::Doorbell) => Withdrawn,
             (Submitted | SubmittedUnverified, NotificationTransport::Doorbell) => Notified,
             _ => self,
         }
@@ -278,6 +282,10 @@ pub enum NotificationPreWriteCause {
     ComposerOwnershipUnproven,
     /// The delivery worker exited twice before any terminal write.
     WorkerFailed,
+    /// The recipient claimed the message over the socket before the doorbell
+    /// was written, so the wake had nothing left to announce. The attempt
+    /// settles as `withdrawn` and no pane bytes are written.
+    ClaimedBeforeWrite,
 }
 
 impl NotificationPreWriteCause {
@@ -295,6 +303,7 @@ impl NotificationPreWriteCause {
             Self::ComposerSemanticMissing => "composer_semantic_missing",
             Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
             Self::WorkerFailed => "worker_failed",
+            Self::ClaimedBeforeWrite => "claimed_before_write",
         }
     }
 
@@ -312,6 +321,7 @@ impl NotificationPreWriteCause {
             Self::ComposerSemanticMissing => "composer ownership rule missing",
             Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
             Self::WorkerFailed => "worker failed",
+            Self::ClaimedBeforeWrite => "claimed before write",
         }
     }
 }
@@ -961,16 +971,41 @@ pub fn render_doorbell_v3(attempt_id: NotificationAttemptId) -> String {
     )
 }
 
-/// Rebuild the sender-named summary and exact-attempt notification format 4.
+/// Rebuild the sender-and-recipients header, summary, and exact-attempt
+/// notification format 4:
+///
+/// ```text
+/// [cyclops from <sender> to <recipients>] <summary> | cyclops inbox claim m-att_...
+/// ```
+///
+/// `recipients` is what [`render_recipient_list`] produced for the message.
 pub fn render_doorbell_v4(
     sender_label: &str,
+    recipients: &str,
     summary: &str,
     attempt_id: NotificationAttemptId,
 ) -> String {
     format!(
-        "[cyclops from {sender_label}] {summary} | {}",
+        "[cyclops from {sender_label} to {recipients}] {summary} | {}",
         render_doorbell_v3(attempt_id)
     )
+}
+
+/// The `to` half of a doorbell header: the recipient labels joined by `, `
+/// for up to three names, `<first>, <second>, +N` beyond that, and `all`
+/// for a broadcast to every agent.
+pub fn render_recipient_list<S: AsRef<str>>(labels: &[S], broadcast: bool) -> String {
+    if broadcast {
+        return "all".to_string();
+    }
+    let labels: Vec<&str> = labels.iter().map(AsRef::as_ref).collect();
+    match labels.as_slice() {
+        [] => "nobody".to_string(),
+        [first, second, rest @ ..] if rest.len() > 1 => {
+            format!("{first}, {second}, +{}", rest.len())
+        }
+        named => named.join(", "),
+    }
 }
 
 /// Parse the exact message and attempt identities carried by doorbell v2.
@@ -1039,9 +1074,10 @@ fn parse_notification_attempt_token(encoded: &str) -> Option<NotificationAttempt
 
 /// Build the canonical message-shaped locator understood by `inbox.claim`.
 ///
-/// Production message ids are `m-` plus 32 lowercase hex characters. The
-/// reserved `m-att_` prefix is therefore disjoint from every minted id while
-/// remaining valid input for older positional claim clients.
+/// Minted message ids are `cyc-<thread>-<message>` (legacy journals hold
+/// `m-` plus 32 lowercase hex characters). The reserved `m-att_` prefix is
+/// therefore disjoint from every minted id while remaining valid input for
+/// older positional claim clients.
 pub fn notification_attempt_claim_locator(attempt_id: NotificationAttemptId) -> MessageId {
     MessageId::new(format!(
         "{NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX}{}",
@@ -1361,16 +1397,21 @@ mod tests {
     }
 
     #[test]
-    fn claim_settlement_preserves_operator_doorbells_but_withdraws_direct_payloads() {
+    fn claim_settlement_withdraws_unwritten_doorbells_and_direct_payloads() {
         use NotificationState::*;
 
-        for state in [
-            Queued,
-            Gating,
-            BlockedPreWrite,
-            QuotaHeld,
-            QuotaResetObserved,
-        ] {
+        for state in [Queued, Gating, BlockedPreWrite] {
+            assert_eq!(
+                state.settled_by_claim(NotificationTransport::Doorbell),
+                Withdrawn
+            );
+            assert_eq!(
+                state.settled_by_claim(NotificationTransport::DirectPayload),
+                Withdrawn
+            );
+        }
+        // Replay-only quota states keep their operator-visible phase.
+        for state in [QuotaHeld, QuotaResetObserved] {
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::Doorbell),
                 state
@@ -2054,6 +2095,58 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<NotificationFact>(value).unwrap(),
             fact
+        );
+    }
+
+    #[test]
+    fn doorbell_v4_names_the_sender_and_the_recipients() {
+        let attempt =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        assert_eq!(
+            render_doorbell_v4("implementer", "reviewer", "Ready for review.", attempt),
+            "[cyclops from implementer to reviewer] Ready for review. | cyclops inbox claim m-att_ASNFZ4mrTe-BI0VniavN7w"
+        );
+        assert_eq!(
+            render_doorbell_v4("admin", "all", "Standup in five.", attempt),
+            "[cyclops from admin to all] Standup in five. | cyclops inbox claim m-att_ASNFZ4mrTe-BI0VniavN7w"
+        );
+        assert_eq!(
+            parse_doorbell_v3(&render_doorbell_v3(attempt)),
+            Some(attempt)
+        );
+    }
+
+    #[test]
+    fn recipient_list_joins_up_to_three_names_then_counts_the_rest() {
+        assert_eq!(render_recipient_list(&["reviewer"], false), "reviewer");
+        assert_eq!(
+            render_recipient_list(&["reviewer", "implementer"], false),
+            "reviewer, implementer"
+        );
+        assert_eq!(render_recipient_list(&["a", "b", "c"], false), "a, b, c");
+        assert_eq!(
+            render_recipient_list(&["a", "b", "c", "d"], false),
+            "a, b, +2"
+        );
+        assert_eq!(
+            render_recipient_list(&["a", "b", "c", "d", "e", "f"], false),
+            "a, b, +4"
+        );
+        assert_eq!(render_recipient_list(&["a", "b", "c", "d"], true), "all");
+        assert_eq!(render_recipient_list::<&str>(&[], false), "nobody");
+    }
+
+    #[test]
+    fn the_claimed_before_write_cause_has_a_stable_wire_name() {
+        let cause = NotificationPreWriteCause::ClaimedBeforeWrite;
+        assert_eq!(cause.wire_name(), "claimed_before_write");
+        assert_eq!(
+            serde_json::to_value(cause).unwrap(),
+            serde_json::Value::String("claimed_before_write".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<NotificationPreWriteCause>(r#""claimed_before_write""#).unwrap(),
+            cause
         );
     }
 }

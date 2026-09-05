@@ -40,7 +40,8 @@ flowchart TD
    response proves durable acceptance and nothing else. A summary the
    sender did not supply is derived from the subject (the body's first line
    only when the subject is blank), cut to one line of at most 200
-   characters; a supplied summary is one non-empty line of at most 240.
+   characters; a supplied summary is one non-empty line with no length cap
+   (the CLI warns the sender above 160 characters).
 2. **Queue.** One worker per durable recipient; notifications to one mailbox
    are strictly FIFO. Broadcast is one message row with one entry and one
    notification record per recipient. A worker retires when its queue
@@ -129,9 +130,13 @@ For a non-admin recipient the daemon writes one row, the only format it
 writes now:
 
 ```text
-[cyclops from implementer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer to reviewer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
+The header names the sender and the recipients from the message's immutable
+presentation (`render_recipient_list` in `cyclops-proto`): up to three
+recipient labels joined by `, `, then `<first>, <second>, +N`, and `to all`
+for a broadcast to every agent. The format number stays 4.
 The 22-character token encodes the complete 128-bit notification attempt id
 under the reserved `m-att_` namespace. The recipient runs the claim command
 and reads the body from the mailbox; the body never reaches the pane on this
@@ -140,9 +145,14 @@ the readback joins the wrapped rows before comparing. `admin` has no pane
 route, so an admin message is accepted and stays in the admin inbox with no
 attempt.
 
-Mailbox retrieval and the doorbell are independent. A socket claim before
-the write does not withdraw the queued doorbell; the worker still writes it.
-A claim after Enter settles the attempt as `notified`.
+A socket claim before the write boundary withdraws the doorbell. An attempt
+still `queued`, `gating`, or `blocked_pre_write` settles as `withdrawn` with
+cause `claimed_before_write` under the same store lock as the claim, the
+worker's next pre-write check (`entry_allows_notification`) finds the entry
+claimed and stops, and no pane bytes are written; the recipient's FIFO moves
+to its next pending message. A claim after Enter settles the attempt as
+`notified`. Journals an older daemon wrote, where the write followed the
+claim, replay through the withdrawn state.
 
 ## The raw transport
 

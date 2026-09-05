@@ -728,17 +728,17 @@ run "$CYC" read reviewer --source detection --plain
 check "the reviewer composer is write-ready" 'decided by .* · write-ready$'
 
 agent_command implementer "$N1" 'send reviewer --subject "Release notes review" --summary "Review the release notes. Confirm the mailbox contract." --body "Check the mailbox contract." --client-key parity-review --plain'
-check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
+check "acceptance is separate from notification" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "mailbox acceptance exits 0" 0
 REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer to reviewer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the recipient sees the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer to reviewer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
-REVIEW_LOCATOR="$(awk '/^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $NF; exit }' "$OUT")"
+REVIEW_LOCATOR="$(awk '/^❯ \[cyclops from implementer to reviewer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $NF; exit }' "$OUT")"
 [ -n "$REVIEW_LOCATOR" ] || { echo "!! exact attempt locator was not captured" >&2; exit 1; }
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
@@ -825,10 +825,10 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 # process up to a watched pane; nothing in the request can claim a sender.
 start_composer reviewer "$N2"
 agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --summary "Review the burst path fix. Check the passing tests." --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
-check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
+check "the handoff is accepted from the pane" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check_exit "the handoff exits 0" 0
 HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer\] Review the burst path fix\. Check the passing tests\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer to reviewer\] Review the burst path fix\. Check the passing tests\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the handoff doorbell to be submitted" 100 notification_crossed_submit "$HANDOFF"
 
 stop_composer reviewer "$N2"
@@ -840,16 +840,21 @@ check "the reviewer claims the handoff body" '^gateway\.rs:120\. Tests pass\.$'
 
 start_composer implementer "$N1"
 agent_command reviewer "$N2" "reply $HANDOFF --summary \"Approve the burst path fix. Note one retry issue.\" --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
-check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
+check "reply derives routing from the parent" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8} · thread cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check_exit "an accepted reply exits 0" 0
 REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ \[cyclops from reviewer\] Approve the burst path fix\. Note one retry issue\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ \[cyclops from reviewer to implementer\] Approve the burst path fix\. Note one retry issue\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the reply doorbell to be submitted" 100 notification_crossed_submit "$REPLY_ID"
 stop_composer implementer "$N1"
 agent_command implementer "$N1" "inbox claim $REPLY_ID --plain"
 check "the implementer claims the verdict" '^Approved\. One nit in the retry path\.$'
 
+# A reply's id carries its parent's <thread> run; only the <message> run is new.
+[ "${REPLY_ID:4:8}" = "${HANDOFF:4:8}" ] || { echo "!! reply $REPLY_ID does not share the thread part of $HANDOFF" >&2; exit 1; }
+[ "${REPLY_ID:13:8}" != "${HANDOFF:13:8}" ] || { echo "!! reply $REPLY_ID repeats the message part of $HANDOFF" >&2; exit 1; }
+
 agent_command reviewer "$N2" "thread $HANDOFF --plain"
+check "the thread index names each message part" "^thread $HANDOFF · ${HANDOFF:13:8} → ${REPLY_ID:13:8}\$"
 check "the thread holds the request"      '^ +[0-9]+s +implementer → reviewer +Burst path fix, ready for review'
 check "and the reply under it"            '^ +[0-9]+s +reviewer → implementer +Re: Burst path fix, ready for review'
 check "with the review verdict"           '^ +Approved\. One nit in the retry path\.$'
@@ -864,7 +869,7 @@ echo "#### The admin mailbox"
 
 # A pane agent can address admin, but admin has no pane and receives no wake.
 agent_command implementer "$N1" 'send admin --subject "Operator review" --summary "Review the release note. Respond with an operator decision." --body "The release note is ready." --client-key parity-admin --plain'
-check "admin is a durable recipient" '^accepted m-[[:xdigit:]]{32}$'
+check "admin is a durable recipient" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check "admin receives no pane wake" '^✓ accepted · wake not started$'
 check_exit "the admin send exits 0" 0
 ADMIN_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
@@ -1091,11 +1096,11 @@ duo_start_composer reviewer "$D2"
 
 printf '\n$ cyclops send reviewer --subject "hello" --summary "Review the greeting. Reply when ready."\n'
 duo_agent_command implementer "$D1" 'send reviewer --subject "hello" --summary "Review the greeting. Reply when ready." --client-key parity-duo --plain'
-check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
+check "the first message is accepted"     '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "and accepted send exits 0" 0
 DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ \[cyclops from implementer\] Review the greeting\. Reply when ready\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ \[cyclops from implementer to reviewer\] Review the greeting\. Reply when ready\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the second rig doorbell to be submitted" 100 duo_notification_crossed_submit "$DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
@@ -1257,14 +1262,14 @@ wait_for "the defaults daemon to bind reviewer" 100 stock_pane_bound_to "$S2" de
 stock_start_composer reviewer "$S2"
 
 stock_agent_command implementer "$S1" 'send reviewer --subject "bound hello" --summary "Review the bound greeting. Claim the private details." --body "private default body" --client-key parity-stock-bound --plain'
-check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
+check "the default bound send is accepted" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "the default bound send exits 0" 0
 STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ \[cyclops from implementer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ \[cyclops from implementer to reviewer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the default pane gets the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer to reviewer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.
@@ -1519,7 +1524,7 @@ wait_for "the installed daemon to bind reviewer" 100 installed_pane_bound_to "$I
 
 installed_agent_command implementer "$I1" \
   'send reviewer --subject "Installed handoff" --summary "Review the installed handoff. Reply when complete." --body "Installed pair reached durable messaging." --client-key parity-installed-handoff --plain'
-check "the installed send is durably accepted" '^accepted m-[[:xdigit:]]{32}$'
+check "the installed send is durably accepted" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check_exit "the installed send exits 0" 0
 INST_HANDOFF_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 [ -n "$INST_HANDOFF_ID" ] || { echo "!! installed handoff id was not captured" >&2; exit 1; }
@@ -1530,7 +1535,7 @@ check_exit "the installed claim exits 0" 0
 
 installed_agent_command reviewer "$I2" \
   "reply $INST_HANDOFF_ID --summary \"Confirm the installed handoff. Record the result.\" --body \"Installed handoff complete.\" --client-key parity-installed-reply --plain"
-check "the installed reply is durably accepted" '^accepted m-[[:xdigit:]]{32}$'
+check "the installed reply is durably accepted" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8} · thread cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
 check_exit "the installed reply exits 0" 0
 INST_REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 [ -n "$INST_REPLY_ID" ] || { echo "!! installed reply id was not captured" >&2; exit 1; }

@@ -3,6 +3,22 @@
 All notable changes to Cyclops v2. Format follows Keep a Changelog;
 versions are unreleased until admin cuts a tag.
 
+## [Unreleased]
+
+### Added
+- Thread-aware message ids `cyc-<thread>-<message>`: a root mints both eight-character hex runs; a reply, a `--reply-to` send, or a replacement reuses the parent's `<thread>` run. `MessageId::thread_part()` and `message_part()`; legacy `m-<hex32>` ids still parse and replay.
+- `msg.read`: the operator reads one message, body included, without claiming it. Served only to the admin origin; an agent caller gets `forbidden` (`bodies reach an agent only through a claim`).
+- `msg.send` and `msg.reply` results carry `thread_root`; the CLI receipt names the thread a reply joined (`accepted <id> · thread <root>`).
+- `cyclops thread <id>` is an everyday command and prints a thread index above the grid: the root id and each message's `<message>` part in order.
+
+### Changed
+- The doorbell header names the recipients: `[cyclops from <sender> to <recipients>] <summary> | cyclops inbox claim m-att_...`. Up to three names joined by `, `, then `<first>, <second>, +N`; a broadcast reads `to all`. Format number stays 4.
+- A claim over the socket while the doorbell is `queued`, `gating`, or `blocked_pre_write` withdraws it (cause `claimed_before_write`) and nothing is written to the pane; a claim after Enter still settles the attempt as `notified`.
+- Summaries have no length cap; the rule is one non-empty line. The CLI warns once on stderr above 160 characters.
+
+### Removed
+- `MESSAGE_SUMMARY_MAX_CHARS` and the 240-character summary rejection on the daemon and the CLI.
+
 ## [1.0.2] - 2026-09-03
 
 ### Added

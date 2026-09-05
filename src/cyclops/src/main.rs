@@ -286,9 +286,10 @@ enum Cmd {
     #[command(hide = true)]
     History(HistoryArgs),
     /// One message with its replies and delivery record, oldest first.
-    #[command(hide = true)]
+    #[command(display_order = 5)]
     Thread {
-        /// Message id, e.g. m-3f9c2a.
+        /// Message id, e.g. cyc-1a2b3c4d-5e6f7a8b; the doorbell's m-att_
+        /// locator is not accepted here.
         id: String,
     },
     /// Wait for an agent to reach a state. Exit 0 when reached, 2 on
@@ -1937,6 +1938,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
+    warn_long_summary(summary.as_deref());
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -2013,7 +2015,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         } else {
             "already accepted"
         };
-        println!("{verb} {}", style.accent(&receipt.msg_id));
+        println!("{}", accepted_line(verb, &receipt, style));
     }
     println!("{}", render::render_receipts(&receipt.deliveries, style));
     for delivery in &receipt.deliveries {
@@ -2931,6 +2933,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
+    warn_long_summary(summary.as_deref());
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -3007,7 +3010,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     } else {
         "already accepted"
     };
-    println!("{verb} {}", style.accent(&result.msg_id));
+    println!("{}", accepted_line(verb, &result, style));
     if !result.deliveries.is_empty() {
         println!("{}", render::render_receipts(&result.deliveries, style));
     }
@@ -3642,11 +3645,70 @@ fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
         Ok(None) => return 0,
         Err(code) => return code,
     };
+    println!("{}", thread_index(id, &thread.lines, style));
     println!(
         "{}",
         render::render_thread(&thread.lines, style, render::now_ms())
     );
     0
+}
+
+/// The thread's ids in order, above the grid: the root id, then each
+/// message's `<message>` part (or its whole id when it predates the
+/// `cyc-<thread>-<message>` form), so a reader can name any message in
+/// the thread without scanning the record.
+fn thread_index(root: &str, lines: &[cyclops_proto::LedgerLine], style: &Style) -> String {
+    let parts: Vec<String> = lines
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.kind,
+                cyclops_proto::Kind::Msg | cyclops_proto::Kind::Fyi
+            )
+        })
+        .map(
+            |line| match cyclops_proto::MessageId::new(line.id.as_str()) {
+                Ok(id) => id.message_part().unwrap_or(id.as_str()).to_string(),
+                Err(_) => line.id.clone(),
+            },
+        )
+        .collect();
+    format!(
+        "thread {} {} {}",
+        style.accent(root),
+        style.dim("·"),
+        parts.join(" → ")
+    )
+}
+
+/// `accepted <id>`, and for a message inside an existing thread the root
+/// it joined: a reply's id already carries the thread part, and the root
+/// says which message started it.
+fn accepted_line(verb: &str, receipt: &MsgSendResult, style: &Style) -> String {
+    let mut line = format!("{verb} {}", style.accent(&receipt.msg_id));
+    if let Some(root) = receipt
+        .thread_root
+        .as_ref()
+        .filter(|root| root.as_str() != receipt.msg_id)
+    {
+        line.push_str(&format!(
+            " {} thread {}",
+            style.dim("·"),
+            style.accent(root.as_str())
+        ));
+    }
+    line
+}
+
+/// One stderr line when a summary runs long. The daemon takes any
+/// one-line summary; this is advice to the sender, not a refusal.
+fn warn_long_summary(summary: Option<&str>) {
+    if let Some(chars) = summary
+        .map(|summary| summary.chars().count())
+        .filter(|chars| *chars > copy::SUMMARY_LONG_CHARS)
+    {
+        eprintln!("{}", copy::summary_runs_long(chars));
+    }
 }
 
 /// Body from a file path, or stdin when the path is "-" (the v1 habit:
@@ -4178,6 +4240,7 @@ mod tests {
             visible,
             BTreeSet::from([
                 "clear", "commands", "health", "inbox", "reply", "send", "status", "stop",
+                "thread",
             ])
         );
     }
@@ -4280,6 +4343,82 @@ mod tests {
         };
         assert_eq!(args.supersedes.as_deref(), Some("m-old"));
         assert!(args.reply_to.is_none());
+    }
+
+    #[test]
+    fn the_receipt_names_the_thread_only_when_the_message_joined_one() {
+        let style = Style::none();
+        let root = MsgSendResult {
+            msg_id: "cyc-1a2b3c4d-5e6f7a8b".into(),
+            thread_root: Some(cyclops_proto::MessageId::new("cyc-1a2b3c4d-5e6f7a8b").unwrap()),
+            seq: 7,
+            deliveries: Vec::new(),
+            inserted: Some(true),
+        };
+        assert_eq!(
+            accepted_line("accepted", &root, &style),
+            "accepted cyc-1a2b3c4d-5e6f7a8b"
+        );
+        let reply = MsgSendResult {
+            msg_id: "cyc-1a2b3c4d-9c0d1e2f".into(),
+            ..root.clone()
+        };
+        assert_eq!(
+            accepted_line("accepted", &reply, &style),
+            "accepted cyc-1a2b3c4d-9c0d1e2f · thread cyc-1a2b3c4d-5e6f7a8b"
+        );
+        // An older daemon sends no thread root; the line is the old line.
+        let old = MsgSendResult {
+            thread_root: None,
+            ..reply
+        };
+        assert_eq!(
+            accepted_line("already accepted", &old, &style),
+            "already accepted cyc-1a2b3c4d-9c0d1e2f"
+        );
+    }
+
+    #[test]
+    fn the_thread_index_lists_each_message_part_in_order() {
+        let style = Style::none();
+        let line = |id: &str, kind: cyclops_proto::Kind| cyclops_proto::LedgerLine {
+            seq: 1,
+            boot_id: "boot".into(),
+            id: id.into(),
+            ts: 1,
+            kind,
+            from: "a".into(),
+            to: vec!["b".into()],
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        let lines = [
+            line("cyc-1a2b3c4d-5e6f7a8b", cyclops_proto::Kind::Msg),
+            line("cyc-1a2b3c4d-5e6f7a8b", cyclops_proto::Kind::State),
+            line("cyc-1a2b3c4d-9c0d1e2f", cyclops_proto::Kind::Fyi),
+            line(
+                "m-0123456789abcdef0123456789abcdef",
+                cyclops_proto::Kind::Msg,
+            ),
+        ];
+        assert_eq!(
+            thread_index("cyc-1a2b3c4d-5e6f7a8b", &lines, &style),
+            "thread cyc-1a2b3c4d-5e6f7a8b · 5e6f7a8b → 9c0d1e2f → m-0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_summary_runs_long_past_the_advice_threshold_only() {
+        assert_eq!(copy::SUMMARY_LONG_CHARS, 160);
+        assert_eq!(
+            copy::summary_runs_long(161),
+            "summary is 161 characters; keep it short, the pane shows one line"
+        );
+        // The daemon's rule is the only refusal: one non-empty line.
+        assert!(cyclops_proto::validate_message_summary(&"a".repeat(400)).is_ok());
     }
 
     #[test]

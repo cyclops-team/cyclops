@@ -165,9 +165,10 @@ pub(crate) fn select_attempt_payload(
     })
 }
 
-/// Format 4 for one message line: the recorded summary when the sender gave
-/// one, else the same derivation the accept path applies, so a message
-/// accepted before summaries existed still renders one exact row.
+/// Format 4 for one message line: the sender and the recipients from the
+/// immutable presentation, the recorded summary when the sender gave one,
+/// else the same derivation the accept path applies, so a message accepted
+/// before summaries existed still renders one exact row.
 fn render_summary_doorbell(
     message: &LedgerLine,
     attempt_id: NotificationAttemptId,
@@ -181,8 +182,18 @@ fn render_summary_doorbell(
             message.subject.as_deref().unwrap_or_default(),
         )
     })?;
+    let recipients = cyclops_proto::render_recipient_list(
+        &metadata
+            .presentation
+            .recipient_labels
+            .iter()
+            .map(|presentation| presentation.label.as_str())
+            .collect::<Vec<_>>(),
+        metadata.broadcast,
+    );
     Some(cyclops_proto::render_doorbell_v4(
         &metadata.presentation.sender_label,
+        &recipients,
         &summary,
         attempt_id,
     ))
