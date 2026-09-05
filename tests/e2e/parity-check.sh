@@ -146,7 +146,12 @@ cleanup() {
       if grep -aq '"notification' "$journal"; then
         echo
         echo "== $journal (notification facts, last 40):"
-        grep -a '"notification' "$journal" | tail -40 | cut -c1-400 | sed 's/^/   /'
+        grep -a '"notification' "$journal" | tail -40 \
+          | jq -c '{seq, kind, type: .data.type, state: .data.state, cause: .data.cause,
+                    pre_write_cause: .data.pre_write_cause, wake_block: .data.wake_block,
+                    transport: .data.transport, verified_by: .data.verified_by,
+                    observation: .data.pre_write_observation}' 2>/dev/null \
+          | sed 's/^/   /'
       fi
     done
     # Nested daemons write structured lifecycle events under their private
