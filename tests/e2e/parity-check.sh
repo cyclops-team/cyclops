@@ -139,6 +139,16 @@ cleanup() {
         tail -30 "$log" | sed 's/^/   /'
       fi
     done
+    # The mailbox journal is where a doorbell that never reached the pane
+    # says why: the last notification facts name the state and the hold
+    # cause the gate recorded.
+    find "${CYCLOPS_HOME:-/nonexistent}" -name '*.ndjson' 2>/dev/null | while read -r journal; do
+      if grep -aq '"notification' "$journal"; then
+        echo
+        echo "== $journal (notification facts, last 40):"
+        grep -a '"notification' "$journal" | tail -40 | cut -c1-400 | sed 's/^/   /'
+      fi
+    done
     # Nested daemons write structured lifecycle events under their private
     # homes; their launch redirection is still useful for an early process
     # failure. Show both when a nested journey fails.
