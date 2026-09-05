@@ -370,6 +370,7 @@ pub(super) async fn execute(
                 cyclops_ui::ChatAction::Reply => (KeyCode::Char('r'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Announce => (KeyCode::Char('a'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Open => (KeyCode::Enter, KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Body => (KeyCode::Char('b'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Scope => (KeyCode::Char('s'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Clear => (KeyCode::Char('c'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Sessions => (KeyCode::Char('t'), KeyModifiers::NONE),
@@ -380,6 +381,10 @@ pub(super) async fn execute(
             // the verbs that read the selection.
             app.messages_focused = true;
             super::handle_messages_key(app, KeyEvent::new(code, modifiers)).await?;
+            Ok(Outcome::default())
+        }
+        Action::ScrollMessages { lines } => {
+            super::scroll_messages(app, lines);
             Ok(Outcome::default())
         }
         Action::ClearPaneComposer { pane_id } => {
@@ -2044,6 +2049,15 @@ mod tests {
             message_detail_tx: None,
             message_detail_in_flight: None,
             messages_reconcile_owed: None,
+            messages_bodies: cyclops_ui::MessageBodies::default(),
+            message_body_tx: None,
+            messages_detail_revision: 0,
+            messages_timeline: None,
+            messages_scroll_top: None,
+            messages_viewport: cyclops_ui::ChatViewport::default(),
+            messages_filter_key: None,
+            pane_manifests: std::collections::HashMap::new(),
+            decoration_revision: 0,
         }
     }
 

@@ -21,8 +21,8 @@ use crate::theme::{self, Paint};
 
 /// One stream row: the entry it came from (for [`entry_row_style`]) and
 /// the plain line(s) `cyclops watch`'s follow mode would print for it
-/// ([`Entry::lines`], comfortable density — a message's body hangs its
-/// first line under the subject there too).
+/// ([`Entry::lines`]). Body-free: a resting row never owns a body, and
+/// only an authenticated detail read shows one.
 pub struct EventRow<'a> {
     pub entry: &'a Entry,
     pub lines: Vec<String>,

@@ -216,9 +216,21 @@ inspect messaging there.
 
 The Messages pane uses the same card language as agent panes: a complete
 muted border at rest and a double accent border while it has keyboard focus.
+A click anywhere inside the pane gives it the keyboard, the way a click on an
+agent pane gives that pane the keyboard; a click on a message row also
+selects that row, and the mouse wheel over the pane scrolls its timeline.
 Drag its left border horizontally to resize it. The border responds after one
 cell of movement; the centered chevron remains the separate collapse control.
-The resting queue keeps rows compact.
+
+The resting queue is compact: one row per message with who sent it to whom,
+the subject, the proven delivery status and the full message id, as many of
+those as the width holds. A delivery that needs a person keeps its own line
+under the heading, with its cause. Press `b` (or click `body` in the footer)
+to show every message body under its heading, wrapped to the pane width;
+press `b` again to fold them. The choice is saved as `messages_show_bodies`
+in `config.toml`. Bodies are read as the operator, never claimed on an
+agent's behalf: where the daemon refuses the read, or does not offer it, the
+row keeps one dim `body unavailable` line instead of the body.
 Press Enter on a message to open its authenticated detail, where the full body
 and available thread history wrap to the current pane width and scroll instead
 of being cut off. An inbound body is shown only after the exact recipient

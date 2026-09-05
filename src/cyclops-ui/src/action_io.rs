@@ -89,6 +89,24 @@ pub async fn perform(sock: &Path, request: ActionRequest) -> ActionOutcome {
                 Err(e) => e.into_outcome(),
             }
         }
+        ActionRequest::ReadBody { message_id } => {
+            // The same shape a claim answers with (`InboxMessage`, body
+            // included), read rather than claimed: showing an operator a
+            // body must never take an agent's mail.
+            match call(sock, "msg.read", json!({ "message_id": message_id })).await {
+                Ok(value) => match serde_json::from_value::<cyclops_proto::InboxMessage>(value) {
+                    Ok(message) => ActionOutcome::Opened(Box::new(Loaded {
+                        body: message.body.as_deref().map(crate::grid::safe_text),
+                        body_authorized: true,
+                        ..Loaded::default()
+                    })),
+                    Err(error) => {
+                        ActionOutcome::Uncertain(format!("unreadable msg.read result: {error}"))
+                    }
+                },
+                Err(e) => e.into_outcome(),
+            }
+        }
     }
 }
 
@@ -324,6 +342,41 @@ mod tests {
 
         let outcome = perform(&sock, request).await;
         (server.await.unwrap(), outcome)
+    }
+
+    /// A body read asks `msg.read` for the id and nothing else, and what
+    /// comes back is the claim's message shape with the body kept.
+    #[tokio::test]
+    async fn a_body_read_asks_msg_read_and_keeps_the_body() {
+        let message_id = MessageId::new("m-t01-m07").unwrap();
+        let answer = serde_json::json!({
+            "message_id": "m-t01-m07",
+            "kind": "msg",
+            "sender_label": "coder",
+            "subject": "change 7",
+            "body": "please look at line 42",
+            "thread_root": "m-t01-m07",
+        });
+        let (asked, outcome) = one_call(
+            "ui-action-io-msg-read",
+            answer,
+            ActionRequest::ReadBody {
+                message_id: message_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(asked["method"], "msg.read");
+        assert_eq!(
+            asked["params"],
+            serde_json::json!({ "message_id": "m-t01-m07" })
+        );
+        match outcome {
+            ActionOutcome::Opened(loaded) => {
+                assert_eq!(loaded.body.as_deref(), Some("please look at line 42"));
+                assert!(loaded.body_authorized);
+            }
+            other => panic!("a body read must open: {other:?}"),
+        }
     }
 
     #[tokio::test]

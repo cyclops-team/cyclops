@@ -93,10 +93,11 @@ pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use avatar::{Avatar, AvatarRegistry};
 #[cfg(feature = "presentation")]
 pub use chat::{
-    chat_action_line, chat_action_lines, chat_action_strip, chat_action_strips, chat_actions,
-    render_chat, render_chat_lines, wrap_words, ChatAction, ChatActionSpan, ChatActionStrip,
-    ChatInk, ChatLine, ChatLineKind, ChatRenderContext, ChatSpan, ComposerMode, ComposerState,
-    TimelineItem,
+    build_chat_timeline, chat_action_line, chat_action_lines, chat_action_strip,
+    chat_action_strips, chat_actions, render_chat, render_chat_frame, render_chat_lines,
+    wrap_words, BodyState, ChatAction, ChatActionSpan, ChatActionStrip, ChatFrame, ChatInk,
+    ChatLine, ChatLineKind, ChatRenderContext, ChatSpan, ChatTimeline, ChatViewport, ComposerMode,
+    ComposerState, LineOwner, MessageBodies, TimelineItem,
 };
 #[cfg(feature = "presentation")]
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};

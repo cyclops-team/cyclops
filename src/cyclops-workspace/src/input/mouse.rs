@@ -115,6 +115,16 @@ pub enum HitTarget {
     /// words a keyboard user reads, so a pointer gets the same verbs
     /// instead of a hint it cannot act on.
     MessagesAction(cyclops_ui::ChatAction),
+    /// The Messages pane's content between its border and its strip. A
+    /// click here is a statement about where the operator is working, the
+    /// way a click on a pane canvas is: it takes the keyboard focus. The
+    /// wheel over it scrolls the timeline.
+    MessagesBody,
+    /// One timeline row that speaks for a queue row. A click selects that
+    /// row as well as focusing the pane.
+    MessagesRow {
+        target: cyclops_ui::QueueTarget,
+    },
     AttentionIndicator {
         pane_id: String,
     },

@@ -11,8 +11,6 @@
 //! Both states paint that chevron through [`paint_toggle`], so the two can
 //! never disagree about how the control looks or answers a mouse.
 
-use std::collections::HashMap;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -544,29 +542,50 @@ pub fn paint_sidebar_rail(
     }
 }
 
+/// Columns the Messages pane's rows get inside its border: what the
+/// timeline is built at, so a cached build and the paint agree on one
+/// number.
+pub fn messages_content_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(2))
+}
+
+/// What one frame of the Messages pane paints from.
+pub struct MessagesPaint<'a> {
+    pub queue: &'a cyclops_ui::HumanQueue,
+    pub context: cyclops_ui::ChatRenderContext<'a>,
+    /// Built at [`messages_content_width`] of the area, by the caller,
+    /// who keeps it between frames.
+    pub timeline: &'a cyclops_ui::ChatTimeline,
+    /// A window the operator scrolled to; `None` follows the selection.
+    pub scroll_top: Option<usize>,
+    pub focused: bool,
+}
+
 /// Render the Messages pane on the right edge. Its left border remains the
 /// resize divider and collapse control, while the complete frame makes the
 /// peer region it owns unambiguous beside the agent grid.
+///
+/// Returns the timeline window the frame showed, for the wheel to move
+/// from.
 pub fn paint_messages(
-    queue: &cyclops_ui::HumanQueue,
-    detail: Option<&cyclops_ui::Detail>,
-    composer: Option<&cyclops_ui::ComposerState>,
-    avatar_registry: &cyclops_ui::AvatarRegistry,
-    live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
-    pane_manifests: Option<&HashMap<String, String>>,
-    status: Option<&str>,
-    retry_available: bool,
-    focused: bool,
-    view_journal: bool,
+    view: MessagesPaint<'_>,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
-) {
+) -> cyclops_ui::ChatViewport {
+    let MessagesPaint {
+        queue,
+        context,
+        timeline,
+        scroll_top,
+        focused,
+    } = view;
     if area.width == 0 || area.height == 0 {
-        return;
+        return cyclops_ui::ChatViewport::default();
     }
+    let view_journal = context.view_journal;
     buf.set_style(area, theme::chrome_panel(paint));
     let border_style = if focused {
         theme::pane_border_focused(paint)
@@ -583,12 +602,16 @@ pub fn paint_messages(
         .border_style(border_style)
         .render(area, buf);
 
-    if area.width > 11 {
-        let title = if view_journal {
-            " Journal "
-        } else {
-            " Messages "
-        };
+    let title = if view_journal {
+        " Journal "
+    } else {
+        " Messages "
+    };
+    let title_w = u16::try_from(unicode_width::UnicodeWidthStr::width(title)).unwrap_or(u16::MAX);
+    // Two cells of border before the title and the corner after it: on a
+    // pane one cell narrower than that the title used to overwrite the
+    // corner, and the right border read as missing on its top row.
+    if area.width >= title_w + 3 {
         super::overlay_text(buf, area, area.x + 2, area.y, title, border_style);
 
         if !view_journal && area.width > 24 {
@@ -603,7 +626,7 @@ pub fn paint_messages(
             // wider than the chip it was for.
             let chip_w = u16::try_from(unicode_width::UnicodeWidthStr::width(scope_chip))
                 .unwrap_or(u16::MAX);
-            let chip_x = area.x + 2 + title.len() as u16;
+            let chip_x = area.x + 2 + title_w;
             if chip_x + chip_w + 2 < area.x + area.width {
                 super::overlay_text(
                     buf,
@@ -638,38 +661,30 @@ pub fn paint_messages(
         hover,
     );
 
-    let content_w = area.width.saturating_sub(2) as usize;
+    let content_w = messages_content_width(area);
     let content_h = area.height.saturating_sub(2) as usize;
     if content_w == 0 || content_h == 0 {
-        return;
+        return cyclops_ui::ChatViewport::default();
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64);
 
-    let rows = cyclops_ui::render_chat_lines(
-        queue,
-        cyclops_ui::ChatRenderContext {
-            detail,
-            composer,
-            avatar_registry,
-            live_routes,
-            pane_manifests,
-            status,
-            retry_available,
-            now_ms,
-            view_journal,
-        },
-        content_w,
-        content_h,
-    );
+    let frame =
+        cyclops_ui::render_chat_frame(timeline, queue, context, content_w, content_h, scroll_top);
     let content_rect = Rect::new(
         area.x + 1,
         area.y + 1,
         area.width.saturating_sub(2),
         area.height.saturating_sub(2),
     );
+    // The whole content answers a click with focus and the wheel with a
+    // scroll. Pushed first: the rows and the strip's buttons that follow
+    // sit on the same layer, and the last region pushed over a cell is
+    // the one that answers there.
+    hits.push(
+        content_rect,
+        HitLayer::SidebarChrome,
+        HitTarget::MessagesBody,
+    );
+    let selected = queue.selected().map(|row| &row.target);
     let pointed = |rect: Rect| {
         hover.is_some_and(|(col, row)| {
             col >= rect.x
@@ -682,11 +697,27 @@ pub fn paint_messages(
     // strip's buttons also register their hit targets, one per button, so
     // a click lands on exactly the verb whose fill it is over. The strip
     // is found by kind, never by matching on the words it printed.
-    for (i, row) in rows.into_iter().enumerate() {
+    for (i, row) in frame.lines.into_iter().enumerate() {
         if i >= content_rect.height as usize {
             break;
         }
         let y = content_rect.y + i as u16;
+        if let Some(owner) = &row.owner {
+            // A click on a heading keeps the recipient the cursor is
+            // already on when it is one of this message's, and takes the
+            // first otherwise; a status line names its one recipient.
+            let target = selected
+                .filter(|selected| owner.targets.contains(selected))
+                .or(owner.targets.first())
+                .cloned();
+            if let Some(target) = target {
+                hits.push(
+                    Rect::new(content_rect.x, y, content_rect.width, 1),
+                    HitLayer::SidebarChrome,
+                    HitTarget::MessagesRow { target },
+                );
+            }
+        }
         let mut x = content_rect.x;
         for span in &row.spans {
             let width = Span::raw(span.text.as_str()).width() as u16;
@@ -715,6 +746,7 @@ pub fn paint_messages(
             x = x.saturating_add(width);
         }
     }
+    frame.viewport
 }
 
 /// The workspace palette for one Messages pane ink. The renderer named what
@@ -3783,6 +3815,35 @@ mod tests {
         );
     }
 
+    /// Build the timeline and paint the pane in one call, the way the
+    /// app does across two, for tests that only need the frame.
+    fn paint_messages_plain(
+        queue: &cyclops_ui::HumanQueue,
+        context: cyclops_ui::ChatRenderContext<'_>,
+        focused: bool,
+        area: Rect,
+        buf: &mut Buffer,
+        paint: &Paint,
+        hits: &mut HitMap,
+    ) -> cyclops_ui::ChatViewport {
+        let timeline =
+            cyclops_ui::build_chat_timeline(queue, context, messages_content_width(area));
+        paint_messages(
+            MessagesPaint {
+                queue,
+                context,
+                timeline: &timeline,
+                scroll_top: None,
+                focused,
+            },
+            area,
+            buf,
+            paint,
+            hits,
+            None,
+        )
+    }
+
     /// The strip's words are controls, not decoration: a click on a verb
     /// reaches that verb, and it reaches it through the action the key
     /// press raises rather than through a second implementation.
@@ -3794,9 +3855,14 @@ mod tests {
         let paint = Paint::for_test();
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
-        paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
-            &paint, &mut hits, None,
+        paint_messages_plain(
+            &queue,
+            cyclops_ui::ChatRenderContext::new(&registry),
+            false,
+            area,
+            &mut buf,
+            &paint,
+            &mut hits,
         );
 
         let content_w = area.width.saturating_sub(2) as usize;
@@ -3840,9 +3906,14 @@ mod tests {
         let paint = Paint::for_test();
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
-        paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
-            &paint, &mut hits, None,
+        paint_messages_plain(
+            &queue,
+            cyclops_ui::ChatRenderContext::new(&registry),
+            false,
+            area,
+            &mut buf,
+            &paint,
+            &mut hits,
         );
 
         let chip = hits
@@ -3886,27 +3957,34 @@ mod tests {
         let (_, spans) = cyclops_ui::chat_action_strip(content_w, false);
         let (action, start, end) = spans[1];
         let x = area.x + 1 + start as u16;
-        let y = (0..area.height)
-            .find(|&y| {
-                let mut buf = Buffer::empty(area);
-                let mut hits = HitMap::default();
-                paint_messages(
-                    &queue, None, None, &registry, None, None, None, false, false, false, area,
-                    &mut buf, &paint, &mut hits, None,
-                );
-                matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
-            })
-            .expect("the strip paints a button");
-
+        let context = cyclops_ui::ChatRenderContext::new(&registry);
+        let timeline = cyclops_ui::build_chat_timeline(&queue, context, content_w);
         let draw = |hover: Option<(u16, u16)>| {
             let mut buf = Buffer::empty(area);
             let mut hits = HitMap::default();
             paint_messages(
-                &queue, None, None, &registry, None, None, None, false, false, false, area,
-                &mut buf, &paint, &mut hits, hover,
+                MessagesPaint {
+                    queue: &queue,
+                    context,
+                    timeline: &timeline,
+                    scroll_top: None,
+                    focused: false,
+                },
+                area,
+                &mut buf,
+                &paint,
+                &mut hits,
+                hover,
             );
-            buf
+            (buf, hits)
         };
+        let y = (0..area.height)
+            .find(|&y| {
+                let (_, hits) = draw(None);
+                matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
+            })
+            .expect("the strip paints a button");
+        let draw = |hover: Option<(u16, u16)>| draw(hover).0;
         let rested = draw(None);
         let lit = draw(Some((x, y)));
         let hover = theme::add_button_hover(&paint);
@@ -3974,9 +4052,14 @@ mod tests {
         queue.set_scope(Scope::All);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
-        paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
-            &paint, &mut hits, None,
+        paint_messages_plain(
+            &queue,
+            cyclops_ui::ChatRenderContext::new(&registry),
+            false,
+            area,
+            &mut buf,
+            &paint,
+            &mut hits,
         );
         let row_text = |y: u16| -> String {
             (area.x..area.right())
@@ -4089,6 +4172,104 @@ mod tests {
         assert_eq!(unknown[(9, 6)].symbol(), MESSAGES_EXPAND);
     }
 
+    /// Every size down to one cell paints without reaching outside the
+    /// pane, and a wide glyph never breaks the right border: the
+    /// off-by-one class of Ratatui bug, swept rather than sampled.
+    #[test]
+    fn the_messages_pane_paints_at_every_narrow_size_inside_its_border() {
+        use cyclops_proto::{Kind, MessageId, RecipientKey};
+        use cyclops_ui::{
+            Direction, MailboxWord, QueueRow, QueueTarget, Scope, Snapshot, WakeWord,
+        };
+        let sender: RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0"
+                .parse()
+                .unwrap();
+        let recipient: RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
+                .parse()
+                .unwrap();
+        let rows = (0..3u64)
+            .map(|index| {
+                let message = MessageId::new(format!("m-t0-m{index}")).unwrap();
+                QueueRow {
+                    target: QueueTarget::new(message.clone(), recipient),
+                    message_id: message.clone(),
+                    recipient,
+                    recipient_label: "審査員".into(),
+                    sender,
+                    sender_label: "coder".into(),
+                    thread_root: message,
+                    thread_message_count: 1,
+                    ts: 1,
+                    kind: Kind::Msg,
+                    recipient_count: 1,
+                    subject: Some("変更 ✓ review the diff 全角".into()),
+                    mailbox: MailboxWord::Pending,
+                    wake: WakeWord::NeedsAttention,
+                    cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    needs_action: true,
+                    seq: index + 1,
+                    updated_at: 1,
+                    direction: Direction::Inbound,
+                    ..QueueRow::default()
+                }
+            })
+            .collect();
+        let mut queue = cyclops_ui::HumanQueue::new();
+        queue.replace(Snapshot { watermark: 3, rows });
+        queue.set_scope(Scope::All);
+        let registry = cyclops_ui::AvatarRegistry::default();
+        let paint = Paint::for_test();
+        for show_bodies in [false, true] {
+            let context = cyclops_ui::ChatRenderContext::new(&registry)
+                .with_show_bodies(show_bodies)
+                .with_status("daemon reconnecting")
+                .at(5_000);
+            for width in 1..=32u16 {
+                for height in 1..=12u16 {
+                    // One column of margin on every side, so a write past
+                    // the pane lands on a cell the assertion can see.
+                    let outer = Rect::new(0, 0, width + 2, height + 2);
+                    let area = Rect::new(1, 1, width, height);
+                    let mut buf = Buffer::empty(outer);
+                    let mut hits = HitMap::default();
+                    paint_messages_plain(&queue, context, true, area, &mut buf, &paint, &mut hits);
+                    for y in 0..outer.height {
+                        for x in 0..outer.width {
+                            let inside =
+                                area.x <= x && x < area.right() && area.y <= y && y < area.bottom();
+                            if !inside {
+                                assert_eq!(
+                                    buf[(x, y)].symbol(),
+                                    " ",
+                                    "{width}x{height} bodies={show_bodies}: wrote outside the pane at ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                    if width >= 2 && height >= 2 {
+                        for y in area.y..area.bottom() {
+                            assert_ne!(
+                                buf[(area.right() - 1, y)].symbol(),
+                                " ",
+                                "{width}x{height} bodies={show_bodies}: the right border is missing at row {y}"
+                            );
+                        }
+                    }
+                    for region in hits.regions() {
+                        assert!(
+                            region.rect.right() <= area.right()
+                                && region.rect.bottom() <= area.bottom(),
+                            "{width}x{height}: hit {:?} reaches outside the pane",
+                            region.target
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_open_messages_pane_carves_divider_and_collapse_chevron() {
         let area = Rect::new(170, 0, 30, 50);
@@ -4096,22 +4277,15 @@ mod tests {
         let mut hits = HitMap::default();
         let paint = Paint::for_test();
         let queue = cyclops_ui::HumanQueue::default();
-        paint_messages(
+        let registry = cyclops_ui::AvatarRegistry::default();
+        paint_messages_plain(
             &queue,
-            None,
-            None,
-            &cyclops_ui::AvatarRegistry::default(),
-            None,
-            None,
-            None,
-            false,
-            false,
+            cyclops_ui::ChatRenderContext::new(&registry),
             false,
             area,
             &mut buf,
             &paint,
             &mut hits,
-            None,
         );
 
         let band = toggle_reach(Rect::new(170, 0, 1, 50));
