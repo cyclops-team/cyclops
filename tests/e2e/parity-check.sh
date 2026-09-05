@@ -519,7 +519,7 @@ run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
 check "setup installs the sounds"         '^  wrote 2 sounds to .*/sounds$'
-check "setup installs the manifests"      '^  wrote 12 detection manifests to .*/manifests$'
+check "setup installs the manifests"      '^  wrote 52 detection manifests to .*/manifests$'
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
 # write one: a file in the home directory the daemon reads at boot. It
@@ -639,7 +639,7 @@ check "--raw without detection is a usage error" 'pairs with --source detection'
 check_exit "and exits 2" 2
 
 run "$CYC" name "$P2" reviewer --manifest cluade --plain
-check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, aider, amp, claude, codex, crush, cursor, demo, gemini, goose, kimi, opencode, qwen$'
+check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: adal, agy, aider, amp, auggie, autohand, bob, claude, cline, codearts, codebuddy, codex, commandcode, continue, copilot, cortex, crush, cursor, dcode, demo, devin, dexto, droid, forge, gemini, goose, grok, hermes, iflow, jazz, junie, kilo, kimchi, kimi, kiro, kode, loaf, mcode, neovate, openclaw, opencode, openhands, pa, pi, qoder, qodercn, qwen, reasonix, rovodev, tabnine, traecli, vibe, warp$'
 
 echo
 echo "#### Rung 4: layouts"
@@ -1001,7 +1001,7 @@ printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
 check "setup writes the config"           'wrote .*/config\.toml$'
-check "and installs the manifests"        '^  wrote 12 detection manifests to .*/manifests$'
+check "and installs the manifests"        '^  wrote 52 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
 printf '%s\n' 'set-option -g exit-empty off' 'set-option -g exit-unattached off' \

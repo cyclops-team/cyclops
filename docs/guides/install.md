@@ -159,7 +159,7 @@ $ cyclops start --setup-only
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
   wrote 2 sounds to /Users/you/.cyclops/sounds
-  wrote 12 detection manifests to /Users/you/.cyclops/manifests
+  wrote 52 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
