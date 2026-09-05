@@ -135,8 +135,9 @@ pub fn paint_daemon_status(
 }
 
 /// Render the workspace sidebar: the tab header, the selected tab's body,
-/// the shared footer, and the collapse chevron on its outer edge.
-#[allow(dead_code)]
+/// the shared footer, and the collapse chevron on its outer edge. The app
+/// calls `paint_sidebar_filtered` directly; this is the tests' entry.
+#[cfg(test)]
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,

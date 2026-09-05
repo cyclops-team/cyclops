@@ -67,8 +67,6 @@ mod sessionid;
 mod sessionstore;
 pub(crate) mod turnkey;
 mod workspace_ui;
-// Removed when daemon startup reads the workspace identity.
-#[allow(dead_code)]
 mod workspaceid;
 
 pub use config::Config;
@@ -3690,7 +3688,7 @@ pub(crate) async fn repaint_chrome(
 /// theme next to a stream in this week's is the visible half of that.
 ///
 /// Returns the name now active, for the CLI to print, and emits `theme`
-/// so a running `cyclops ui` wakes and re-reads the selection itself.
+/// so a running `cyclops watch` wakes and re-reads the selection itself.
 /// The event carries no colors: every surface resolves its own, and one
 /// that took a palette off the wire could show a theme no file holds.
 pub(crate) async fn reload_theme(inner: &Arc<Inner>) -> String {
@@ -3990,7 +3988,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // A daemon with no manifests boots clean, watches panes, and can
     // deliver nothing. The warn! below reaches whoever is tailing stderr,
     // which after `cyclopsd &` is nobody, so the same sentence also goes on
-    // the record: it lands in `cyclops ui` and replays out of the ledger.
+    // the record: it lands in `cyclops watch` and replays out of the ledger.
     // `cyclops status` reads the same fact off the status answer and
     // explains the unknown panes it produces.
     if manifest_ids.is_empty() {

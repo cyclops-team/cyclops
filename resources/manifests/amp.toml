@@ -32,9 +32,6 @@ process_names = ["amp"]
 argv_basenames = ["amp"]
 launch = "amp"
 
-[messaging]
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 config_mechanism = "none: amp.hooks actions are fixed types and plugins are TypeScript"
 

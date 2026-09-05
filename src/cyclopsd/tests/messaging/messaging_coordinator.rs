@@ -2452,11 +2452,6 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
         1,
     )
     .replacen(
-        "[messaging]\nmailbox_capability_file = \"~/.gemini/antigravity-cli/skills/cyclops/SKILL.md\"\n\n",
-        "",
-        1,
-    )
-    .replacen(
         "region = \"bottom_non_empty_lines(8)\"",
         "region = \"bottom_non_empty_lines(5)\"",
         1,

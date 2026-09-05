@@ -29,11 +29,6 @@ process_names = ["crush"]
 argv_basenames = ["crush"]
 launch = "crush"
 
-[messaging]
-# Crush loads ~/.config/agents/skills, ~/.config/crush/skills, ~/.agents/skills,
-# and ~/.claude/skills; the shared ~/.agents copy is the one Cyclops seeds.
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 config_mechanism = "hook add in ~/.config/crush/crushrc (PreToolUse only)"
 available = ["PreToolUse"]

@@ -46,9 +46,6 @@ argv_basenames = ["claude"]
 # below, so a pane started this way is already reporting.
 launch = "claude"
 
-[messaging]
-mailbox_capability_file = "~/.claude/skills/cyclops/SKILL.md"
-
 [hooks]
 # Configured via --settings <file>; the file may be generated per pane so the
 # user's own ~/.claude/settings.json is never modified. MEASURED: hooks fire in

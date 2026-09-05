@@ -1170,7 +1170,6 @@ mod tests {
             active_pane: focused.into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
         let mut runtimes = RuntimeRegistry::default();
         let mut runtime = crate::runtime::PaneRuntime::new(5, 5);
@@ -2641,7 +2640,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2743,7 +2741,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2800,7 +2797,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2958,7 +2954,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -3050,7 +3045,6 @@ mod tests {
                 active_pane: "%0".to_string(),
                 zoomed: false,
                 minimized: std::collections::HashMap::new(),
-                minimization_provenance: std::collections::HashMap::new(),
             }
         }
 
@@ -3162,7 +3156,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
 
         // 1. Closed Messages: Rail occupies 1 column on right.
@@ -3240,7 +3233,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
 
         // 1. Closed Messages: Full agent card geometry.
@@ -3363,7 +3355,6 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();

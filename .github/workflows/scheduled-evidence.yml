@@ -1,8 +1,6 @@
 name: scheduled evidence
 
 on:
-  push:
-    branches: [beta/messaging-rework]
   schedule:
     - cron: "17 7 * * *"
   workflow_dispatch:

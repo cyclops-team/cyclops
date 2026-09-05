@@ -1949,7 +1949,6 @@ mod tests {
             active_pane: pane_id.to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![WorkspaceRow {
@@ -2156,7 +2155,6 @@ mod tests {
             active_pane: pane_id.to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -4075,7 +4073,6 @@ mod tests {
                     active_pane,
                     zoomed: false,
                     minimized: Default::default(),
-                    minimization_provenance: Default::default(),
                 }],
                 active_tab: 0,
             },

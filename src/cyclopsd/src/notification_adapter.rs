@@ -48,7 +48,7 @@ fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationT
 }
 
 impl NotificationContext {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(
         store: Arc<StdMutex<MessageStore>>,
         message_id: MessageId,

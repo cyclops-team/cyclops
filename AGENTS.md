@@ -9,8 +9,7 @@ Cyclops coordinates terminal coding agents already running in tmux: a Rust
 daemon (`cyclopsd`) watches panes, fuses sensors into an agent state,
 accepts messages into durable mailboxes, writes one doorbell line per
 message with a recorded receipt, and appends every fact to an NDJSON
-journal. A generated knowledge base with diagrams lives at
-`.agents/summary/index.md`.
+journal.
 
 ## Where things live
 

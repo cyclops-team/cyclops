@@ -42,9 +42,6 @@ argv_basenames = ["agent", "cursor-agent"]
 # and this one says which program is meant.
 launch = "cursor-agent"
 
-[messaging]
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 # MEASURED with a logging hook installed at <workspace>/.cursor/hooks.json:
 # every event below fired, with the payloads recorded in this file's notes.

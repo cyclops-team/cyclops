@@ -171,7 +171,6 @@ pub(crate) enum StagingTarget<'a> {
 /// `Hidden` is distinct from `Unprovable`: a collapsed chip is positive
 /// evidence that bytes exist, but the screen cannot reveal which bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ComposerContentProof {
     Visible(String),
     Hidden,
@@ -749,7 +748,6 @@ pub(crate) fn exact_composer_content_for_state(
     ComposerContentProof::Visible(content.join("\n"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn captured_content<'a>(
     pattern: &cyclops_manifest::Regex,
     row: &'a str,

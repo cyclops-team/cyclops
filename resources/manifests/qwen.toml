@@ -32,11 +32,6 @@ process_names = ["qwen"]
 argv_basenames = ["qwen"]
 launch = "qwen"
 
-[messaging]
-# Personal skills live in ~/.qwen/skills/<name>/SKILL.md; the docs list no
-# ~/.agents/skills alias, so Qwen gets its own copy.
-mailbox_capability_file = "~/.qwen/skills/cyclops/SKILL.md"
-
 [hooks]
 # `hooks` object in ~/.qwen/settings.json (user) or .qwen/settings.json
 # (project, requires trusted-folder status). QWEN_HOME relocates ~/.qwen.

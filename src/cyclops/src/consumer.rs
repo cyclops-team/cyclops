@@ -211,6 +211,10 @@ impl Spec {
                 relative: PathBuf::from("hooks/hooks.json"),
             },
         };
+        // Claude, Antigravity, Kimi, and Qwen document a skills directory of
+        // their own (Qwen: ~/.qwen/skills/<name>/SKILL.md, no ~/.agents alias)
+        // and get a private copy. The rest read the shared ~/.agents/skills
+        // copy; goose loads skills from ~/.agents/skills and .agents/skills only.
         let skill = match self.kind {
             CliKind::Claude | CliKind::Agy | CliKind::Kimi | CliKind::Qwen => AssetLocation {
                 root: install_root.clone(),

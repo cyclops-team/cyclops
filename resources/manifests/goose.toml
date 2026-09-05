@@ -34,10 +34,6 @@ argv_basenames = ["goose"]
 # `goose session` is the interactive chat; bare `goose` prints usage.
 launch = "goose session"
 
-[messaging]
-# goose loads skills from ~/.agents/skills/ and .agents/skills/ only.
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 config_mechanism = "hooks/hooks.json in ~/.agents/plugins/cyclops/"
 turn_start = "UserPromptSubmit"

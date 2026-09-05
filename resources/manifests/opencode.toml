@@ -33,9 +33,6 @@ process_names = ["opencode"]
 argv_basenames = ["opencode"]
 launch = "opencode"
 
-[messaging]
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 config_mechanism = "none: OpenCode exposes lifecycle events only to JavaScript plugins"
 

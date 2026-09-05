@@ -3081,7 +3081,7 @@ fn manifest_uses_screen_tier(m: &Manifest) -> bool {
 /// restored to top-down order. Production goes through
 /// [`screen_winner_esc`] (the recompute may carry an escaped capture);
 /// this plain form serves the tests that assert single-capture behavior.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn screen_winner<'m>(m: &'m Manifest, screen: &str) -> Option<&'m CompiledRule> {
     screen_winner_esc(m, screen, None)
 }

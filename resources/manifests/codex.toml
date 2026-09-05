@@ -29,9 +29,6 @@ process_names = ["codex"]
 # this way: hooks are `cyclops hooks install`, never composed in here.
 launch = "codex"
 
-[messaging]
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 # Event names are PascalCase in hooks.json, snake_case internally.
 config_mechanism = "hooks.json in CODEX_HOME or <repo>/.codex/"

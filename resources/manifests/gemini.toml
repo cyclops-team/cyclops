@@ -41,12 +41,6 @@ process_names = ["gemini"]
 argv_basenames = ["gemini"]
 launch = "gemini"
 
-[messaging]
-# Gemini reads ~/.agents/skills as an alias of ~/.gemini/skills (documented),
-# and MEASURED 0.45.2 warns "Skill conflict detected" when both hold the
-# same skill name, so Cyclops seeds only the shared copy.
-mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
-
 [hooks]
 # `hooks` object in ~/.gemini/settings.json (user layer), .gemini/settings.json
 # (project layer, fingerprinted and re-confirmed when a command changes), or

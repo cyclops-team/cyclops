@@ -201,9 +201,9 @@ fn combine(observations: impl IntoIterator<Item = Installation>) -> Installation
 
 /// Consumers that read the shared `~/.agents/skills` copy and take no hook
 /// wiring from Cyclops, so they have no `CliKind` and no catalog entry. Each
-/// counts as installed when its own config directory exists; the paths are
-/// the documented ones recorded in the matching manifest under
-/// resources/manifests/.
+/// counts as installed when its own config directory exists. Crush also
+/// reads ~/.config/agents/skills, ~/.config/crush/skills, and
+/// ~/.claude/skills, but the shared ~/.agents copy is the one it gets.
 const SKILL_ONLY_CONSUMERS: &[(&str, &str)] = &[
     ("OpenCode", ".config/opencode"),
     ("Amp", ".config/amp"),

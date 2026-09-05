@@ -4406,7 +4406,7 @@ mod tests {
     // accepted, and that cannot be proven from inside one process: both
     // ends of a socketpair are this process, so the attested identity a
     // re-read returns is always this execution's own. The regression
-    // lives in `tests/sender_identity.rs`, where a real client execs on
+    // lives in `tests/identity/sender_identity.rs`, where a real client execs on
     // a connection it already opened.
     //
     // The foreign-uid case is gone with it. The uid now comes from the

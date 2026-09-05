@@ -3793,6 +3793,13 @@ composer_trailer_required_prefix = 1
             env!("CARGO_MANIFEST_DIR"),
             "/../../resources/manifests/agy.toml"
         ))
+        // The historical body still carried the retired `[messaging]` key.
+        .replacen(
+            "launch = \"agy\"\n\n[hooks]",
+            "launch = \"agy\"\n\n[messaging]\nmailbox_capability_file = \
+             \"~/.gemini/antigravity-cli/skills/cyclops/SKILL.md\"\n\n[hooks]",
+            1,
+        )
         .replacen(
             "region = \"bottom_non_empty_lines(8)\"",
             "region = \"bottom_non_empty_lines(5)\"",

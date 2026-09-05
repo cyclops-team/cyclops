@@ -421,9 +421,6 @@ ack = "UserPromptSubmit"
 ack_evidence = "dispatch"
 ack_payload_field = "prompt"
 
-[messaging]
-mailbox_capability_file = "__CYCLOPS_MAILBOX_CAPABILITY__"
-
 [[rule]]
 id = "title_working"
 state = "working"
@@ -488,7 +485,6 @@ composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 EOF
 )
-DEMO_MANIFEST="${DEMO_MANIFEST/__CYCLOPS_MAILBOX_CAPABILITY__/$DEMO_SKILL}"
 
 if [ "$INSTALLER_ONLY" -eq 0 ]; then
 echo "== rig home:   $CYCLOPS_HOME (removed on exit)"

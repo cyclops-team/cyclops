@@ -7868,7 +7868,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -7987,7 +7986,6 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
             minimized: Default::default(),
-            minimization_provenance: Default::default(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -9690,7 +9688,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let tabs = vec![tab("@0"), tab("@1")];
         let mut pinned = BTreeSet::new();
@@ -11511,7 +11508,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11580,7 +11576,6 @@ mod tests {
             active_pane: pane.into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut current = WorkspaceModel {
             workspaces: vec![],
@@ -11627,7 +11622,6 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let row = |id: &str, name: &str| crate::model::WorkspaceRow {
             session_id: id.into(),
@@ -11800,7 +11794,6 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
-            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11944,7 +11937,6 @@ mod tests {
                     active_pane: dragged.clone(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
-                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
@@ -12047,7 +12039,6 @@ mod tests {
                     active_pane: bottom.into(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
-                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
