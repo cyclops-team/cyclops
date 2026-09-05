@@ -725,6 +725,137 @@ async fn a_claim_before_submit_still_submits_the_operator_visible_doorbell() {
     rig.daemon.shutdown().await;
 }
 
+/// An agent-loop pane whose screen can show a modal the manifest does not
+/// dismiss. The gate holds on the modal while the loop keeps reading its
+/// stdin, so the test can type a socket claim into the pane that the
+/// daemon resolves to the pane's own agent identity.
+const HELD_AGENT_LOOP_MANIFEST: &str = r#"
+[agent]
+id = "held-agent-loop"
+display_name = "Held agent loop"
+process_names = ["Python", "python3"]
+argv_basenames = ["cycagent"]
+
+[[rule]]
+id = "fake_trust_modal"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(8)"
+contains = ["FAKE-TRUST-PROMPT"]
+auto_dismiss = false
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 100
+region = "pane_title"
+regex = ['^']
+"#;
+
+/// A claim over the socket while the gate holds withdraws the doorbell:
+/// the attempt settles as `withdrawn` with cause `claimed_before_write`,
+/// the recipient's FIFO moves on, and nothing is ever pasted into the pane.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_claim_while_the_gate_holds_withdraws_the_doorbell_and_writes_nothing() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let client_dir = crate::body_privacy::named_clients("claim-before-write");
+    let pane_command = crate::body_privacy::agent_command_loop(&client_dir);
+    let mut rig = Rig::new(
+        "workspace-claim-before-write",
+        HELD_AGENT_LOOP_MANIFEST,
+        &pane_command,
+        "",
+    )
+    .await;
+    crate::body_privacy::wait_manifest_bound_to(&mut rig, 1, "held-agent-loop").await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    // The loop paints the modal; the manifest holds the gate on it.
+    rig.tmux.run_ok(&[
+        "send-keys",
+        "-t",
+        &pane,
+        "/bin/echo FAKE-TRUST-PROMPT",
+        "Enter",
+    ]);
+    rig.tmux.wait_screen(&pane, "FAKE-TRUST-PROMPT");
+
+    let first =
+        send_workspace_message(&rig, "claim-before-write-first", "First", "first body").await;
+    let first_id = first["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == first_id.as_str()
+                && event["data"]["action"] == "hold"
+        })
+        .await;
+    let held_doorbell = compact_doorbell(&rig, &first_id);
+    assert_eq!(
+        notification_state_count(&rig, &first_id, NotificationState::Writing),
+        0
+    );
+
+    // The recipient claims over the socket from inside its own pane.
+    let claimed = crate::body_privacy::pane_request(
+        &mut rig,
+        &client_dir,
+        &pane,
+        "claim-before-write",
+        "inbox.claim",
+        json!({"message_id": first_id}),
+    )
+    .await;
+    assert_eq!(claimed["result"]["disposition"], "claimed", "{claimed}");
+    assert_eq!(claimed["result"]["message"]["body"], "first body");
+
+    // The claim settled the attempt: withdrawn, because it was claimed
+    // before the write. The settlement is projected from the claim fact.
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let notification = &snapshot["result"]["rows"]
+        .as_array()
+        .expect("snapshot rows")
+        .iter()
+        .find(|row| row["message_id"] == first_id)
+        .expect("claimed message remains visible")["recipients"][0]["notification"];
+    assert_eq!(notification["state"], "not_started", "{notification}");
+    assert_eq!(notification["settlement"], "withdrawn_by_claim");
+    assert_eq!(notification["pre_write_cause"], "claimed_before_write");
+
+    // Clear the modal. The withdrawn attempt has no worker left; the next
+    // message proves the pipeline moved past it.
+    rig.tmux
+        .run_ok(&["send-keys", "-t", &pane, "/usr/bin/clear", "Enter"]);
+    let second =
+        send_workspace_message(&rig, "claim-before-write-second", "Second", "second body").await;
+    let second_id = second["msg_id"].as_str().unwrap().to_string();
+    // The loop pane has no hook, so its receipt may read back unverified.
+    crate::body_privacy::wait_for_notification_submitted(&mut rig, &second_id).await;
+
+    // Nothing of the first message ever reached the pane.
+    let history = joined_pane_history(&rig, &pane);
+    assert!(
+        !history.contains(&held_doorbell),
+        "the withdrawn doorbell was written: {history}"
+    );
+    assert!(!history.contains("first body"));
+    assert!(history.contains(&compact_doorbell(&rig, &second_id)));
+    assert_eq!(
+        notification_state_count(&rig, &first_id, NotificationState::Writing),
+        0
+    );
+    assert_eq!(
+        notification_state_count(&rig, &first_id, NotificationState::Submitted),
+        0
+    );
+    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
+    rig.daemon.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_in_the_post_key_gap_settles_before_the_next_notification() {
     if !tmux_available() {
@@ -908,14 +1039,16 @@ async fn summary_notification_stages_the_preview_and_exact_claim_without_the_bod
 
     let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
         .expect("the summary notification has one exact attempt");
-    let screen = rig.tmux.capture(&pane);
+    // The row soft-wraps in the fixture pane; read it back joined, the
+    // way the daemon's own readback does.
+    let screen = joined_pane_history(&rig, &pane);
     assert!(
         screen.contains(summary),
         "summary missing from pane: {screen}"
     );
     assert!(
-        screen.contains("[cyclops from admin]"),
-        "sender missing from pane: {screen}"
+        screen.contains("[cyclops from admin to worker]"),
+        "sender and recipient missing from pane: {screen}"
     );
     assert!(
         screen.contains(&cyclops_proto::render_doorbell_v3(attempt)),
@@ -2531,7 +2664,7 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
         .expect("pre-submit pause sender stayed open");
     let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
         .expect("the staged AGY doorbell has one exact attempt");
-    let expected = cyclops_proto::render_doorbell_v4("admin", summary, attempt);
+    let expected = cyclops_proto::render_doorbell_v4("admin", "worker", summary, attempt);
     let screen = rig.tmux.capture(&pane);
     let continuation_rows: Vec<_> = screen.lines().filter(|row| row.starts_with("  ")).collect();
     assert_eq!(

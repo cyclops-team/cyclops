@@ -1,0 +1,51 @@
+# Cyclops detection manifest: Kilo CLI (Kilo Code)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No kilo binary was run and nothing was measured: this file binds the pane
+# and nothing more. Sources:
+#   https://kilo.ai/docs/code-with-ai/platforms/cli
+#   https://www.npmjs.com/package/@kilocode/cli
+#   https://github.com/Kilo-Org/kilocode/tree/main/packages/opencode
+#
+# Skills directory (skills.sh catalog key kilo): ~/.kilocode/skills. The
+# catalog path is the legacy one; current docs put config in
+# ~/.config/kilo/ and skills in ~/.kilo/skills/.
+#
+# NO HOOK CONFIG. Kilo is OpenCode-derived and exposes lifecycle events only
+# to JavaScript plugins (the same surface as opencode.toml), with no
+# shell-command hook in kilo.json, so no [hooks] table and no wiring ships.
+# This manifest binds the pane so the agent's own `cyclops send` resolves
+# its identity, and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  kilo is an npm package (@kilocode/cli); like OpenCode's npm
+#            launcher it may leave "node" as the pane's foreground command
+#            (inferred, not measured). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest kilo.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The docs quote no prompt string, so no idle rule
+#            ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "kilo"
+display_name = "Kilo CLI"
+version_tested = "unverified"
+process_names = ["kilo"]
+argv_basenames = ["kilo"]
+launch = "kilo"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Kilo CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

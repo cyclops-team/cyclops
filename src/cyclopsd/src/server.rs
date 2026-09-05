@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams, DaemonShutdownParams,
     DaemonShutdownResult, Event, FrameContract, FrameSize, Hello, InboxClaimParams,
-    InboxListParams, MessagesFollowParams, MessagesSnapshotParams, MsgSendParams,
+    InboxListParams, MessagesFollowParams, MessagesSnapshotParams, MsgReadParams, MsgSendParams,
     NotificationAttemptId, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
     PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
     Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
@@ -526,10 +526,13 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        "headless.register" => (headless_register(inner, id, req.params, peer).await, None),
+        "headless.clear" => (headless_clear(inner, id, req.params, peer), None),
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
         "msg.reply" => (msg_reply(inner, id, req.params, peer).await, None),
         "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
         "inbox.claim" => (inbox_claim(inner, id, req.params, peer), None),
+        "msg.read" => (msg_read(inner, id, req.params, peer), None),
         "messages.snapshot" => (messages_snapshot(inner, id, req.params, peer), None),
         "messages.follow" => (messages_follow(inner, id, req.params, peer), None),
         "msg.requeue" => (msg_requeue(inner, id, req.params, peer), None),
@@ -818,7 +821,7 @@ fn from_result(id: Value, result: Result<Value, cyclops_proto::WireError>) -> Re
 /// (hook-ACK evidence) must never disagree about who is allowed in. A
 /// tightening applied to one and not the other would leave the record
 /// trusting a peer the other verb turns away.
-fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
+pub(crate) fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
     let deny = |message: String| WireError {
         code: "denied".to_string(),
         message,
@@ -841,6 +844,29 @@ fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
         return Err(deny(format!("uid {} is not the daemon's user", id.uid)));
     }
     Ok((id.uid, id.pid))
+}
+
+/// `cyclops name <label> --self` from a process with no pane. The label
+/// binds to the nearest agent in the caller's process tree; the request
+/// names nothing (rule 5).
+async fn headless_register(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: crate::headless::HeadlessRegisterParams =
+        match decode_params(&id, params, "headless.register params") {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
+    from_result(id, crate::headless::register(inner, peer, params).await)
+}
+
+fn headless_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: crate::headless::HeadlessClearParams = match params {
+        Value::Null => crate::headless::HeadlessClearParams::default(),
+        given => match decode_params(&id, given, "headless.clear params") {
+            Ok(params) => params,
+            Err(response) => return response,
+        },
+    };
+    from_result(id, crate::headless::clear(inner, peer, params))
 }
 
 async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
@@ -948,6 +974,35 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         id,
         serde_json::to_value(result).expect("inbox claim serializes"),
     )
+}
+
+/// The operator reads one message, body included, without claiming it.
+/// Only the admin origin is served: a body reaches an agent through an
+/// authenticated claim and nothing else, so an agent caller is refused
+/// before the message is even looked up. No journal line is appended.
+fn msg_read(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+    let params: MsgReadParams = match decode_params(&id, params, "msg.read params") {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
+        Ok(caller) => caller,
+        Err(error) => return wire_error_response(id, error),
+    };
+    if !caller.key.is_admin() {
+        return Response::err(
+            id,
+            "forbidden",
+            "bodies reach an agent only through a claim",
+        );
+    }
+    match messaging.read_message(caller.key, params.message_id) {
+        Ok(message) => Response::ok(
+            id,
+            serde_json::to_value(message).expect("message read serializes"),
+        ),
+        Err(error) => wire_error_response(id, mailbox_service_error(error)),
+    }
 }
 
 fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
@@ -1151,12 +1206,11 @@ fn resolve_mailbox_identity(
             };
             let root = ProcessInstanceId::new(route.root.pid, route.root.birth)
                 .map_err(|_| mailbox_origin_denied())?;
-            if inner
+            if !inner
                 .registry
                 .lock()
                 .expect("registry lock")
-                .for_route(route.recipient_key, root)
-                .is_none()
+                .route_is_current(route.recipient_key, root)
             {
                 return Err(mailbox_origin_denied());
             }
@@ -1318,6 +1372,7 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
             }
         }
         MailboxServiceError::Store(error) => ("mailbox_error", error.to_string()),
+        MailboxServiceError::OperatorRequired => ("forbidden", error.to_string()),
         MailboxServiceError::Poisoned | MailboxServiceError::ForeignDirectory => {
             ("mailbox_error", error.to_string())
         }
@@ -1358,17 +1413,31 @@ pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> 
         .collect()
 }
 
-/// One exact row eligible to authenticate a hook report.
+/// One exact row eligible to authenticate a mailbox caller or a hook
+/// report: a watched pane, or a headless registration.
 struct ReportPane {
-    session_idx: usize,
+    /// None for a headless root, which sits in no watched session.
+    session_idx: Option<usize>,
     recipient_key: RecipientKey,
     pane_id: String,
     label: Option<String>,
     root: identity::ProcId,
 }
 
+/// The watched pane roots alone, for a walk that must refuse anything
+/// inside one (a headless registration).
+pub(crate) fn watched_pane_roots(inner: &Inner) -> Vec<(String, identity::ProcId)> {
+    report_panes(inner)
+        .into_iter()
+        .filter(|pane| pane.session_idx.is_some())
+        .map(|pane| (pane.pane_id, pane.root))
+        .collect()
+}
+
 /// Rows for authenticated hook origins. Detached sessions use their
 /// last-known panes because the process tree can outlive control mode.
+/// Headless registrations follow as root rows of their own; one whose
+/// process is observed gone here is retired rather than answered for.
 fn report_panes(inner: &Inner) -> Vec<ReportPane> {
     let panes = crate::mailbox_panes(inner, None);
     let mut rows = Vec::new();
@@ -1390,12 +1459,42 @@ fn report_panes(inner: &Inner) -> Vec<ReportPane> {
                 .map(|adoption| adoption.label.clone())
         });
         rows.push(ReportPane {
-            session_idx,
+            session_idx: Some(session_idx),
             recipient_key,
             pane_id: pane.row.pane_id.clone(),
             label,
             root,
         });
+    }
+    let headless = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .headless_adoptions();
+    let mut dead = Vec::new();
+    for adoption in headless {
+        let root = crate::headless::proc_id(adoption.root);
+        if !root.still_live() {
+            dead.push(adoption.recipient);
+            continue;
+        }
+        rows.push(ReportPane {
+            session_idx: None,
+            recipient_key: adoption.recipient,
+            pane_id: String::new(),
+            label: Some(adoption.label),
+            root,
+        });
+    }
+    if !dead.is_empty() {
+        // The exit watcher is the ordinary path; this is the fallback rule
+        // 8 names, and it runs off the observation just made. Only from
+        // inside the runtime, which every request handler is.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if let Some(inner) = crate::inner_handle(inner) {
+                handle.spawn(async move { crate::headless::retire_dead(&inner, dead) });
+            }
+        }
     }
     rows
 }
@@ -1518,6 +1617,15 @@ fn verify_report_origin(
     let pane = report_pane_at(&panes, &route_idx, pane_root).ok_or_else(|| {
         deny("the authenticated hook route vanished during verification".to_string())
     })?;
+    // A headless agent has no pane and therefore no hooks to report: a
+    // vendor hook fired under one is refused here, quietly, like the
+    // operator's.
+    let Some(session_idx) = pane.session_idx else {
+        return Err(deny(
+            "hook reports come from inside an agent pane; this peer descends from a headless              registration, which has no pane"
+                .to_string(),
+        ));
+    };
     let pane_id = pane.pane_id.clone();
     let label = pane.label.clone();
     let pane_root = pane.root;
@@ -1541,7 +1649,7 @@ fn verify_report_origin(
     let provisional = ReportOrigin {
         recipient: recipient.clone(),
         pane_id: pane_id.clone(),
-        session_idx: pane.session_idx,
+        session_idx,
         recipient_key: pane.recipient_key,
         pane_root,
         agent: identity::ProcId { pid: 0, birth: 0 },
@@ -1569,7 +1677,7 @@ fn verify_report_origin(
     // agent holds the tty or handed it over; a helper nobody's agent
     // started has no such ancestor and is refused.
     let Some((vendor, agent_pid)) =
-        fusion::vendor_between(inner, pane.session_idx, &pane_id, pid, pane_root.pid)
+        fusion::vendor_between(inner, session_idx, &pane_id, pid, pane_root.pid)
     else {
         return Err(deny(
             "hook reports come from an agent process; nothing between this peer and the pane's \
@@ -1600,7 +1708,7 @@ fn verify_report_origin(
     Ok(ReportOrigin {
         recipient,
         pane_id,
-        session_idx: pane.session_idx,
+        session_idx,
         recipient_key: pane.recipient_key,
         pane_root: pane.root,
         agent: agent_pid,
@@ -2798,6 +2906,7 @@ mod tests {
             // spawns a session_task or calls Daemon::shutdown.
             stop: watch::channel(false).1,
             extra_tasks: StdMutex::new(Vec::new()),
+            self_handle: std::sync::OnceLock::new(),
         })
     }
 
@@ -3056,6 +3165,7 @@ mod tests {
                         }],
                     },
                     raw: false,
+                    broadcast: false,
                 },
             )
             .unwrap();
@@ -3162,6 +3272,7 @@ mod tests {
                             }],
                         },
                         raw: false,
+                        broadcast: false,
                     },
                 )
                 .unwrap();
@@ -3972,14 +4083,14 @@ mod tests {
         let second_root = identity::ProcId { pid: 42, birth: 2 };
         let panes = vec![
             ReportPane {
-                session_idx: 0,
+                session_idx: Some(0),
                 recipient_key: RecipientKey::agent(workspace, first_session, pane),
                 pane_id: pane.to_string(),
                 label: Some("first".into()),
                 root: first_root,
             },
             ReportPane {
-                session_idx: 1,
+                session_idx: Some(1),
                 recipient_key: RecipientKey::agent(workspace, second_session, pane),
                 pane_id: pane.to_string(),
                 label: Some("second".into()),
@@ -3988,7 +4099,7 @@ mod tests {
         ];
 
         let selected = report_pane_at(&panes, "1", second_root).unwrap();
-        assert_eq!(selected.session_idx, 1);
+        assert_eq!(selected.session_idx, Some(1));
         assert_eq!(selected.label.as_deref(), Some("second"));
         assert_eq!(
             selected.recipient_key,

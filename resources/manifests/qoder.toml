@@ -1,0 +1,82 @@
+# Cyclops detection manifest: Qoder CLI (Qoder)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no qoder binary was run on the evidence host and
+# no turn, title, or screen was captured. Sources:
+#   https://docs.qoder.com/cli/hooks-reference   events, common payload fields
+#   https://docs.qoder.com/cli/cli-reference     `>` prompt, `!` bash, `/` slash commands
+#   https://docs.qoder.com/cli/overview
+#   https://www.npmjs.com/package/@qoder-ai/qodercli
+#   skills.sh catalog row `qoder`: skills directory ~/.qoder/skills
+#
+# Sensor summary for this CLI:
+#   process  qoder is an npm package (@qoder-ai/qodercli, also installed
+#            by `curl qoder.com/install`) run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED
+#            for gemini, inferred here). "node" is not listed: it would
+#            claim every Node process. Until the daemon reads the script
+#            path behind an interpreter, pin the pane:
+#            cyclops name %N <label> --manifest qoder.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.qoder/settings.json ($QODER_CONFIG_DIR relocates ~/.qoder);
+#            plugins ship hooks/hooks.json. Every payload carries
+#            session_id, transcript_path, cwd, hook_event_name,
+#            permission_mode, agent_id, agent_type. The event-specific
+#            fields live in an "Event Catalog" section the hooks reference
+#            defers to and which was not located, so the UserPromptSubmit
+#            prompt field is undocumented here and no ACK payload field is
+#            declared. No turn id ties Stop to its UserPromptSubmit.
+#   screen   UNMEASURED. The docs name the `>` prompt, `!` for bash and
+#            `/` for slash commands, and describe a status bar as
+#            `model · workspace · +N -N` (a template with placeholders, not
+#            a quoted row), so no idle or working rule ships and deliveries
+#            fail closed (not write-ready) until someone measures the
+#            composer.
+
+[agent]
+id = "qoder"
+display_name = "Qoder CLI"
+version_tested = "unverified"
+process_names = ["qoder"]
+argv_basenames = ["qoder"]
+launch = "qoder"
+
+[hooks]
+config_mechanism = "hooks object in ~/.qoder/settings.json"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit",
+  "SessionStart", "SessionEnd", "Stop", "StopFailure", "SubagentStart",
+  "SubagentStop", "PreCompact", "PostCompact", "Notification",
+  "ConfigChange", "InstructionsLoaded", "CwdChanged", "FileChanged",
+  "WorktreeCreate", "WorktreeRemove", "Elicitation", "ElicitationResult",
+  "TaskCreated", "TaskCompleted", "PermissionRequest", "PermissionDenied",
+  "TeammateIdle", "Setup",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.qoder/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Qoder CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

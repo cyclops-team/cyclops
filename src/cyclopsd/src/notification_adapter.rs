@@ -40,11 +40,14 @@ pub(crate) enum NotificationAdapterError {
     MessageMissing,
 }
 
-/// A doorbell or raw write may still go out after the recipient claimed the
-/// message: the wake is for the operator's eyes and the claim is what the
-/// recipient did. Only the retired direct payload was withdrawn by a claim.
-fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationTransport) -> bool {
-    state.is_pending() || (state.is_claimed() && transport != NotificationTransport::DirectPayload)
+/// Nothing is written for a message the recipient already holds. A claim
+/// before the write boundary settles the attempt as withdrawn under the
+/// same store lock, so a worker that reaches its pre-write check after a
+/// claim finds the entry claimed and stops without touching the pane. A
+/// doorbell already past Enter is receipted by the claim instead; that path
+/// never asks this question.
+fn entry_allows_notification(state: &MailboxEntryState, _transport: NotificationTransport) -> bool {
+    state.is_pending()
 }
 
 impl NotificationContext {
@@ -309,6 +312,52 @@ impl NotificationContext {
             self.recipient,
             self.attempt_id,
             verified_by,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
+    /// The mailbox-only delivery for a headless recipient. Nothing is
+    /// gated and nothing is written: the attempt goes from `queued` to
+    /// `notified` with `transport: mailbox`, and the recipient reads the
+    /// message over the socket. Refused, without a fact, when the entry is
+    /// no longer pending (a claim already settled it) or the attempt moved.
+    pub(crate) fn record_mailbox_notified(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        let current = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
+        if !self.owns(&current) {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        if current.state == NotificationState::Notified
+            && current.transport == NotificationTransport::Mailbox
+        {
+            return Ok(current);
+        }
+        if current.state != NotificationState::Queued {
+            return Err(NotificationAdapterError::TerminalConflict(current.state));
+        }
+        let pending = store
+            .projection()
+            .get_entry(self.recipient, &self.message_id)
+            .is_some_and(|entry| {
+                entry_allows_notification(&entry.state, NotificationTransport::Mailbox)
+            });
+        if !pending {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        let record = store.advance_notification_mailbox_notified(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
         )?;
         self.publish_transition(&record);
         Ok(record)

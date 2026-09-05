@@ -86,6 +86,8 @@ pub enum ManifestError {
     BadInjection { id: String, why: String },
     #[error("manifest {id}: messaging: {why}")]
     BadMessaging { id: String, why: String },
+    #[error("manifest {id}: hooks.wiring: {why}")]
+    BadWiring { id: String, why: String },
 }
 
 /// Event names as the runtime compares them: ASCII alphanumerics only,
@@ -339,6 +341,12 @@ pub struct Hooks {
     /// $CODEX_HOME/hooks.json, agy reads <workspace>/.agents/hooks.json).
     #[serde(default)]
     pub settings_flag: Option<String>,
+    /// How Cyclops writes this vendor's hook file, when the vendor is wired
+    /// from this table instead of a compiled-in template. Absent for the
+    /// vendors `resources/hooks/` covers and for vendors with no shell
+    /// hook. Validated by [`HookWiring::validate`] at parse time.
+    #[serde(default)]
+    pub wiring: Option<HookWiring>,
 }
 
 impl Hooks {
@@ -383,6 +391,272 @@ impl Hooks {
         names.extend(self.turn_start.as_deref());
         names.extend(self.turn_end.as_deref());
         names
+    }
+}
+
+/// The file shapes `[hooks.wiring]` can name. Each one is a vendor's
+/// documented hook configuration format; the writer for each lives in the
+/// CLI (`src/cyclops/src/wiring.rs`) and the manifest only names it.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String")]
+pub enum WiringShape {
+    /// A `hooks` object merged into a JSON settings file, Claude Code
+    /// style: `{"hooks":{"<Event>":[{"matcher":"","hooks":[{"type":
+    /// "command","command":"<cmd>","timeout":10}]}]}}`.
+    ClaudeSettings,
+    /// The same `hooks` object as a file of its own.
+    ClaudeHooksFile,
+    /// GitHub Copilot CLI: `{"version":1,"hooks":{"<event>":[{"type":
+    /// "command","bash":"<cmd>","timeoutSec":10}]}}`.
+    Copilot,
+    /// Hermes Agent: a `hooks:` block in a YAML config.
+    HermesYaml,
+    /// Mistral Vibe: `[[hooks]]` tables in a TOML file.
+    VibeToml,
+    /// Autohand: `hooks.hooks[]` entries `{"event","command","description",
+    /// "enabled"}` merged into `config.json`.
+    Autohand,
+    /// Kiro CLI: a `hooks` object in an agent JSON,
+    /// `{"<event>":[{"command":"<cmd>"}]}`.
+    KiroAgent,
+    /// Tabnine CLI: `{"hooks":{"<Event>":[{"hooks":[{"type":"command",
+    /// "command":"<cmd>","name":"cyclops"}]}]}}`.
+    Tabnine,
+    /// OpenHands: `{"hooks":{"<Event>":[{"command":"<cmd>","timeout":10}]}}`.
+    Openhands,
+}
+
+impl WiringShape {
+    /// Every shape, in the order the reference documents them.
+    pub const ALL: [WiringShape; 9] = [
+        WiringShape::ClaudeSettings,
+        WiringShape::ClaudeHooksFile,
+        WiringShape::Copilot,
+        WiringShape::HermesYaml,
+        WiringShape::VibeToml,
+        WiringShape::Autohand,
+        WiringShape::KiroAgent,
+        WiringShape::Tabnine,
+        WiringShape::Openhands,
+    ];
+
+    /// The spelling a manifest uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            WiringShape::ClaudeSettings => "claude-settings",
+            WiringShape::ClaudeHooksFile => "claude-hooks-file",
+            WiringShape::Copilot => "copilot",
+            WiringShape::HermesYaml => "hermes-yaml",
+            WiringShape::VibeToml => "vibe-toml",
+            WiringShape::Autohand => "autohand",
+            WiringShape::KiroAgent => "kiro-agent",
+            WiringShape::Tabnine => "tabnine",
+            WiringShape::Openhands => "openhands",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<WiringShape> {
+        WiringShape::ALL
+            .into_iter()
+            .find(|shape| shape.name() == name)
+    }
+}
+
+impl TryFrom<String> for WiringShape {
+    type Error = String;
+
+    /// The unknown-shape message names the shape and every known one, so a
+    /// typo in a manifest is one line to fix rather than a guess.
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        WiringShape::from_name(&name).ok_or_else(|| {
+            let known: Vec<&str> = WiringShape::ALL.iter().map(|shape| shape.name()).collect();
+            format!(
+                "unknown hooks.wiring.shape {name:?}; known shapes: {}",
+                known.join(", ")
+            )
+        })
+    }
+}
+
+/// The five lifecycle edges Cyclops wires, by the key `[hooks.wiring.events]`
+/// uses for each. The value under a key is the vendor's own event name, and
+/// only the keys a manifest declares are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WiringEvent {
+    SessionStart,
+    PromptSubmit,
+    Stop,
+    Notification,
+    PermissionRequest,
+}
+
+impl WiringEvent {
+    pub const ALL: [WiringEvent; 5] = [
+        WiringEvent::SessionStart,
+        WiringEvent::PromptSubmit,
+        WiringEvent::Stop,
+        WiringEvent::Notification,
+        WiringEvent::PermissionRequest,
+    ];
+
+    /// The manifest key.
+    pub fn key(self) -> &'static str {
+        match self {
+            WiringEvent::SessionStart => "session_start",
+            WiringEvent::PromptSubmit => "prompt_submit",
+            WiringEvent::Stop => "stop",
+            WiringEvent::Notification => "notification",
+            WiringEvent::PermissionRequest => "permission_request",
+        }
+    }
+}
+
+/// `[hooks.wiring.events]`: which of the five edges this vendor fires, and
+/// what it calls each. Unknown keys are refused here, unlike the rest of the
+/// manifest: a misspelled key would silently drop an edge, and the prompt
+/// edge is the one a verified receipt depends on.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WiringEvents {
+    #[serde(default)]
+    pub session_start: Option<String>,
+    #[serde(default)]
+    pub prompt_submit: Option<String>,
+    #[serde(default)]
+    pub stop: Option<String>,
+    #[serde(default)]
+    pub notification: Option<String>,
+    #[serde(default)]
+    pub permission_request: Option<String>,
+}
+
+impl WiringEvents {
+    /// The vendor name declared for one edge.
+    pub fn get(&self, event: WiringEvent) -> Option<&str> {
+        match event {
+            WiringEvent::SessionStart => self.session_start.as_deref(),
+            WiringEvent::PromptSubmit => self.prompt_submit.as_deref(),
+            WiringEvent::Stop => self.stop.as_deref(),
+            WiringEvent::Notification => self.notification.as_deref(),
+            WiringEvent::PermissionRequest => self.permission_request.as_deref(),
+        }
+    }
+
+    /// Every declared edge with its vendor name, in [`WiringEvent::ALL`]
+    /// order, so a rendered file lists events in one stable order.
+    pub fn declared(&self) -> Vec<(WiringEvent, &str)> {
+        WiringEvent::ALL
+            .into_iter()
+            .filter_map(|event| self.get(event).map(|name| (event, name)))
+            .collect()
+    }
+}
+
+/// Where a `[hooks.wiring]` file lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WiringScope {
+    /// `~/...`: one file per machine, in the operator's home. Setup wires
+    /// it once the vendor's directory exists.
+    Home,
+    /// A relative path: one file per project, resolved against the working
+    /// directory the vendor is started in. Setup has no project to resolve
+    /// it against, so the operator places it.
+    Project,
+}
+
+/// `[hooks.wiring]`: enough for the CLI to write this vendor's hook file
+/// without a Rust template. `file` is `~/`-relative or project-relative,
+/// never absolute, because a manifest is shared between machines; for a
+/// home file, the directory it lives in is what proves the vendor is
+/// installed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HookWiring {
+    pub shape: WiringShape,
+    pub file: String,
+    pub events: WiringEvents,
+    /// The field on the prompt-submit payload that carries the prompt text,
+    /// when the vendor documents it. That is what lets a doorbell be found
+    /// inside the payload; without it the receipt settles on screen evidence.
+    #[serde(default)]
+    pub payload_prompt_field: Option<String>,
+}
+
+impl HookWiring {
+    /// Whether `file` is a home file or a project file.
+    pub fn scope(&self) -> WiringScope {
+        if self.file.starts_with("~/") {
+            WiringScope::Home
+        } else {
+            WiringScope::Project
+        }
+    }
+
+    /// `file` without its `~/`, for a home file.
+    pub fn home_relative(&self) -> Option<&str> {
+        self.file.strip_prefix("~/")
+    }
+
+    /// The path `file` names once `~/` is `home` and a project-relative
+    /// file is under `project`.
+    pub fn file_under(&self, home: &Path, project: &Path) -> PathBuf {
+        match self.home_relative() {
+            Some(rest) => home.join(rest),
+            None => project.join(&self.file),
+        }
+    }
+
+    /// What `Manifest::parse` refuses. Each rule prevents a file that would
+    /// wire nothing or wire the wrong thing:
+    ///
+    /// 1. `file` is `~/`-relative or project-relative and never climbs out
+    ///    of its root, so a shared manifest cannot name one machine's
+    ///    absolute path.
+    /// 2. At least one event is declared; a wiring with none writes an
+    ///    empty file for no reason.
+    /// 3. Every vendor event name is a plain word (letters, digits, `_`,
+    ///    `-`): it ends up on a command line as `cyclops hook <name>`, and
+    ///    the writer recognizes its own entries by exactly that form.
+    /// 4. `payload_prompt_field` needs a `prompt_submit` event to describe.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.file.starts_with('/') || self.file.starts_with('~') && !self.file.starts_with("~/")
+        {
+            return Err(format!(
+                "file {:?} must start with \"~/\" or be relative to the project",
+                self.file
+            ));
+        }
+        let rest = self.home_relative().unwrap_or(&self.file);
+        if rest.is_empty()
+            || rest.ends_with('/')
+            || Path::new(rest)
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "file {:?} must name a file below its root",
+                self.file
+            ));
+        }
+        let declared = self.events.declared();
+        if declared.is_empty() {
+            return Err("events declares no event; nothing would be wired".into());
+        }
+        for (event, name) in &declared {
+            let plain = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !plain {
+                return Err(format!(
+                    "events.{} = {name:?} is not a plain event name",
+                    event.key()
+                ));
+            }
+        }
+        if self.payload_prompt_field.is_some() && self.events.prompt_submit.is_none() {
+            return Err("payload_prompt_field needs events.prompt_submit".into());
+        }
+        Ok(())
     }
 }
 
@@ -1092,6 +1366,12 @@ impl Manifest {
                 id: raw.agent.id.clone(),
                 why,
             });
+        }
+        if let Some(wiring) = &raw.hooks.wiring {
+            wiring.validate().map_err(|why| ManifestError::BadWiring {
+                id: raw.agent.id.clone(),
+                why,
+            })?;
         }
         let key = &raw.hooks.turn_key_fields;
         if !key.is_empty() {
@@ -2188,5 +2468,182 @@ regex_esc = ['DONE']
             unpaired.is_err(),
             "regex_esc without a paired regex must not parse"
         );
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    const HEAD: &str = r#"
+[agent]
+id = "vendor"
+display_name = "Vendor CLI"
+
+[hooks]
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+"#;
+
+    fn parse(wiring: &str) -> Result<Manifest, ManifestError> {
+        Manifest::parse(&format!("{HEAD}{wiring}"), Path::new("vendor.toml"))
+    }
+
+    fn wiring(shape: &str) -> String {
+        format!(
+            "[hooks.wiring]\nshape = \"{shape}\"\nfile = \"~/.vendor/settings.json\"\n\
+             payload_prompt_field = \"prompt\"\n\n[hooks.wiring.events]\n\
+             session_start = \"SessionStart\"\nprompt_submit = \"UserPromptSubmit\"\n\
+             stop = \"Stop\"\nnotification = \"Notification\"\n\
+             permission_request = \"PermissionRequest\"\n"
+        )
+    }
+
+    #[test]
+    fn a_manifest_without_wiring_declares_none() {
+        assert!(parse("").unwrap().hooks.wiring.is_none());
+    }
+
+    #[test]
+    fn every_shape_parses_by_its_documented_name() {
+        for shape in WiringShape::ALL {
+            let manifest = parse(&wiring(shape.name()))
+                .unwrap_or_else(|e| panic!("{} did not parse: {e}", shape.name()));
+            let wired = manifest.hooks.wiring.expect("wiring parsed");
+            assert_eq!(wired.shape, shape);
+            assert_eq!(WiringShape::from_name(shape.name()), Some(shape));
+            assert_eq!(wired.file, "~/.vendor/settings.json");
+            assert_eq!(wired.scope(), WiringScope::Home);
+            assert_eq!(
+                wired.file_under(Path::new("/home/op"), Path::new("/work")),
+                Path::new("/home/op/.vendor/settings.json")
+            );
+            assert_eq!(wired.payload_prompt_field.as_deref(), Some("prompt"));
+            assert_eq!(
+                wired.events.declared(),
+                vec![
+                    (WiringEvent::SessionStart, "SessionStart"),
+                    (WiringEvent::PromptSubmit, "UserPromptSubmit"),
+                    (WiringEvent::Stop, "Stop"),
+                    (WiringEvent::Notification, "Notification"),
+                    (WiringEvent::PermissionRequest, "PermissionRequest"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn only_declared_events_are_wired() {
+        let manifest = parse(
+            "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/.copilot/hooks/cyclops.json\"\n\
+             [hooks.wiring.events]\nprompt_submit = \"userPromptSubmitted\"\nstop = \"agentStop\"\n",
+        )
+        .unwrap();
+        let wired = manifest.hooks.wiring.unwrap();
+        assert_eq!(
+            wired.events.declared(),
+            vec![
+                (WiringEvent::PromptSubmit, "userPromptSubmitted"),
+                (WiringEvent::Stop, "agentStop"),
+            ]
+        );
+        assert_eq!(wired.events.get(WiringEvent::SessionStart), None);
+        assert_eq!(wired.payload_prompt_field, None);
+    }
+
+    /// A project file is the vendor's own convention (OpenHands reads
+    /// `.openhands/hooks.json` from the repository), and a manifest may
+    /// say so. It resolves against the project, not the home.
+    #[test]
+    fn a_project_relative_file_is_accepted() {
+        let manifest = parse(
+            "[hooks.wiring]\nshape = \"openhands\"\nfile = \".openhands/hooks.json\"\n\
+             [hooks.wiring.events]\nstop = \"stop\"\n",
+        )
+        .unwrap();
+        let wired = manifest.hooks.wiring.unwrap();
+        assert_eq!(wired.scope(), WiringScope::Project);
+        assert_eq!(wired.home_relative(), None);
+        assert_eq!(
+            wired.file_under(Path::new("/home/op"), Path::new("/work/repo")),
+            Path::new("/work/repo/.openhands/hooks.json")
+        );
+    }
+
+    #[test]
+    fn an_unknown_shape_is_refused_by_name() {
+        let error = parse(&wiring("sqlite")).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown hooks.wiring.shape \"sqlite\""),
+            "{error}"
+        );
+        assert!(error.contains("claude-settings"), "{error}");
+        assert!(error.contains("openhands"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_event_key_is_refused() {
+        let error = parse(
+            "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/.copilot/hooks/cyclops.json\"\n\
+             [hooks.wiring.events]\nprompt_sumbit = \"userPromptSubmitted\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("prompt_sumbit"), "{error}");
+    }
+
+    #[test]
+    fn wiring_validation_names_each_refusal() {
+        let cases = [
+            (
+                "absolute file",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"/etc/hooks.json\"\n\
+                 [hooks.wiring.events]\nstop = \"agentStop\"\n",
+                "must start with \"~/\" or be relative to the project",
+            ),
+            (
+                "bare tilde",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~hooks.json\"\n\
+                 [hooks.wiring.events]\nstop = \"agentStop\"\n",
+                "must start with \"~/\" or be relative to the project",
+            ),
+            (
+                "file climbs out of home",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/../hooks.json\"\n\
+                 [hooks.wiring.events]\nstop = \"agentStop\"\n",
+                "must name a file below its root",
+            ),
+            (
+                "project file climbs out of the project",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"../hooks.json\"\n\
+                 [hooks.wiring.events]\nstop = \"agentStop\"\n",
+                "must name a file below its root",
+            ),
+            (
+                "no events",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/.copilot/hooks/cyclops.json\"\n\
+                 [hooks.wiring.events]\n",
+                "declares no event",
+            ),
+            (
+                "event with shell characters",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/.copilot/hooks/cyclops.json\"\n\
+                 [hooks.wiring.events]\nstop = \"agentStop; rm -rf\"\n",
+                "events.stop = \"agentStop; rm -rf\" is not a plain event name",
+            ),
+            (
+                "prompt field without a prompt event",
+                "[hooks.wiring]\nshape = \"copilot\"\nfile = \"~/.copilot/hooks/cyclops.json\"\n\
+                 payload_prompt_field = \"prompt\"\n[hooks.wiring.events]\nstop = \"agentStop\"\n",
+                "payload_prompt_field needs events.prompt_submit",
+            ),
+        ];
+        for (case, body, expected) in cases {
+            let error = parse(body).unwrap_err().to_string();
+            assert!(
+                error.starts_with("manifest vendor: hooks.wiring: ") && error.contains(expected),
+                "{case}: {error}"
+            );
+        }
     }
 }

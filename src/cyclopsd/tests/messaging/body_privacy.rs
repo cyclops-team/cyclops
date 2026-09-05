@@ -12,7 +12,7 @@ use common::*;
 use cyclops_proto::NotificationState;
 use serde_json::{json, Value};
 
-const IDENTITY_MANIFEST: &str = r#"
+pub(crate) const IDENTITY_MANIFEST: &str = r#"
 [agent]
 id = "body-privacy-fixture"
 display_name = "Body privacy fixture"
@@ -34,7 +34,7 @@ fn client_path() -> String {
     )
 }
 
-fn named_clients(tag: &str) -> PathBuf {
+pub(crate) fn named_clients(tag: &str) -> PathBuf {
     let dir = cyclops_proto::scratch::scratch_dir(&format!("cyc-{tag}-bin"));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let output = Command::new("sh")
@@ -53,7 +53,7 @@ fn named_clients(tag: &str) -> PathBuf {
     dir
 }
 
-fn agent_command_loop(client_dir: &Path) -> String {
+pub(crate) fn agent_command_loop(client_dir: &Path) -> String {
     format!(
         "{}/cycagent -u -c 'import shlex,subprocess,sys\nfor line in sys.stdin:\n try: subprocess.run(shlex.split(line))\n except Exception: pass'",
         client_dir.display()
@@ -81,7 +81,7 @@ async fn response(out: &Path) -> Value {
     panic!("client never answered: {}", out.display());
 }
 
-async fn pane_request(
+pub(crate) async fn pane_request(
     rig: &mut Rig,
     client_dir: &Path,
     pane: &str,
@@ -108,18 +108,19 @@ async fn pane_request(
     response(&out).await
 }
 
-async fn wait_manifest_bound(rig: &mut Rig, pane_count: usize) {
+pub(crate) async fn wait_manifest_bound(rig: &mut Rig, pane_count: usize) {
+    wait_manifest_bound_to(rig, pane_count, "body-privacy-fixture").await;
+}
+
+/// Wait until every fixture pane is bound to the manifest `manifest_id`.
+pub(crate) async fn wait_manifest_bound_to(rig: &mut Rig, pane_count: usize, manifest_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
         let panes = status["result"]["sessions"][0]["panes"]
             .as_array()
             .unwrap_or_else(|| panic!("no panes in {status}"));
-        if panes.len() == pane_count
-            && panes
-                .iter()
-                .all(|pane| pane["manifest"] == "body-privacy-fixture")
-        {
+        if panes.len() == pane_count && panes.iter().all(|pane| pane["manifest"] == manifest_id) {
             return;
         }
         assert!(
@@ -209,7 +210,7 @@ async fn wait_for_notification_state(rig: &mut Rig, message_id: &str, state: &st
     }
 }
 
-async fn wait_for_notification_submitted(rig: &mut Rig, message_id: &str) {
+pub(crate) async fn wait_for_notification_submitted(rig: &mut Rig, message_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         if notification_state_count(rig, message_id, "submitted") > 0
@@ -619,7 +620,7 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal() {
+async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -720,38 +721,38 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
         .into_iter()
         .any(|line| { line["id"] == first_id && line["data"]["type"] == "message_claimed" }));
 
-    let snapshot = pane_request(
-        &mut rig,
-        &client_dir,
-        &recipient,
-        "snapshot-after-blocked-claim",
-        "messages.snapshot",
-        json!({}),
-    )
-    .await;
+    // The claim withdrew the blocked attempt: the recipient holds the body,
+    // so the wake has nothing left to announce and the FIFO moves on. Read
+    // the projection over the admin socket: the second doorbell may now
+    // land in the loop pane and must not race a command typed there.
+    let lines_after_claim = workspace_lines(&rig).len();
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     assert!(snapshot["error"].is_null(), "snapshot failed: {snapshot}");
     let rows = snapshot["result"]["rows"].as_array().unwrap();
     let first_row = rows
         .iter()
         .find(|row| row["message_id"] == first_id)
         .expect("claimed first message remains visible");
-    let second_row = rows
-        .iter()
-        .find(|row| row["message_id"] == second_id)
-        .expect("second message remains visible");
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
-    assert!(matches!(
-        first_row["recipients"][0]["notification"]["state"].as_str(),
-        Some("gating" | "blocked_pre_write")
-    ));
-    assert!(first_row["recipients"][0]["notification"]["settlement"].is_null());
-    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
+    let first_notification = &first_row["recipients"][0]["notification"];
+    assert_eq!(first_notification["state"], "not_started", "{first_row}");
+    assert_eq!(first_notification["settlement"], "withdrawn_by_claim");
     assert_eq!(
-        second_row["recipients"][0]["notification"]["state"],
-        "not_started"
+        first_notification["pre_write_cause"],
+        "claimed_before_write"
     );
-    assert!(notification_attempts(&rig, &second_id).is_empty());
 
+    let second_attempt = wait_for_notification_attempt(&mut rig, &second_id).await;
+    wait_for_notification_state(&mut rig, &second_id, "writing").await;
+    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
+    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
+    assert_ne!(first_attempt, second_attempt);
+    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
+    assert!(notification_state_count(&rig, &second_id, "writing") > 0);
+
+    // The operator withdrawing the already-withdrawn attempt is answered
+    // with the record and appends nothing.
+    let lines_before_withdraw = workspace_lines(&rig).len();
     let withdrawn = rig
         .ctl
         .request(
@@ -763,15 +764,141 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
         )
         .await;
     assert!(withdrawn["error"].is_null(), "{withdrawn}");
-    let second_attempt = wait_for_notification_attempt(&mut rig, &second_id).await;
-    wait_for_notification_state(&mut rig, &second_id, "writing").await;
-    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
-    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
-    assert_ne!(first_attempt, second_attempt);
-    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
-    assert!(notification_state_count(&rig, &second_id, "writing") > 0);
+    let first_lines = |lines: &[Value]| lines.iter().filter(|l| l["id"] == first_id).count();
+    assert_eq!(
+        first_lines(&workspace_lines(&rig)),
+        first_lines(&workspace_lines(&rig)[..lines_before_withdraw]),
+        "the operator withdrawal appended a fact for the withdrawn attempt"
+    );
+    assert!(lines_after_claim <= lines_before_withdraw);
     let history = pane_history(&rig, &recipient);
     assert!(!history.contains(&compact_doorbell(&first_attempt)));
 
     rig.shutdown().await;
+}
+
+/// `msg.read` is the operator's read: the admin origin gets the body
+/// without claiming, the message stays pending for its recipient, and the
+/// read appends nothing. Every agent caller is refused, the message's own
+/// recipient included, because a body reaches an agent only through a
+/// claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_operator_reads_a_body_without_claiming_and_an_agent_is_refused() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let client_dir = named_clients("msg-read");
+    let pane_command = agent_command_loop(&client_dir);
+    let mut rig = Rig::new("msgread", IDENTITY_MANIFEST, &pane_command, "").await;
+    let first = rig.pane_ids().await[0].clone();
+    rig.tmux
+        .run_ok(&["split-window", "-d", "-t", &first, &pane_command]);
+    rig.wait_attached(2).await;
+    wait_manifest_bound(&mut rig, 2).await;
+    let panes = rig.pane_ids().await;
+    let sender = panes[0].clone();
+    let recipient = panes[1].clone();
+    rig.label(&sender, "sender").await;
+    rig.label(&recipient, "recipient").await;
+
+    let secret = "operator-readable body the recipient has not claimed";
+    let sent = pane_request(
+        &mut rig,
+        &client_dir,
+        &sender,
+        "read-send",
+        "msg.send",
+        json!({
+            "to": ["recipient"],
+            "subject": "private",
+            "summary": "Read this from the mailbox.",
+            "body": secret
+        }),
+    )
+    .await;
+    assert!(sent["error"].is_null(), "send failed: {sent}");
+    let message_id = sent["result"]["msg_id"]
+        .as_str()
+        .expect("accepted message id")
+        .to_string();
+    assert_eq!(sent["result"]["thread_root"], message_id);
+    wait_for_notification_submitted(&mut rig, &message_id).await;
+
+    // The operator reads the body without claiming and without appending.
+    let lines_before = workspace_lines(&rig).len();
+    let read = rig
+        .ctl
+        .request("msg.read", json!({"message_id": message_id}))
+        .await;
+    assert!(read["error"].is_null(), "operator read failed: {read}");
+    assert_eq!(read["result"]["message_id"], message_id);
+    assert_eq!(read["result"]["body"], secret);
+    assert_eq!(read["result"]["sender_label"], "sender");
+    assert_eq!(read["result"]["recipient_label"], "recipient");
+    assert_eq!(read["result"]["thread_root"], message_id);
+    assert_eq!(
+        workspace_lines(&rig).len(),
+        lines_before,
+        "msg.read appended"
+    );
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let row = snapshot["result"]["rows"]
+        .as_array()
+        .expect("snapshot rows")
+        .iter()
+        .find(|row| row["message_id"] == message_id)
+        .expect("the message stays visible");
+    assert_eq!(
+        row["recipients"][0]["mailbox"]["status"], "pending",
+        "the operator's read claimed the message: {row}"
+    );
+
+    // The doorbell's own locator resolves to the same message.
+    let doorbell = doorbell_for(&rig, &message_id);
+    let locator = doorbell.rsplit(' ').next().expect("locator");
+    let read_by_locator = rig
+        .ctl
+        .request("msg.read", json!({"message_id": locator}))
+        .await;
+    assert_eq!(read_by_locator["result"]["message_id"], message_id);
+    assert_eq!(read_by_locator["result"]["body"], secret);
+
+    // Agents are refused: the recipient, and the sender who authored it.
+    for (pane, tag) in [(&recipient, "recipient-read"), (&sender, "sender-read")] {
+        let refused = pane_request(
+            &mut rig,
+            &client_dir,
+            pane,
+            tag,
+            "msg.read",
+            json!({"message_id": message_id}),
+        )
+        .await;
+        assert!(
+            refused["result"].is_null(),
+            "an agent read a body: {refused}"
+        );
+        assert_eq!(refused["error"]["code"], "forbidden", "{refused}");
+        assert_eq!(
+            refused["error"]["message"],
+            "bodies reach an agent only through a claim"
+        );
+    }
+
+    // The operator's read left the claim to the recipient.
+    let claimed = pane_request(
+        &mut rig,
+        &client_dir,
+        &recipient,
+        "recipient-claim",
+        "inbox.claim",
+        json!({"message_id": message_id}),
+    )
+    .await;
+    assert_eq!(claimed["result"]["disposition"], "claimed", "{claimed}");
+    assert_eq!(claimed["result"]["message"]["body"], secret);
+
+    rig.daemon.shutdown().await;
 }

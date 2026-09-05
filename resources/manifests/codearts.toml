@@ -1,0 +1,47 @@
+# Cyclops detection manifest: CodeArts Agent (Huawei)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No codearts binary was run and nothing was measured: this file binds the
+# pane and nothing more. Sources:
+#   skills.sh catalog entry codearts-agent (config under ~/.codeartsdoer/:
+#   skills/, plugins/, codearts_cli.json)
+#
+# Skills directory (skills.sh catalog key codearts-agent):
+# ~/.codeartsdoer/skills
+#
+# NO HOOK CONFIG. CodeArts Agent extends through JS/TS plugins only; no
+# shell-command lifecycle hook is documented, so no [hooks] table and no
+# wiring ships. This manifest binds the pane so the agent's own
+# `cyclops send` resolves its identity, and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  #{pane_current_command} is expected to read "codearts"
+#            (inferred from the documented executable name, not measured).
+#            If it is a Node launcher the pane may read "node", which is
+#            not listed; pin it: cyclops name %N <label> --manifest codearts.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. No prompt string was found in the documentation,
+#            so no idle rule ships and deliveries fail closed.
+
+[agent]
+id = "codearts"
+display_name = "CodeArts Agent"
+version_tested = "unverified"
+process_names = ["codearts"]
+argv_basenames = ["codearts"]
+launch = "codearts"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for CodeArts Agent."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

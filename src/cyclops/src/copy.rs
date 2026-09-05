@@ -27,6 +27,16 @@ pub const WATCH_NOT_INCLUDED: &str = "interactive watch is not included in this 
 pub const RESTART_PREDATES_FIX: &str =
     "Stop and start it once by hand: cyclops daemon stop, then cyclops start.";
 
+/// Above this many characters the CLI says the summary runs long. The
+/// daemon accepts any one-line summary; the pane shows one row, and a
+/// long preview is a paragraph the recipient scrolls past.
+pub const SUMMARY_LONG_CHARS: usize = 160;
+
+/// The one stderr warning a long summary earns. The send still goes.
+pub fn summary_runs_long(chars: usize) -> String {
+    format!("summary is {chars} characters; keep it short, the pane shows one line")
+}
+
 pub const NO_RECIPIENT: &str =
     "no recipient. Name one (cyclops send reviewer --subject \"...\" --summary \"First sentence. Second sentence.\"), or pass --to or --all.";
 
@@ -485,14 +495,16 @@ pub fn no_daemon_log(log: &std::path::Path) -> String {
 }
 
 /// `cyclops name --self` outside tmux. The flag reads $TMUX_PANE, so a
-/// shell with none set cannot mean any pane; the sentence hands over the
-/// by-id spelling instead.
-pub fn self_outside_tmux(name: &str) -> String {
-    format!(
-        "--self names the pane this command is running in, and this shell is not in one. \
-         Run it inside tmux, or name the pane by id: cyclops name %0 {name}."
-    )
-}
+/// shell with none set is a headless agent, and the daemon says so on the
+/// receipt line: no pane, socket only.
+pub const HEADLESS_NAMED: &str = "headless, no pane";
+
+/// `inbox next --wait` ended because cyclopsd closed the connection. The
+/// wait had no deadline, so this is the one exit without a message, and
+/// it is named rather than folded into a generic connection loss.
+pub const INBOX_NEXT_DAEMON_GONE: &str =
+    "cyclopsd closed the connection while this command was waiting; nothing was claimed. \
+     Start the daemon again and rerun cyclops inbox next --wait.";
 
 /// `--raw` beside a non-detection source. The other sources ARE the raw
 /// capture, so the flag there is a misunderstanding worth a sentence

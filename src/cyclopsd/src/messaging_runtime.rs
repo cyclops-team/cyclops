@@ -278,6 +278,31 @@ pub(crate) fn record_unowned_notification(
         .map_err(|error| MailboxServiceError::NotificationSchedule(error.to_string()))
 }
 
+/// The mailbox-only delivery: close the attempt `notified` with transport
+/// `mailbox` under the publication lock. A headless recipient has no pane,
+/// so there is no gate to pass and nothing to write; being in the mailbox
+/// is the notification, and the agent reads it over the socket.
+pub(crate) fn record_mailbox_delivery(
+    publication: &StdMutex<()>,
+    context: &NotificationContext,
+) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+    let head = ScheduledHead::new(context.message_id().clone(), context.attempt_id());
+    let recorded = {
+        let _publication = publication.lock().expect("mailbox publication lock");
+        context.record_mailbox_notified()
+    };
+    match recorded {
+        Ok(_) => Ok(RecipientScheduleOutcome::MailboxOnly { head }),
+        // A claim got there first, or the attempt is no longer this one:
+        // the mailbox already says what happened, and no wake is owed.
+        Err(
+            crate::notification_adapter::NotificationAdapterError::NoLongerCurrentBeforeWrite
+            | crate::notification_adapter::NotificationAdapterError::TerminalConflict(_),
+        ) => Ok(RecipientScheduleOutcome::NoWakeNeeded),
+        Err(error) => Err(MailboxServiceError::NotificationSchedule(error.to_string())),
+    }
+}
+
 /// Schedule only the oldest pending entry for one durable recipient.
 pub(crate) fn schedule_recipient(
     inner: &Arc<Inner>,
@@ -307,6 +332,12 @@ pub(crate) fn schedule_recipient(
             NotificationPreWriteCause::SessionUnavailable,
             MessageWakeBlock::DaemonStopping,
         );
+    }
+    // A headless recipient still on the roster is notified by the mailbox
+    // itself. One that was retired has no route, and its pending entries
+    // park like any other recipient whose route went away.
+    if recipient.is_headless() && service.identity_for_recipient(recipient)?.is_some() {
+        return record_mailbox_delivery(&inner.mailbox_publication, &context);
     }
     let Some(route) = notification_route(inner, service, recipient)? else {
         return park_unowned_notification(

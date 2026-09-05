@@ -16,8 +16,13 @@ outcomes from authoritative state instead of guessing or retrying blindly.
 
 Examples show current protocol shapes. Additive optional fields may be omitted
 when they are not relevant to the behavior being explained.
-Message ids are abbreviated for readability. Newly minted ids use `m-`
-followed by all 32 lowercase hexadecimal UUID digits.
+Message ids are abbreviated for readability. Newly minted ids are
+`cyc-<thread>-<message>`, two runs of eight lowercase hex characters: every
+message in one thread shares the `<thread>` run and gets its own `<message>`
+run, so the id alone says which conversation a message belongs to. Journals an
+older daemon wrote hold `m-` plus 32 lowercase hex characters; those ids still
+parse, replay, and can be replied to, and their replies share one `<thread>`
+run derived from the legacy root.
 
 ## Talk to it
 
@@ -125,6 +130,7 @@ alphabet.
 | `msg.reply` | Reply using routing and subject derived from a visible message |
 | `inbox.list` | List pending mailbox metadata without bodies |
 | `inbox.claim` | Atomically claim one message and return its payload |
+| `msg.read` | The operator reads one message, body included, without claiming it |
 | `messages.snapshot` | Read body-free inbox, outbound, and notification state |
 | `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
@@ -394,10 +400,19 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
     "body":"gateway.rs:120 drops the burst path"}}
 <- {"id":4,"result":{"deliveries":[{"notification_state":"queued",
     "state":"queued","to":"reviewer"}],"inserted":true,
-    "msg_id":"m-7fe0df","seq":7}}
+    "msg_id":"cyc-7fe0df31-a41c02e9","seq":7,
+    "thread_root":"cyc-7fe0df31-a41c02e9"}}
 ```
 
-`to` takes several labels, or `"*"` for every named pane. Interactive clients
+`thread_root` is additive: the message itself for a new thread, the parent's
+root for a `reply_to` send, a `msg.reply`, or a replacement. A message inside
+a thread shares the root's `<thread>` run and mints a fresh `<message>` run.
+
+`to` takes several labels, or `"*"` for every agent on the roster, pane or
+headless (never admin). A recipient key has one of three kinds: `admin`,
+`agent` (a pane: `workspace_id`, `session_instance_id`, `pane_id`), or
+`headless` (`workspace_id`, `agent_instance_id`; see `headless.register`).
+Interactive clients
 may instead send `to: []` with `recipient_keys`, an array of exact durable
 recipient identities returned by `messages.snapshot`. The two selectors cannot
 be combined. Exact keys must still be present in the current mailbox directory,
@@ -405,9 +420,11 @@ and the daemon snapshots their current labels only for display. A rename cannot
 retarget a selected key. `reply_to` derives its recipient from the referenced
 message and therefore permits neither selector.
 
-`summary` is optional. When present it must be one non-empty line of at most
-240 characters with no control characters; the daemon validates it before
-acceptance and includes it in the semantic request digest. When absent the
+`summary` is optional. When present it must be one non-empty line with no
+control characters; there is no length cap, because the pane shows one row
+and a long summary simply wraps, but the CLI warns the sender above 160
+characters. The daemon validates the line before acceptance and includes it
+in the semantic request digest. When absent the
 daemon derives one from the subject (the body's first line only when the
 subject is blank), cut to 200 characters. Other optional params are `fyi`
 (an announcement), `client_key` (sender-scoped exact-retry key), `supersedes`
@@ -483,13 +500,17 @@ For a non-admin recipient the daemon writes one doorbell line, recorded as
 `doorbell_format: 4` on the `writing` fact:
 
 ```text
-[cyclops from implementer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer to reviewer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The 22-character URL-safe token encodes the complete 128-bit notification
-attempt id. The `m-att_` namespace is reserved for this locator and is disjoint
-from production message ids, which are always `m-` plus 32 lowercase hex
-characters. Only the daemon's `inbox.claim` handler interprets the locator;
+The header names the sender and the recipients from the immutable acceptance
+presentation. Up to three recipients are joined by `, `; beyond three the
+header reads `<first>, <second>, +N`; a broadcast to every agent (`"*"`)
+reads `to all`. The `m-att_` locator's 22-character URL-safe token encodes
+the complete 128-bit notification attempt id. That namespace is reserved for
+the locator and is disjoint from every minted message id (`cyc-...`, or the
+legacy `m-` plus 32 lowercase hex characters). Only the daemon's `inbox.claim`
+and `msg.read` handlers interpret the locator;
 other message-id consumers do not. It resolves only the current attempt for
 that exact authenticated recipient and appends the claim under the same store
 lock. A delayed command for a replaced attempt cannot claim its replacement.
@@ -507,9 +528,11 @@ The wire states are `not_started`, `queued`, `gating`, `writing`, `submitted`,
 `submitted_unverified`, `notified`, `attention_required`, and `superseded`.
 `staged` appears only when reading a journal an older daemon wrote. A
 `blocked_pre_write` attempt reads `gating` with `pre_write_cause` set; a
-withdrawn one reads `not_started` with `notification_settlement` set. A
-doorbell claim settles the mailbox body without withdrawing a queued doorbell;
-a claim after Enter is the receipt and settles the attempt as `notified`.
+withdrawn one reads `not_started` with `notification_settlement` set. A claim
+while the attempt is `queued`, `gating`, or `blocked_pre_write` withdraws it
+with `pre_write_cause: "claimed_before_write"` and nothing is written to the
+pane; a claim after Enter is the receipt and settles the attempt as
+`notified`.
 `submitted_unverified` means Enter was pressed once after a paste whose row
 did not read back exactly; it is never pressed again. `attention_required` is
 written only for a physical write failure (`paste_failed`, `submit_failed`,
@@ -531,7 +554,12 @@ remains in the durable admin inbox without a notification attempt.
 
 The `writing` transition carries `transport: "doorbell"` or `"raw"` beside
 `binding`; a raw write has no binding because nothing about the occupant was
-proven. A doorbell carries `doorbell_format: 4`, which fixes the summary and
+proven. A headless recipient has no pane, so its attempt never reaches
+`writing`: it moves `queued -> notified` in one fact carrying
+`transport: "mailbox"`, no binding, no doorbell format, and no `verified_by`.
+That edge is admitted only with the mailbox transport. The receipt for such a
+delivery reads `notification_state: "notified"` with
+`note: "in mailbox, no pane"` and no `pane`. A doorbell carries `doorbell_format: 4`, which fixes the summary and
 attempt-locator bytes for replay. Binding records contain the recipient,
 pane-root generation, foreground leader generation, admitted agent generation,
 and manifest. Journals an older daemon wrote carry `direct_payload` transports
@@ -597,11 +625,40 @@ literal message claim. No other method interprets the reserved locator.
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
 `message_not_pending`; a subscribed receive client should list again within
-its original deadline. Claiming the mailbox body does not withdraw the
-independent doorbell: a claim before the write leaves the queued doorbell in
-place and the worker still writes it, while a claim after Enter is the
-receipt and settles the attempt as `notified`. A claim proves retrieval, not
-task completion.
+its original deadline. A claim before the write boundary withdraws the
+doorbell: the recipient already holds the body, so an attempt still `queued`,
+`gating`, or `blocked_pre_write` settles as `withdrawn` with
+`pre_write_cause: "claimed_before_write"`, the worker stops at its pre-write
+check, and no pane bytes are written. A claim after Enter is the receipt and
+settles the attempt as `notified`. A claim proves retrieval, not task
+completion.
+
+### msg.read
+
+The operator's read of one message, body included, with no claim and no
+journal append. Served only to the admin origin (a same-user shell outside
+every watched pane, or a shell with no agent-vendor ancestor); any agent
+caller, the message's own recipient and sender included, gets error code
+`forbidden` with message `bodies reach an agent only through a claim` before
+the message is looked up. The result is the same `InboxMessage` shape
+`inbox.claim` returns, with `thread_root` and every recipient label in
+`recipient_label`. The reserved `m-att_` locator from a doorbell line resolves
+to its message.
+
+```text
+-> {"id":7,"method":"msg.read","params":{"message_id":"cyc-7fe0df31-a41c02e9"}}
+<- {"id":7,"result":{"body":"gateway.rs:120 drops the burst path","kind":"msg",
+    "message_id":"cyc-7fe0df31-a41c02e9",
+    "recipient_label":"reviewer",
+    "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
+    "sender_label":"admin",
+    "subject":"Review the rate limiter",
+    "summary":"The rate limiter is ready for review.",
+    "thread_root":"cyc-7fe0df31-a41c02e9"}}
+```
+
+The message stays pending for its recipient; the recipient's later claim is a
+fresh claim.
 
 `messages.snapshot` returns one atomic body-free projection for the
 authenticated caller. Agents see only messages they sent or received. The
@@ -641,7 +698,8 @@ so a rename cannot strand or retarget a watch.
 
 A recipient with no notification attempt reports `not_started`; the read model
 never invents a queued attempt. Per-recipient `available` comes from the current
-durable route directory keyed by recipient identity. It is current route
+durable route directory keyed by recipient identity. `current_route.pane_id`
+is absent for a headless recipient, which has a label and no pane. It is current route
 metadata and is not covered by `workspace_seq`. Mailbox state can be `pending`,
 `claimed`, or `superseded`; `delivered_direct` appears only when reading a
 journal an older daemon wrote. A replacement process or session cannot inherit
@@ -799,6 +857,62 @@ starting with `%` (a tmux pane id), and a name another pane already
 answers to. A control character is refused too, because it cannot survive
 onto a tmux command line and the border would then wear a different name
 than the record.
+
+### headless.register and headless.clear
+
+An agent that runs in no tmux pane registers itself over the socket. Nothing
+in the request names a process: the daemon walks the caller's process tree,
+refuses it if a watched pane root is on the way (`use_pane`, with the pane
+named in the message), and otherwise binds the label to the nearest agent
+process it ships a manifest for, on a path proven current to the top of the
+tree. A same-user shell with no agent above it is the operator and is refused
+(`denied`). The CLI verb is `cyclops name <label> --self` from a shell with no
+`TMUX_PANE`.
+
+```
+-> {"id":11,"method":"headless.register","params":{"label":"worker","manifest":null}}
+<- {"id":11,"result":{"agent_instance_id":"5a4d0c02-7d2e-4a4b-9a6a-0c9d7d6b2e11",
+    "detects_as":"claude","headless":true,"label":"worker","manifest":null,"pid":48213,
+    "recipient":{"kind":"headless","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a",
+    "agent_instance_id":"5a4d0c02-7d2e-4a4b-9a6a-0c9d7d6b2e11"}}}
+```
+
+`recipient` is the durable key every later surface uses; its display form is
+
+```text
+headless:<workspace-id>/<agent-instance-id>
+```
+
+Registering again from the same process keeps the same key. `manifest` echoes the pin and `detects_as` is the
+manifest the root process classifies under; nothing is gated on either,
+because nothing is ever written to a terminal for this recipient. The same
+four labels `pane.label` refuses are refused here, plus a name a pane already
+answers to; and a pane cannot take a headless label.
+
+Every request a descendant of the registered process makes is attributed to
+the label, exactly as a pane agent's helpers are attributed to the pane.
+Delivery is mailbox-only (`transport: "mailbox"` above) and the agent reads
+with `inbox.list` and `inbox.claim`, or `cyclops inbox next --wait`. Hook
+reports from a headless process are refused: it has no pane to report about.
+
+The label is released when the process exits. The daemon holds one named,
+one-shot exit event per registration (`kqueue` `EVFILT_PROC NOTE_EXIT` on
+macOS, `pidfd_open` on Linux) and emits `messages.route_changed` when it
+fires. After that the label is unaddressable (`no_such_target`), the recipient
+key is no longer served, and `messages.snapshot` reports the recipient
+`available: false` with its `notified` attempt; pending entries stay pending
+and the operator reads them with `msg.read`. A later registration mints a new
+key. At boot every stored registration is re-verified by OS boot id and
+process birth, and anything that does not match is dropped.
+
+`headless.clear` takes the registration back early. With no params it clears
+the caller's own registration; with `{"label": ...}` it clears a named one and
+is served to the admin origin only.
+
+```
+-> {"id":12,"method":"headless.clear","params":{}}
+<- {"id":12,"result":{"cleared":true,"label":"worker"}}
+```
 
 ### session.watch
 

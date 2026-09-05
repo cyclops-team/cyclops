@@ -541,7 +541,7 @@ def main() -> int:
             root,
             env,
         )
-        accepted = re.search(r"^accepted (m-[0-9a-f]{32})$", sent, flags=re.MULTILINE)
+        accepted = re.search(r"^accepted (cyc-[0-9a-f]{8}-[0-9a-f]{8})$", sent, flags=re.MULTILINE)
         if accepted is None:
             raise WorkloadError(f"installed sender did not report durable acceptance\n{sent}")
         message_id = accepted.group(1)

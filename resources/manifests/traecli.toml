@@ -1,0 +1,84 @@
+# Cyclops detection manifest: TraeCode CLI (ByteDance, China build)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no traecli binary was run on the evidence host and
+# no turn, title, or screen was captured. Sources:
+#   https://docs.trae.cn/ide_hook-configuration-reference   ~/.trae-cn/hooks.json, shape, events, payload fields
+#   https://trae.cn/trae-cli/install.sh                     the install script the catalog pass recorded
+#   https://forum.trae.cn/t/topic/2395                      ~/.trae-cn/skills
+#   skills.sh catalog row `trae-cn`: skills directory ~/.trae-cn/skills
+#
+# Sensor summary for this CLI:
+#   process  the install script places `traecli`; whether it is a native
+#            binary or an interpreter script is unmeasured. If binding
+#            fails, pin the pane: cyclops name %N <label> --manifest traecli.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED FOR THE IDE, CLI SUPPORT UNCONFIRMED. The hook
+#            reference is written for the TraeCode IDE; it names the CLI
+#            only in a breadcrumb, so whether traecli reads the same file
+#            is an assumption of the catalog pass. The file is
+#            ~/.trae-cn/hooks.json (global) or $PROJECT/.trae/hooks.json
+#            (project), shaped {"version": 1, "hooks": {"Event": [{matcher,
+#            loop_limit, hooks: [{type: "command", command, timeout}]}]}}.
+#            That is the Claude hooks object wrapped in a `version` key
+#            with a per-matcher `loop_limit`; the claude-hooks-file wiring
+#            shape below must add both or the file may be refused.
+#            UserPromptSubmit carries `prompt` (plus session_id,
+#            hook_event_name, cwd, workspace_roots); Stop carries
+#            stop_hook_active, loop_count, last_assistant_message;
+#            Notification carries notification_type, message, tool_use_id.
+#            No turn id ties Stop to its UserPromptSubmit.
+#   screen   UNMEASURED. No prompt glyph, status row, or working line is
+#            documented, so no idle or working rule ships and deliveries
+#            fail closed (not write-ready) until someone measures the
+#            composer.
+
+[agent]
+id = "traecli"
+display_name = "TraeCode CLI"
+version_tested = "unverified"
+process_names = ["traecli"]
+argv_basenames = ["traecli"]
+launch = "traecli"
+
+[hooks]
+config_mechanism = "hooks object in ~/.trae-cn/hooks.json (version 1 wrapper)"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop",
+  "Notification",
+]
+
+# Standalone JSON of the Claude hooks shape, but wrapped: the top level is
+# {"version": 1, "hooks": {...}} and each matcher group may carry
+# `loop_limit`. Documented for the IDE; unconfirmed for the CLI.
+[hooks.wiring]
+shape = "claude-hooks-file"
+file = "~/.trae-cn/hooks.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for TraeCode CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

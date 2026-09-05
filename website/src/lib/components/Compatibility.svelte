@@ -5,26 +5,90 @@
 
 	const MANIFESTS_URL = `${REPO_URL}/blob/main/docs/reference/MANIFESTS.md`;
 
-	// The shipped manifests (resources/manifests/*.toml): each row is
-	// the CLI's command, the way a pane names it, and the manifest's display
-	// name. Five are measured against a live CLI; the seven marked unverified
-	// are written from vendor documentation and say so in the manifest
-	// (version_tested = "unverified"). The next agent is the reader's, and it
-	// gets the mark.
-	const detected = [
+	// The supported agents, in the three tiers docs/guides/install.md
+	// documents. Each detected row is the CLI's command, the way a pane
+	// names it, and the manifest's display name. Five manifests are measured
+	// against a live CLI; the rest are written from vendor documentation and
+	// say so in the file (version_tested = "unverified"). Skill-only products
+	// run in no pane: they read the Cyclops skill and nothing else. The next
+	// agent is the reader's, and it gets the mark.
+	const verified = [
 		{ cmd: 'claude', name: 'Claude Code' },
 		{ cmd: 'codex', name: 'Codex CLI' },
 		{ cmd: 'cursor-agent', name: 'Cursor Agent' },
 		{ cmd: 'agy', name: 'Antigravity CLI' },
-		{ cmd: 'kimi', name: 'Kimi Code CLI' },
-		{ cmd: 'gemini', name: 'Gemini CLI (unverified)' },
-		{ cmd: 'qwen', name: 'Qwen Code (unverified)' },
-		{ cmd: 'goose', name: 'goose (unverified)' },
-		{ cmd: 'opencode', name: 'OpenCode (unverified)' },
-		{ cmd: 'amp', name: 'Amp (unverified)' },
-		{ cmd: 'crush', name: 'Crush (unverified)' },
-		{ cmd: 'aider', name: 'aider (unverified)' }
+		{ cmd: 'kimi', name: 'Kimi Code CLI' }
 	];
+	const unverified = [
+		{ cmd: 'gemini', name: 'Gemini CLI' },
+		{ cmd: 'qwen', name: 'Qwen Code' },
+		{ cmd: 'goose', name: 'goose' },
+		{ cmd: 'opencode', name: 'OpenCode' },
+		{ cmd: 'amp', name: 'Amp' },
+		{ cmd: 'crush', name: 'Crush' },
+		{ cmd: 'aider', name: 'aider' },
+		{ cmd: 'adal', name: 'AdaL' },
+		{ cmd: 'auggie', name: 'Auggie' },
+		{ cmd: 'autohand', name: 'Autohand Code' },
+		{ cmd: 'bob', name: 'IBM Bob Shell' },
+		{ cmd: 'cline', name: 'Cline CLI' },
+		{ cmd: 'codearts', name: 'CodeArts Agent' },
+		{ cmd: 'codebuddy', name: 'CodeBuddy Code' },
+		{ cmd: 'cmd', name: 'Command Code' },
+		{ cmd: 'cn', name: 'Continue CLI' },
+		{ cmd: 'copilot', name: 'GitHub Copilot CLI' },
+		{ cmd: 'cortex', name: 'Cortex Code' },
+		{ cmd: 'dcode', name: 'Deep Agents Code' },
+		{ cmd: 'devin', name: 'Devin for Terminal' },
+		{ cmd: 'dexto', name: 'Dexto' },
+		{ cmd: 'droid', name: 'Droid' },
+		{ cmd: 'forge', name: 'ForgeCode' },
+		{ cmd: 'grok', name: 'Grok Build' },
+		{ cmd: 'hermes', name: 'Hermes Agent' },
+		{ cmd: 'iflow', name: 'iFlow CLI' },
+		{ cmd: 'jazz', name: 'Jazz' },
+		{ cmd: 'junie', name: 'Junie CLI' },
+		{ cmd: 'kilo', name: 'Kilo CLI' },
+		{ cmd: 'kimchi', name: 'Kimchi' },
+		{ cmd: 'kiro-cli', name: 'Kiro CLI' },
+		{ cmd: 'kode', name: 'Kode' },
+		{ cmd: 'loaf', name: 'Loaf' },
+		{ cmd: 'mcode', name: 'MiniMax Code CLI' },
+		{ cmd: 'neovate', name: 'Neovate' },
+		{ cmd: 'openclaw', name: 'OpenClaw' },
+		{ cmd: 'openhands', name: 'OpenHands CLI' },
+		{ cmd: 'pa', name: 'Posit Assistant TUI' },
+		{ cmd: 'pi', name: 'Pi' },
+		{ cmd: 'qoder', name: 'Qoder CLI' },
+		{ cmd: 'qoderclicn', name: 'Qoder CN CLI' },
+		{ cmd: 'reasonix', name: 'Reasonix' },
+		{ cmd: 'acli', name: 'Rovo Dev' },
+		{ cmd: 'tabnine', name: 'Tabnine CLI' },
+		{ cmd: 'traecli', name: 'TraeCode CLI' },
+		{ cmd: 'vibe', name: 'Mistral Vibe' },
+		{ cmd: 'warp', name: 'Warp Agent CLI' }
+	];
+	const skillOnly = [
+		'AiderDesk',
+		'AstrBot',
+		'Codemaker',
+		'Code Studio',
+		'Firebender',
+		'inference.sh',
+		'Lingma',
+		'MCPJam',
+		'Moxby',
+		'Mux',
+		'Ona',
+		'Pochi',
+		'Terramind',
+		'Trae',
+		'Windsurf',
+		'ZCode',
+		'Zencoder',
+		'Zed'
+	];
+	const detectedCount = verified.length + unverified.length;
 </script>
 
 <section class="section">
@@ -34,20 +98,36 @@
 			<h3 class="statement">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 			<p class="lede">
 				Cyclops detects supported agents automatically. Each one is described by a small manifest
-				file: what its process is called, how it reports back, and how to tell when it's busy. 12
-				agents detected out of the box, five of them measured against a live CLI. Teaching Cyclops a new agent CLI is one file.
+				file: what its process is called, how it reports back, and how to tell when it's busy.
+				{detectedCount} agents detected out of the box, five of them measured against a live CLI;
+				{skillOnly.length} more IDEs and desktop apps get the Cyclops skill. Teaching Cyclops a new agent
+				CLI is one file.
 			</p>
 		</div>
 		<div class="panel card">
 			<ul class="list" aria-label="Agents detected out of the box">
-				<li class="head label">Detected out of the box</li>
-				{#each detected as agent (agent.cmd)}
+				<li class="head label">Verified against a live CLI</li>
+				{#each verified as agent (agent.cmd)}
 					<li class="agent">
 						<span class="marker" aria-hidden="true">✓</span>
 						<span class="cmd">{agent.cmd}</span>
 						<span class="name">{agent.name}</span>
 					</li>
 				{/each}
+				<li class="head label">Detected, wired from vendor docs (unverified)</li>
+				{#each unverified as agent (agent.cmd)}
+					<li class="agent">
+						<span class="marker" aria-hidden="true">✓</span>
+						<span class="cmd">{agent.cmd}</span>
+						<span class="name">{agent.name}</span>
+					</li>
+				{/each}
+				<li class="head label">Skill only, no pane</li>
+				<li class="products">
+					{#each skillOnly as product (product)}
+						<span class="name">{product}</span>
+					{/each}
+				</li>
 			</ul>
 			<div class="yours">
 				<AgentMark size={72} />
@@ -94,6 +174,28 @@
 
 	.head {
 		padding: 8px 28px 10px;
+	}
+
+	.head + .head,
+	.agent + .head {
+		margin-top: 10px;
+		border-top: 1px solid var(--line);
+		padding-top: 16px;
+	}
+
+	/* The skill-only products run in no pane, so they get no command
+	   column: one wrapped row of names under their own head. */
+	.products {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px 14px;
+		padding: 4px 28px 10px;
+	}
+
+	/* The unverified tier is long; keep the card scannable. */
+	.list {
+		max-height: 520px;
+		overflow-y: auto;
 	}
 
 	.agent {

@@ -1,0 +1,79 @@
+# Cyclops detection manifest: AdaL (SylphAI)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no adal binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://docs.sylph.ai/features/lifecycle-hooks                    ~/.adal/settings.json hooks, events, `prompt` payload
+#   https://github.com/SylphAI-Inc/adal-cli/blob/main/README.md       `adal`; curl -fsSL https://adal.sylph.ai/install.sh | bash
+#   https://docs.sylph.ai/                                            keyboard shortcuts, skills and plugins
+#   skills.sh catalog row `adal`: skills directory ~/.adal/skills
+#
+# Sensor summary for this CLI:
+#   process  adal is installed by a shell script and launched bare;
+#            whether it is a native binary or an interpreter script is
+#            unmeasured. If binding fails, pin the pane:
+#            cyclops name %N <label> --manifest adal.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped, USER SETTINGS ONLY: a `hooks`
+#            object in ~/.adal/settings.json keyed by event, each
+#            [{matcher, hooks: [{type: "command", command, timeout}]}];
+#            the docs say project and plugin hook scopes are not
+#            available. Six events exist and there is no SessionStart and
+#            no Notification, so attention is the PermissionRequest event.
+#            UserPromptSubmit carries `prompt`; Stop carries is_interrupt
+#            and optionally last_assistant_message; PermissionRequest
+#            carries tool_name and tool_input. Every payload carries
+#            session_id, cwd, hook_event_name, transcript_path; no turn id
+#            ties Stop to its UserPromptSubmit.
+#   screen   UNMEASURED. The docs say `?` opens the shortcut list, Tab
+#            cycles Regular / Plan / Deep Research, and a footer shows the
+#            model, context %, reasoning effort and connection mode, but
+#            quote no exact row, so no idle or working rule ships and
+#            deliveries fail closed (not write-ready) until someone
+#            measures the composer.
+
+[agent]
+id = "adal"
+display_name = "AdaL"
+version_tested = "unverified"
+process_names = ["adal"]
+argv_basenames = ["adal"]
+launch = "adal"
+
+[hooks]
+config_mechanism = "hooks object in ~/.adal/settings.json (user settings only)"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "PermissionRequest"
+available = [
+  "PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit",
+  "PermissionRequest", "Stop",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.adal/settings.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for AdaL."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

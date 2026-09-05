@@ -925,7 +925,10 @@ pub fn render_with_status(
                     .unwrap_or_else(|| "unavailable".into())
             ));
             body.push(match &detail.current_route {
-                Some(route) => format!("current route: {} ({})", route.label, route.pane_id),
+                Some(route) => match route.pane_id {
+                    Some(pane_id) => format!("current route: {} ({pane_id})", route.label),
+                    None => format!("current route: {} (headless)", route.label),
+                },
                 None => "current route: unavailable".into(),
             });
             body.push(String::new());

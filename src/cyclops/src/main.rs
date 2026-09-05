@@ -60,6 +60,7 @@ mod style;
 mod theme;
 mod themeseed;
 mod update;
+mod wiring;
 mod workspace;
 
 use std::collections::BTreeSet;
@@ -286,9 +287,10 @@ enum Cmd {
     #[command(hide = true)]
     History(HistoryArgs),
     /// One message with its replies and delivery record, oldest first.
-    #[command(hide = true)]
+    #[command(display_order = 5)]
     Thread {
-        /// Message id, e.g. m-3f9c2a.
+        /// Message id, e.g. cyc-1a2b3c4d-5e6f7a8b; the doorbell's m-att_
+        /// locator is not accepted here.
         id: String,
     },
     /// Wait for an agent to reach a state. Exit 0 when reached, 2 on
@@ -669,6 +671,11 @@ enum InboxCmd {
         /// Maximum duration to wait (e.g. 5s, 1m). Exits 2 if no message arrives.
         #[arg(long, default_value = "5s")]
         timeout: String,
+        /// Wait with no deadline: for a headless agent (no pane) that
+        /// reads its mailbox over the socket. Exits 1 as `daemon_gone`
+        /// when cyclopsd closes the connection.
+        #[arg(long, conflicts_with = "timeout")]
+        wait: bool,
         /// Only messages from this sender: the canonical sender key from
         /// `cyclops inbox list --json`, not a display label.
         #[arg(long)]
@@ -1172,14 +1179,19 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             )
         }
         Cmd::Inbox(InboxArgs {
-            cmd: InboxCmd::Next { timeout, from },
+            cmd:
+                InboxCmd::Next {
+                    timeout,
+                    wait,
+                    from,
+                },
         }) => {
             let mut client = match Client::connect() {
                 Ok(client) => client,
                 Err(error) => return inbox_next_client_failed(cli, &error),
             };
             report_hello_mismatch(&client);
-            cmd_inbox_next(&mut client, cli, timeout, from.as_deref())
+            cmd_inbox_next(&mut client, cli, timeout, *wait, from.as_deref())
         }
         // Install renders and instructs without a daemon; verify and
         // selftest ask the daemon for hook liveness.
@@ -1204,14 +1216,23 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Ok(c) => c,
                 Err(code) => return code,
             };
-            cmd_name(
-                &mut c,
-                cli,
-                &style_for(cli),
-                args,
-                &target,
-                label.as_deref(),
-            )
+            match target {
+                NameTarget::Pane(target) => cmd_name(
+                    &mut c,
+                    cli,
+                    &style_for(cli),
+                    args,
+                    &target,
+                    label.as_deref(),
+                ),
+                NameTarget::Headless => cmd_name_headless(
+                    &mut c,
+                    cli,
+                    &style_for(cli),
+                    args,
+                    label.as_deref().unwrap_or_default(),
+                ),
+            }
         }
         Cmd::Flush { prune } => {
             let style = style_for(cli);
@@ -1609,6 +1630,16 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
     }
 }
 
+/// What `cyclops name` is about: a pane, or this very process when it
+/// has none.
+enum NameTarget {
+    Pane(String),
+    /// `--self` with no `TMUX_PANE`: the caller is a headless agent and
+    /// registers over the socket. The daemon proves the process tree; the
+    /// request names nothing.
+    Headless,
+}
+
 /// Which pane `cyclops name` is about, and what it will be called.
 ///
 /// Runs before the daemon is asked anything, because both answers are
@@ -1617,21 +1648,19 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
 /// `--self` moves the positional along: the pane is this one, so the
 /// single argument is the name. tmux puts the pane id in the environment
 /// of every process it starts, which is how a pane knows which one it is
-/// without asking anybody.
-fn resolve_name(args: &NameArgs) -> Result<(String, Option<String>), i32> {
+/// without asking anybody. With no pane in the environment, `--self`
+/// registers the caller headless.
+fn resolve_name(args: &NameArgs) -> Result<(NameTarget, Option<String>), i32> {
     let (target, label) = if args.self_ {
         match std::env::var("TMUX_PANE") {
-            Ok(p) if !p.is_empty() => (p, args.target.clone()),
-            _ => {
-                eprintln!(
-                    "{}",
-                    copy::self_outside_tmux(args.target.as_deref().unwrap_or("<name>"))
-                );
-                return Err(EXIT_USAGE);
-            }
+            Ok(p) if !p.is_empty() => (NameTarget::Pane(p), args.target.clone()),
+            _ => (NameTarget::Headless, args.target.clone()),
         }
     } else {
-        (args.target.clone().unwrap_or_default(), args.label.clone())
+        (
+            NameTarget::Pane(args.target.clone().unwrap_or_default()),
+            args.label.clone(),
+        )
     };
 
     // Same rule and same sentence as the daemon: cyclops_proto::label.
@@ -1669,6 +1698,47 @@ fn cmd_name(
         return 0;
     }
     println!("{}", render::render_named(&result, style));
+    0
+}
+
+/// `cyclops name <label> --self` from a process with no pane: register
+/// headless. The daemon binds the label to the nearest agent in this
+/// process's tree and refuses (`use_pane`) when the tree reaches a
+/// watched pane after all.
+fn cmd_name_headless(
+    c: &mut Client,
+    cli: &Cli,
+    style: &Style,
+    args: &NameArgs,
+    label: &str,
+) -> i32 {
+    let params = json!({
+        "label": label,
+        "manifest": args.manifest,
+    });
+    let result = match c.request("headless.register", params) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", copy::client_error(&e, Some(label)));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return 0;
+    }
+    let named = result["label"].as_str().unwrap_or(label);
+    let tail = match result["detects_as"].as_str() {
+        Some(manifest) => format!("{}, detects as {manifest}", copy::HEADLESS_NAMED),
+        None => copy::HEADLESS_NAMED.to_string(),
+    };
+    println!(
+        "{} named {} {} {}",
+        render::check(true),
+        style.role(named, named),
+        style.dim("·"),
+        style.dim(&tail)
+    );
     0
 }
 
@@ -1937,6 +2007,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
+    warn_long_summary(summary.as_deref());
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -2013,9 +2084,9 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         } else {
             "already accepted"
         };
-        println!("{verb} {}", style.accent(&receipt.msg_id));
+        println!("{}", accepted_line(verb, &receipt, style));
     }
-    println!("{}", render::render_receipts(&receipt.deliveries, style));
+    println!("{}", render_send_receipts(&receipt.deliveries, style));
     for delivery in &receipt.deliveries {
         match delivery.state {
             DeliveryState::ParkedBlockedQuota => {
@@ -2037,6 +2108,55 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         }
     }
     receipts_exit(&receipt.deliveries, args.require_wake)
+}
+
+/// A receipt for a headless recipient: the daemon says so in its own
+/// words (`MAILBOX_ONLY_NOTE`), and the line says it back rather than
+/// calling a mailbox close a pane wake.
+fn mailbox_only_receipt(receipt: &cyclops_proto::DeliveryReceipt) -> bool {
+    receipt.note.as_deref() == Some(cyclops_proto::MAILBOX_ONLY_NOTE)
+        && receipt.notification_state == Some(cyclops_proto::MessageNotificationState::Notified)
+}
+
+fn mailbox_only_badge(style: &Style) -> String {
+    format!(
+        "✓ accepted {} {}",
+        style.dim("·"),
+        style.dim(cyclops_proto::MAILBOX_ONLY_NOTE)
+    )
+}
+
+/// Receipts as send shows them, with a mailbox-only delivery worded as
+/// one. Everything else is the shared renderer, byte for byte.
+fn render_send_receipts(deliveries: &[cyclops_proto::DeliveryReceipt], style: &Style) -> String {
+    if !deliveries.iter().any(mailbox_only_receipt) {
+        return render::render_receipts(deliveries, style);
+    }
+    if deliveries.len() == 1 {
+        return mailbox_only_badge(style);
+    }
+    let to_w = deliveries
+        .iter()
+        .map(|r| render::display_width(&r.to))
+        .max()
+        .unwrap_or(0);
+    deliveries
+        .iter()
+        .map(|r| {
+            let padded = format!(
+                "{}{}",
+                r.to,
+                " ".repeat(to_w.saturating_sub(render::display_width(&r.to)))
+            );
+            let badge = if mailbox_only_receipt(r) {
+                mailbox_only_badge(style)
+            } else {
+                render::receipt_badge(r, style)
+            };
+            format!("  {}  {badge}", style.role(&r.to, &padded))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 {
@@ -2107,7 +2227,10 @@ fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 
 /// Subscribe before the first list so an arrival cannot fall between the
 /// empty read and the event wait. Every subsequent read uses the same durable
 /// mailbox projection as `inbox list` and the same atomic claim operation.
-fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) -> i32 {
+/// With `wait`, there is no deadline: the read timeout is cleared and the
+/// command sits on the event stream until a message arrives or the daemon
+/// closes the connection, which exits as a named `daemon_gone`.
+fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, wait: bool, from: Option<&str>) -> i32 {
     let budget = match parse_duration(timeout) {
         Ok(value) => value,
         Err(()) => {
@@ -2120,14 +2243,22 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
             );
         }
     };
-    let Some(deadline) = Instant::now().checked_add(budget) else {
-        return inbox_next_failed(
-            cli,
-            "bad_duration",
-            copy::bad_duration(timeout),
-            json!({"value": timeout}),
-            EXIT_USAGE,
-        );
+    let deadline = if wait {
+        c.clear_read_timeout();
+        None
+    } else {
+        match Instant::now().checked_add(budget) {
+            Some(deadline) => Some(deadline),
+            None => {
+                return inbox_next_failed(
+                    cli,
+                    "bad_duration",
+                    copy::bad_duration(timeout),
+                    json!({"value": timeout}),
+                    EXIT_USAGE,
+                );
+            }
+        }
     };
     let sender = match from.map(str::parse::<cyclops_proto::RecipientKey>) {
         Some(Ok(sender)) => Some(sender),
@@ -2153,6 +2284,7 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
     if let Err(error) = c.subscribe(subscribe) {
         return match error {
             ClientError::ReadTimeout(_) => inbox_next_timed_out(cli, budget),
+            error if wait && daemon_closed(&error) => inbox_next_daemon_gone(cli),
             error => inbox_next_client_failed(cli, &error),
         };
     }
@@ -2165,6 +2297,9 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
             Ok(list) => list,
             Err(InboxListOneError::Client(ClientError::ReadTimeout(_))) => {
                 return inbox_next_timed_out(cli, budget)
+            }
+            Err(InboxListOneError::Client(error)) if wait && daemon_closed(&error) => {
+                return inbox_next_daemon_gone(cli)
             }
             Err(InboxListOneError::Client(error)) => return inbox_next_client_failed(cli, &error),
             Err(InboxListOneError::Unreadable) => {
@@ -2237,17 +2372,44 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
             Err(ClientError::ReadTimeout(_)) => {
                 return inbox_next_timed_out(cli, budget);
             }
+            Err(error) if wait && daemon_closed(&error) => return inbox_next_daemon_gone(cli),
             Err(error) => return inbox_next_client_failed(cli, &error),
         }
     }
 }
 
+/// The daemon hung up: the stream ended, or a request found the socket
+/// closed. Under `--wait` that is the one way the command ends without a
+/// message, and it has a name.
+fn daemon_closed(error: &ClientError) -> bool {
+    match error {
+        ClientError::Gap(_) => true,
+        ClientError::Unknown(message) => message.contains("connection closed"),
+        _ => false,
+    }
+}
+
+fn inbox_next_daemon_gone(cli: &Cli) -> i32 {
+    inbox_next_failed(
+        cli,
+        "daemon_gone",
+        copy::INBOX_NEXT_DAEMON_GONE.to_string(),
+        json!({"pending": false}),
+        1,
+    )
+}
+
+/// No deadline means nothing to re-arm: `--wait` cleared the read timeout
+/// once and never sets one.
 fn inbox_next_set_remaining(
     c: &mut Client,
     cli: &Cli,
     budget: Duration,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), i32> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
     let Some(remaining) = inbox_next_remaining(deadline, Instant::now()) else {
         return Err(inbox_next_timed_out(cli, budget));
     };
@@ -2701,8 +2863,11 @@ fn message_recipient_cell(
                             &recipient
                                 .current_route
                                 .as_ref()
-                                .map(|route| {
-                                    format!("current route {} ({})", route.label, route.pane_id)
+                                .map(|route| match route.pane_id {
+                                    Some(pane_id) => {
+                                        format!("current route {} ({pane_id})", route.label)
+                                    }
+                                    None => format!("current route {} (headless)", route.label),
                                 })
                                 .unwrap_or_else(|| "route unavailable".into()),
                         );
@@ -2727,6 +2892,14 @@ fn message_recipient_cell(
                     None => match recipient.notification.state {
                         cyclops_proto::MessageNotificationState::NotStarted => {
                             "not started".to_string()
+                        }
+                        // A headless recipient's `notified` is the mailbox
+                        // close: no pane was written, and the line says so
+                        // in the receipt's words.
+                        cyclops_proto::MessageNotificationState::Notified
+                            if recipient.recipient.is_headless() =>
+                        {
+                            cyclops_proto::MAILBOX_ONLY_NOTE.to_string()
                         }
                         cyclops_proto::MessageNotificationState::Gating => {
                             "checking readiness".to_string()
@@ -2931,6 +3104,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         eprintln!("{error}");
         return EXIT_USAGE;
     }
+    warn_long_summary(summary.as_deref());
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -3007,7 +3181,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     } else {
         "already accepted"
     };
-    println!("{verb} {}", style.accent(&result.msg_id));
+    println!("{}", accepted_line(verb, &result, style));
     if !result.deliveries.is_empty() {
         println!("{}", render::render_receipts(&result.deliveries, style));
     }
@@ -3642,11 +3816,70 @@ fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
         Ok(None) => return 0,
         Err(code) => return code,
     };
+    println!("{}", thread_index(id, &thread.lines, style));
     println!(
         "{}",
         render::render_thread(&thread.lines, style, render::now_ms())
     );
     0
+}
+
+/// The thread's ids in order, above the grid: the root id, then each
+/// message's `<message>` part (or its whole id when it predates the
+/// `cyc-<thread>-<message>` form), so a reader can name any message in
+/// the thread without scanning the record.
+fn thread_index(root: &str, lines: &[cyclops_proto::LedgerLine], style: &Style) -> String {
+    let parts: Vec<String> = lines
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.kind,
+                cyclops_proto::Kind::Msg | cyclops_proto::Kind::Fyi
+            )
+        })
+        .map(
+            |line| match cyclops_proto::MessageId::new(line.id.as_str()) {
+                Ok(id) => id.message_part().unwrap_or(id.as_str()).to_string(),
+                Err(_) => line.id.clone(),
+            },
+        )
+        .collect();
+    format!(
+        "thread {} {} {}",
+        style.accent(root),
+        style.dim("·"),
+        parts.join(" → ")
+    )
+}
+
+/// `accepted <id>`, and for a message inside an existing thread the root
+/// it joined: a reply's id already carries the thread part, and the root
+/// says which message started it.
+fn accepted_line(verb: &str, receipt: &MsgSendResult, style: &Style) -> String {
+    let mut line = format!("{verb} {}", style.accent(&receipt.msg_id));
+    if let Some(root) = receipt
+        .thread_root
+        .as_ref()
+        .filter(|root| root.as_str() != receipt.msg_id)
+    {
+        line.push_str(&format!(
+            " {} thread {}",
+            style.dim("·"),
+            style.accent(root.as_str())
+        ));
+    }
+    line
+}
+
+/// One stderr line when a summary runs long. The daemon takes any
+/// one-line summary; this is advice to the sender, not a refusal.
+fn warn_long_summary(summary: Option<&str>) {
+    if let Some(chars) = summary
+        .map(|summary| summary.chars().count())
+        .filter(|chars| *chars > copy::SUMMARY_LONG_CHARS)
+    {
+        eprintln!("{}", copy::summary_runs_long(chars));
+    }
 }
 
 /// Body from a file path, or stdin when the path is "-" (the v1 habit:
@@ -4178,6 +4411,7 @@ mod tests {
             visible,
             BTreeSet::from([
                 "clear", "commands", "health", "inbox", "reply", "send", "status", "stop",
+                "thread",
             ])
         );
     }
@@ -4280,6 +4514,82 @@ mod tests {
         };
         assert_eq!(args.supersedes.as_deref(), Some("m-old"));
         assert!(args.reply_to.is_none());
+    }
+
+    #[test]
+    fn the_receipt_names_the_thread_only_when_the_message_joined_one() {
+        let style = Style::none();
+        let root = MsgSendResult {
+            msg_id: "cyc-1a2b3c4d-5e6f7a8b".into(),
+            thread_root: Some(cyclops_proto::MessageId::new("cyc-1a2b3c4d-5e6f7a8b").unwrap()),
+            seq: 7,
+            deliveries: Vec::new(),
+            inserted: Some(true),
+        };
+        assert_eq!(
+            accepted_line("accepted", &root, &style),
+            "accepted cyc-1a2b3c4d-5e6f7a8b"
+        );
+        let reply = MsgSendResult {
+            msg_id: "cyc-1a2b3c4d-9c0d1e2f".into(),
+            ..root.clone()
+        };
+        assert_eq!(
+            accepted_line("accepted", &reply, &style),
+            "accepted cyc-1a2b3c4d-9c0d1e2f · thread cyc-1a2b3c4d-5e6f7a8b"
+        );
+        // An older daemon sends no thread root; the line is the old line.
+        let old = MsgSendResult {
+            thread_root: None,
+            ..reply
+        };
+        assert_eq!(
+            accepted_line("already accepted", &old, &style),
+            "already accepted cyc-1a2b3c4d-9c0d1e2f"
+        );
+    }
+
+    #[test]
+    fn the_thread_index_lists_each_message_part_in_order() {
+        let style = Style::none();
+        let line = |id: &str, kind: cyclops_proto::Kind| cyclops_proto::LedgerLine {
+            seq: 1,
+            boot_id: "boot".into(),
+            id: id.into(),
+            ts: 1,
+            kind,
+            from: "a".into(),
+            to: vec!["b".into()],
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        let lines = [
+            line("cyc-1a2b3c4d-5e6f7a8b", cyclops_proto::Kind::Msg),
+            line("cyc-1a2b3c4d-5e6f7a8b", cyclops_proto::Kind::State),
+            line("cyc-1a2b3c4d-9c0d1e2f", cyclops_proto::Kind::Fyi),
+            line(
+                "m-0123456789abcdef0123456789abcdef",
+                cyclops_proto::Kind::Msg,
+            ),
+        ];
+        assert_eq!(
+            thread_index("cyc-1a2b3c4d-5e6f7a8b", &lines, &style),
+            "thread cyc-1a2b3c4d-5e6f7a8b · 5e6f7a8b → 9c0d1e2f → m-0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_summary_runs_long_past_the_advice_threshold_only() {
+        assert_eq!(copy::SUMMARY_LONG_CHARS, 160);
+        assert_eq!(
+            copy::summary_runs_long(161),
+            "summary is 161 characters; keep it short, the pane shows one line"
+        );
+        // The daemon's rule is the only refusal: one non-empty line.
+        assert!(cyclops_proto::validate_message_summary(&"a".repeat(400)).is_ok());
     }
 
     #[test]
@@ -5150,7 +5460,7 @@ mod tests {
         worker_failed.can_withdraw_notification = true;
         worker_failed.current_route = Some(cyclops_proto::MessageRecipientRoute {
             label: "reviewer-now".into(),
-            pane_id: "%1".parse().unwrap(),
+            pane_id: Some("%1".parse().unwrap()),
         });
         worker_failed.notification.pre_write_cause =
             Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);

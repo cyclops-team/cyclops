@@ -1,0 +1,77 @@
+# Cyclops detection manifest: Junie CLI (JetBrains)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No junie binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://junie.jetbrains.com/docs/junie-cli-hooks.html
+#   https://junie.jetbrains.com/docs/junie-cli-configuration.html
+#   https://junie.jetbrains.com/docs/junie-cli.html
+#
+# Skills directory (skills.sh catalog key junie): ~/.junie/skills
+#
+# Sensor summary for this CLI:
+#   process  junie ships as npm @jetbrains/junie and via Homebrew, so an npm
+#            install may leave "node" as the pane's foreground command
+#            (MEASURED for gemini, inferred here). "node" is not listed: it
+#            would claim every Node process. If the pane does not bind, pin
+#            it: cyclops name %N <label> --manifest junie.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED (EAP), Claude-shaped: a `hooks` object in
+#            ~/.junie/config.json (or a file passed with --config-location).
+#            UserPromptSubmit carries `prompt`, so it is the dispatch
+#            candidate and the ACK field. Stop shares only session_id with
+#            it, which is not a turn key, and can re-fire (stop_hook_active),
+#            so no end is declared: the loader refuses a candidate end
+#            without turn_key_fields. Stop is still wired for liveness.
+#            There is no Notification event; PermissionRequest is the
+#            attention edge.
+#   screen   UNMEASURED. The docs quote no prompt string, so no idle or
+#            working rule ships and deliveries fail closed (not write-ready)
+#            until someone measures the composer.
+
+[agent]
+id = "junie"
+display_name = "Junie CLI"
+version_tested = "unverified"
+process_names = ["junie"]
+argv_basenames = ["junie"]
+launch = "junie"
+
+[hooks]
+config_mechanism = "hooks object in ~/.junie/config.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "PermissionRequest"
+available = [
+  "SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "StopFailure",
+  "PermissionRequest", "SessionEnd",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.junie/config.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Junie CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

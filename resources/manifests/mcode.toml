@@ -1,0 +1,57 @@
+# Cyclops detection manifest: MiniMax Code CLI (MiniMax)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no mcode binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://agent.minimax.io/docs/cli/quick-start.md  `mcode`, install script, Esc / Shift+Tab / Alt+M / /status
+#   https://agent.minimax.io/docs/cli/features.md     /plan, /permission, side conversations; no hooks
+#   https://agent.minimax.io/docs/code/welcome        the desktop app the CLI ships beside
+#   skills.sh catalog row `minimax-code`: skills directory ~/.minimax/skills
+#
+# Sensor summary for this CLI:
+#   process  the docs install mcode with
+#            `curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash`
+#            and launch it bare. Whether the installed file is a native
+#            binary or an interpreter script (which would make
+#            #{pane_current_command} read the interpreter, as it does for
+#            gemini) is unmeasured. If binding fails, pin the pane:
+#            cyclops name %N <label> --manifest mcode.
+#   title    UNMEASURED.
+#   hooks    NONE DOCUMENTED. Neither CLI page describes a shell-command
+#            hook file or an event list, so no [hooks] or [hooks.wiring]
+#            table is declared: an mcode pane has no hook lifecycle and
+#            runs on screen evidence only.
+#   screen   UNMEASURED. The docs name keys (Esc interrupts a task,
+#            Shift+Tab switches modes, Alt+M switches permission mode) and
+#            slash commands (/status, /plan, /permission, /btw, /goal) but
+#            quote no prompt glyph, status row, or working line, so no idle
+#            or working rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+#   skills   ~/.minimax/skills (catalog). The CLI pages name no skills or
+#            config directory; ~/.minimax comes from the catalog pass.
+# The first catalog pass classed minimax-code as a desktop app on the
+# strength of the welcome page; the two CLI pages above are what make it a
+# pane CLI.
+
+[agent]
+id = "mcode"
+display_name = "MiniMax Code CLI"
+version_tested = "unverified"
+process_names = ["mcode"]
+argv_basenames = ["mcode"]
+launch = "mcode"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for MiniMax Code CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

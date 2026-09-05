@@ -40,7 +40,8 @@ flowchart TD
    response proves durable acceptance and nothing else. A summary the
    sender did not supply is derived from the subject (the body's first line
    only when the subject is blank), cut to one line of at most 200
-   characters; a supplied summary is one non-empty line of at most 240.
+   characters; a supplied summary is one non-empty line with no length cap
+   (the CLI warns the sender above 160 characters).
 2. **Queue.** One worker per durable recipient; notifications to one mailbox
    are strictly FIFO. Broadcast is one message row with one entry and one
    notification record per recipient. A worker retires when its queue
@@ -129,9 +130,13 @@ For a non-admin recipient the daemon writes one row, the only format it
 writes now:
 
 ```text
-[cyclops from implementer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer to reviewer] The rate limiter is ready for review. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
+The header names the sender and the recipients from the message's immutable
+presentation (`render_recipient_list` in `cyclops-proto`): up to three
+recipient labels joined by `, `, then `<first>, <second>, +N`, and `to all`
+for a broadcast to every agent. The format number stays 4.
 The 22-character token encodes the complete 128-bit notification attempt id
 under the reserved `m-att_` namespace. The recipient runs the claim command
 and reads the body from the mailbox; the body never reaches the pane on this
@@ -140,9 +145,14 @@ the readback joins the wrapped rows before comparing. `admin` has no pane
 route, so an admin message is accepted and stays in the admin inbox with no
 attempt.
 
-Mailbox retrieval and the doorbell are independent. A socket claim before
-the write does not withdraw the queued doorbell; the worker still writes it.
-A claim after Enter settles the attempt as `notified`.
+A socket claim before the write boundary withdraws the doorbell. An attempt
+still `queued`, `gating`, or `blocked_pre_write` settles as `withdrawn` with
+cause `claimed_before_write` under the same store lock as the claim, the
+worker's next pre-write check (`entry_allows_notification`) finds the entry
+claimed and stops, and no pane bytes are written; the recipient's FIFO moves
+to its next pending message. A claim after Enter settles the attempt as
+`notified`. Journals an older daemon wrote, where the write followed the
+claim, replay through the withdrawn state.
 
 ## The raw transport
 
@@ -156,6 +166,37 @@ is pressed, and the attempt closes as `notified` with no verifier. The
 `writing` fact carries `transport: raw` and no binding, because nothing
 about the occupant was proven. Cyclops never selects this transport on its
 own.
+
+## Headless recipients: the mailbox-only path
+
+A headless agent (`cyclops name <label> --self` from a process with no pane,
+`headless.register` on the wire) has no terminal, so none of the pipeline
+above applies to it. `messaging_runtime::schedule_recipient` sees a headless
+recipient that is still on the roster and, under the publication lock,
+closes the attempt `queued -> notified` with `transport: mailbox`, no
+binding, no doorbell format, and no verifier
+(`NotificationContext::record_mailbox_notified`). Being in the mailbox is the
+notification: the agent reads it over the socket with `inbox next --wait`
+and the body reaches it through the claim alone. The receipt carries
+`note: in mailbox, no pane`, and `cyclops messages` prints the same words
+for that recipient. A claim that lands first settles the entry before the
+close is recorded, and no fact is written for the attempt.
+
+The registration is a process, not a token. The daemon binds the label to
+the nearest agent process above the registering peer (`identity::headless_root`)
+and retires it when that process exits. The exit is a named one-shot event
+(`headless::arm_exit_watcher`): `kqueue` `EVFILT_PROC NOTE_EXIT` on macOS and
+`pidfd_open` on Linux, awaited through an `AsyncFd`, never a poll. On a
+platform with neither, retirement happens when a resolution next observes
+the root dead, and at boot. Retirement republishes the directory and emits
+`messages.route_changed`; the label becomes unaddressable, the recipient key
+resolves nothing, the snapshot row reads `available: false` beside its
+`notified` attempt, pending entries stay pending for the operator's
+`msg.read`, and a re-registration mints a new key. A retired recipient with
+pending entries parks like any recipient without a route
+(`route_unavailable`) rather than being closed as notified. Boot re-verifies
+every stored registration by OS boot id and process birth before the first
+directory is published.
 
 ## Restart
 
@@ -202,7 +243,7 @@ Every transition is a content-free workspace journal fact.
 | `writing` | The paste command was issued |
 | `submitted` | Enter pressed after the row read back exactly |
 | `submitted_unverified` | Enter pressed once without an exact readback |
-| `notified` | A receipt (hook, screen, claim) or none within the deadline |
+| `notified` | A receipt (hook, screen, claim) or none within the deadline; for a headless recipient, the mailbox close (`transport: mailbox`, straight from `queued`) |
 | `attention_required` | A physical write failure or a daemon restart; inspect the pane |
 | `withdrawn_by_operator` | An administrator withdrew it before the write |
 | `superseded` | The message was replaced before the write |
@@ -220,8 +261,9 @@ pid's ancestry is walked upward. A process below an agent vendor inside a
 watched pane sends as that pane: its label, or its pane id when it has none.
 A same-user process with no vendor ancestor is `admin`, even when it sits
 inside a watched pane. A vendor process outside every watched pane, or an
-ancestry that cannot be proven current, is denied. Nothing in the request
-body can name the sender.
+ancestry that cannot be proven current, is denied, unless the walk reaches a
+registered headless root: then the caller is that headless agent, by the same
+descent rule a pane applies. Nothing in the request body can name the sender.
 
 ## Configuration
 

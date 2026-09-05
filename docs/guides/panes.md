@@ -40,7 +40,12 @@ wait for the structural-change debounce and retry.
 taking the id from `$TMUX_PANE`, which tmux sets in every process it
 starts. It is the form an agent uses to register itself on startup, and
 the one to use when you are already sitting in the pane you mean. Outside
-tmux there is no pane to name, and it says so.
+tmux there is no pane to name, so `--self` registers the caller as a
+headless agent instead: the daemon binds the label to the nearest agent
+process in the caller's own tree, delivery is mailbox-only, and the label
+is released when that process exits. The receipt reads
+`named <label> · headless, no pane`. From inside a watched pane the same
+registration is refused with `use_pane`.
 
 ## Three names a pane cannot have
 

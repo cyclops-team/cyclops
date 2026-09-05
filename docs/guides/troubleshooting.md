@@ -166,7 +166,7 @@ Standard send returns after the mailbox write:
 
 ```
 $ cyclops send reviewer --subject "hello" --summary "This is a connectivity check. Reply when it arrives."
-accepted m-<full-uuid-suffix>
+accepted cyc-<thread>-<message>
 ✓ accepted · wake queued
 ```
 
@@ -199,7 +199,7 @@ before requeueing a worker failure.
 
 ```
 $ cyclops send implementer --subject "hello" --summary "This is a connectivity check. Reply when it arrives."
-accepted m-<full-uuid-suffix>
+accepted cyc-<thread>-<message>
 ✓ accepted · 1 ahead · wake queued
 ```
 

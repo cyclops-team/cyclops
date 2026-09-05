@@ -1191,6 +1191,8 @@ pub fn render_chat_lines(
                 heading.push(format!(" ({pane})"), ChatInk::Dim);
             } else if row.sender.is_admin() {
                 heading.push(" [admin]", ChatInk::Dim);
+            } else if row.sender.is_headless() {
+                heading.push(" (headless)", ChatInk::Dim);
             }
             heading.push(" → ", ChatInk::Dim);
             heading.push(
@@ -1199,6 +1201,8 @@ pub fn render_chat_lines(
             );
             if let Some(pane) = row.recipient.pane_id() {
                 heading.push(format!(" ({pane})"), ChatInk::Dim);
+            } else if row.recipient.is_headless() {
+                heading.push(" (headless)", ChatInk::Dim);
             }
             heading.push(" · ", ChatInk::Dim);
             heading.push(status, ChatInk::Accent);
@@ -1398,6 +1402,8 @@ pub fn render_chat_lines(
                         line.push(format!(" ({pane})"), ChatInk::Dim);
                     } else if r.recipient.is_admin() {
                         line.push(" [admin]", ChatInk::Dim);
+                    } else if r.recipient.is_headless() {
+                        line.push(" (headless)", ChatInk::Dim);
                     }
                     line.push(" ", ChatInk::Text);
                 } else {
@@ -1960,7 +1966,7 @@ mod tests {
         let route = |pane: &str| {
             Some(MessageRecipientRoute {
                 label: "claude".into(),
-                pane_id: pane.parse().unwrap(),
+                pane_id: Some(pane.parse().unwrap()),
             })
         };
         let m1 = MessageId::parse("m-0000000000000001").unwrap();

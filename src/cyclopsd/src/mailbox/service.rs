@@ -66,6 +66,10 @@ pub enum MailboxServiceError {
     ForeignDirectory,
     #[error("notification scheduler state could not be recorded: {0}")]
     NotificationSchedule(String),
+    /// A body reaches an agent only through a claim; `msg.read` is the
+    /// operator's read and refuses every other caller.
+    #[error("bodies reach an agent only through a claim")]
+    OperatorRequired,
 }
 
 impl From<MailboxError> for MailboxServiceError {
@@ -186,6 +190,7 @@ impl MailboxService {
         // Keep this read guard through the append. A route replacement cannot
         // invalidate an exact recipient after validation but before acceptance.
         let directory = self.directory()?;
+        let broadcast = request.recipient_keys.is_none() && request.addresses == ["*"];
         let recipients = match request.recipient_keys.as_deref() {
             Some(_) if !request.addresses.is_empty() => {
                 return Err(MailboxDirectoryError::MixedRecipientSelectors.into());
@@ -204,6 +209,7 @@ impl MailboxService {
             client_key: request.client_key,
             supersedes: request.supersedes,
             raw: request.raw,
+            broadcast,
             presentation: MessagePresentation {
                 sender_label: sender.label,
                 recipient_labels: recipients
@@ -224,7 +230,14 @@ impl MailboxService {
                     .is_some()
             })
         });
-        let accepted = store.accept(mint_message_id(), draft)?;
+        // A replacement joins the thread of the message it supersedes; the
+        // store checks the same supersession again under the same lock.
+        let thread_root = store
+            .projection()
+            .supersession_thread_root(draft.sender, &draft.recipients, draft.supersedes.as_ref())
+            .map_err(MessageStoreError::from)?;
+        let message_id = store.mint_message_id(thread_root.as_ref());
+        let accepted = store.accept(message_id, draft)?;
         if accepted.inserted {
             let changed = if withdrew_notification {
                 &[
@@ -563,6 +576,7 @@ impl MailboxService {
                     recipient,
                     label,
                     attempt_id: record.map(|record| record.attempt_id),
+                    transport: record.map(|record| record.transport),
                     notification_state_raw,
                     notification_state,
                     quota_state,
@@ -841,15 +855,15 @@ impl MailboxService {
         } else {
             reference
         };
-        let recipient = store
-            .projection()
-            .derive_reply(sender.key, &reference)?
-            .recipient;
+        let derived = store.projection().derive_reply(sender.key, &reference)?;
+        let recipient = derived.recipient;
         let Some(destination) = directory.identity_for_recipient(recipient) else {
             return Err(MailboxDirectoryError::UnknownRecipient(recipient.to_string()).into());
         };
+        // The reply's id carries the parent's thread.
+        let message_id = store.mint_message_id(Some(&derived.thread_root));
         let accepted = store.reply(
-            mint_message_id(),
+            message_id,
             ReplyDraft {
                 sender: sender.key,
                 reference,
@@ -1021,6 +1035,34 @@ impl MailboxService {
     ///
     /// The returned boolean is true only when this call appended the durable
     /// fact. Repeating the exact operation is a successful no-op.
+    /// The operator's read of one message, body included, with no claim and
+    /// no journal append. A doorbell locator resolves to its message.
+    pub fn read_message(
+        &self,
+        reader: RecipientKey,
+        reference: MessageId,
+    ) -> Result<InboxMessage, MailboxServiceError> {
+        if !reader.is_admin() {
+            return Err(MailboxServiceError::OperatorRequired);
+        }
+        let store = self.store()?;
+        let message_id = match cyclops_proto::parse_notification_attempt_claim_locator(&reference) {
+            Some(attempt_id) => store
+                .projection()
+                .notification_by_attempt(attempt_id)
+                .map(|record| record.message_id.clone())
+                .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))
+                .map_err(MessageStoreError::from)?,
+            None => reference,
+        };
+        let line = store
+            .projection()
+            .get_message(&message_id)
+            .ok_or(MailboxError::MessageNotFound(message_id))
+            .map_err(MessageStoreError::from)?;
+        Ok(operator_message(line).map_err(MessageStoreError::from)?)
+    }
+
     pub fn withdraw_notification_before_write(
         &self,
         operator: RecipientKey,

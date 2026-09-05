@@ -1,0 +1,88 @@
+# Cyclops detection manifest: Auggie (Augment Code CLI)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No auggie binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://docs.augmentcode.com/cli/hooks
+#   https://www.npmjs.com/package/@augmentcode/auggie
+#
+# Skills directory (skills.sh catalog key augment): ~/.augment/skills
+#
+# Sensor summary for this CLI:
+#   process  auggie is npm @augmentcode/auggie run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED for
+#            gemini, inferred here). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest auggie.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.augment/settings.json (user), <workspace>/.augment/
+#            settings.json or settings.local.json, or /etc/augment/
+#            settings.json; entries {"type":"command","command","timeout",
+#            "metadata"}. Events are PreToolUse, PostToolUse, Stop,
+#            SessionStart, SessionEnd and Notification only: there is NO
+#            prompt-submit event, so no start or ACK is declared. Stop
+#            carries agent_stop_cause (end_turn, interrupted,
+#            max_iterations, error) and, with includeConversationData, a
+#            conversation.userPrompt, but an end without a start cannot be
+#            a turn; SessionStart and Stop are wired for liveness and
+#            Notification is the attention edge.
+#   screen   The docs' composer mockup reads
+#            "> Try 'how do I log an error?' or type / for commands". The
+#            rule below anchors the prompt glyph and the quoted placeholder
+#            suffix on one row; it is UNMEASURED, so it is not lifecycle
+#            evidence and can neither confirm idle nor end a turn.
+
+[agent]
+id = "auggie"
+display_name = "Auggie"
+version_tested = "unverified"
+process_names = ["auggie"]
+argv_basenames = ["auggie"]
+launch = "auggie"
+
+[hooks]
+config_mechanism = "hooks object in ~/.augment/settings.json"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "Stop", "SessionStart", "SessionEnd",
+  "Notification",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.augment/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Auggie."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "composer_placeholder"
+state = "idle"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+lifecycle_evidence = false
+line_regex = ['^\s*>\s.*or type / for commands\s*$']
+note = """The empty composer shows the documented placeholder
+"Try 'how do I log an error?' or type / for commands" after the > glyph.
+Only the trailing "or type / for commands" is anchored because the example
+question may rotate. UNMEASURED: whether the placeholder stays visible
+mid-turn is unknown, which is why this is not lifecycle evidence."""
+evidence = "DOCUMENTED only (Augment CLI docs mockup): '> Try 'how do I log an error?' or type / for commands'"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

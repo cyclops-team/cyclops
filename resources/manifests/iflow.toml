@@ -1,0 +1,73 @@
+# Cyclops detection manifest: iFlow CLI
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No iflow binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://platform.iflow.cn/en/cli/examples/hooks
+#   https://platform.iflow.cn/en/cli/configuration/settings
+#   https://github.com/iflow-ai/iflow-cli
+#   https://www.npmjs.com/package/@iflow-ai/iflow-cli
+#
+# Skills directory (skills.sh catalog key iflow-cli): ~/.iflow/skills
+#
+# DISCONTINUED: the vendor's own notice reads "iFlow CLI will officially
+# shut down on April 17, 2026 (Beijing Time). Please migrate to Qoder."
+# This manifest exists for installs that still run.
+#
+# Sensor summary for this CLI:
+#   process  iflow is an npm package run by Node, so #{pane_current_command}
+#            is expected to read "node" (MEASURED for gemini, inferred here).
+#            "node" is not listed: it would claim every Node process. Pin
+#            the pane: cyclops name %N <label> --manifest iflow.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.iflow/settings.json (user) or ./.iflow/settings.json
+#            (project). The hooks page does not name the UserPromptSubmit
+#            payload field: its example uses `user_prompt` but annotates it
+#            "need to confirm actual structure", so no ACK field and
+#            therefore no candidate start is declared (a dispatch ACK needs
+#            a payload field). The events are wired for liveness only.
+#   screen   UNMEASURED. The README shows a bare "> " prompt, which is too
+#            weak to anchor alone, so no idle rule ships and deliveries fail
+#            closed (not write-ready).
+
+[agent]
+id = "iflow"
+display_name = "iFlow CLI"
+version_tested = "unverified"
+process_names = ["iflow"]
+argv_basenames = ["iflow"]
+launch = "iflow"
+
+[hooks]
+config_mechanism = "hooks object in ~/.iflow/settings.json"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "SetUpEnvironment", "Stop", "SubagentStop",
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "Notification",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.iflow/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for iFlow CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

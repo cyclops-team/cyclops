@@ -718,7 +718,10 @@ fn setup_only_writes_the_home_and_opens_nothing() {
     let text = stdout(&out);
     assert!(text.starts_with("✔ cyclops is set up\n"), "got {text:?}");
     assert!(text.contains("config.toml"), "{text}");
-    assert!(text.contains("12 detection manifests"), "{text}");
+    assert!(
+        text.contains(&format!("{} detection manifests", shipped_manifest_count())),
+        "{text}"
+    );
     // No workspace, so no next steps: whoever called this owns what comes
     // after it.
     assert!(!text.contains("Next:"), "{text}");
@@ -1187,11 +1190,14 @@ fn setup_check_reports_an_incomplete_empty_home_without_writing() {
     let report: Value = serde_json::from_slice(&out.stdout).expect("setup check JSON");
     assert_eq!(report["complete"], false, "{report}");
     let consumers = report["consumers"].as_array().expect("consumer rows");
+    let ids: Vec<&str> = consumers
+        .iter()
+        .map(|row| row["id"].as_str().expect("consumer id"))
+        .collect();
+    // The eight template vendors lead; every manifest with [hooks.wiring]
+    // follows as a catalog consumer.
     assert_eq!(
-        consumers
-            .iter()
-            .map(|row| row["id"].as_str().expect("consumer id"))
-            .collect::<Vec<_>>(),
+        &ids[..8],
         ["claude", "codex", "cursor", "agy", "kimi", "gemini", "qwen", "goose"]
     );
     assert_eq!(
@@ -1242,7 +1248,7 @@ fn setup_plan_is_body_free_read_only_and_ignores_uninstalled_consumers() {
     assert_eq!(plan["apply_available"], false, "{plan}");
     assert!(plan.get("apply").is_none(), "{plan}");
     let assets = plan["assets"].as_array().expect("plan assets");
-    assert_eq!(assets.len(), 12, "{plan}");
+    assert_eq!(assets.len(), shipped_manifest_count(), "{plan}");
     for asset in assets {
         assert_eq!(asset["kind"], "manifest", "{asset}");
         assert_eq!(asset["observed_state"], "missing", "{asset}");
@@ -1998,8 +2004,13 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
     assert_eq!(report["complete"], true, "{report}");
     let consumers = report["consumers"].as_array().expect("consumer rows");
     for consumer in consumers {
-        assert_eq!(consumer["installed"], true, "{consumer}");
         assert_eq!(consumer["manifest"]["state"], "current", "{consumer}");
+        // Only the eight vendors this fixture installs are present; the
+        // catalog vendors are absent and count as complete as they are.
+        if consumer["install_state"] == "absent" {
+            continue;
+        }
+        assert_eq!(consumer["installed"], true, "{consumer}");
         assert_eq!(consumer["skill"]["state"], "current", "{consumer}");
     }
     assert_eq!(consumers[0]["hook"]["state"], "current");
@@ -3753,4 +3764,20 @@ fn leak_child(home: &Path, hs: &Path) {
     // Proof this child reached the forced panic through the handshake.
     fs::write(hs.join("seen"), "go").expect("record continue");
     panic!("forced: this stands in for a timed-out assertion");
+}
+
+/// Every TOML file under resources/manifests is a shipped manifest.
+fn shipped_manifest_count() -> usize {
+    std::fs::read_dir(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/manifests"
+    ))
+    .expect("manifest dir")
+    .filter(|entry| {
+        entry
+            .as_ref()
+            .map(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+            .unwrap_or(false)
+    })
+    .count()
 }

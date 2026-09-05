@@ -1,0 +1,46 @@
+# Cyclops detection manifest: ForgeCode (antinomyhq)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No forge binary was run and nothing was measured: this file binds the
+# pane and nothing more. Sources:
+#   https://forgecode.dev/docs/
+#   https://github.com/antinomyhq/forgecode
+#
+# Skills directory (skills.sh catalog key forgecode): ~/.forge/skills
+#
+# NO HOOK CONFIG. ForgeCode documents AGENTS.md, SKILL.md, .mcp.json,
+# permissions.yaml and .forge.toml ($FORGE_CONFIG) but no shell-command
+# lifecycle hook (only a -e/--event flag on the CLI), so no [hooks] table
+# and no wiring ships. This manifest binds the pane so the agent's own
+# `cyclops send` resolves its identity, and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  forge is a native install (curl forgecode.dev/cli), so
+#            #{pane_current_command} is expected to read "forge" (inferred).
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The docs quote no TUI prompt string (the zsh
+#            plugin's ": <prompt>" trigger is shell-side), so no idle rule
+#            ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "forge"
+display_name = "ForgeCode"
+version_tested = "unverified"
+process_names = ["forge"]
+argv_basenames = ["forge"]
+launch = "forge"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for ForgeCode."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

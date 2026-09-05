@@ -1746,6 +1746,19 @@ pub(crate) fn is_vendor_now(inner: &Inner, pid: i32) -> crate::identity::Vendors
     }
 }
 
+/// Which shipped manifest a process runs under, right now, and the exact
+/// process it was read from. The headless registration records this so
+/// the roster can say what the agent is; nothing is ever gated on it.
+pub(crate) fn vendor_manifest_now(
+    inner: &Inner,
+    pid: i32,
+) -> Option<(String, crate::identity::ProcId)> {
+    match vendor_read(inner, pid, argv_line, crate::identity::proc_facts) {
+        VendorRead::Vendor(manifest, process) => Some((manifest.agent.id.clone(), process)),
+        VendorRead::NotVendor | VendorRead::Unprovable => None,
+    }
+}
+
 fn argv_live<'a>(
     inner: &'a Inner,
     pane_id: &str,
@@ -9628,6 +9641,7 @@ regex = ['^IDLE']
             shutdown_request: tokio::sync::watch::channel(false).0,
             stop,
             extra_tasks: StdMutex::new(Vec::new()),
+            self_handle: std::sync::OnceLock::new(),
         })
     }
 

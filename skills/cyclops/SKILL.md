@@ -1,6 +1,6 @@
 ---
 name: cyclops
-description: Communicate with other AI agents running in tmux panes via the cyclops CLI. Use when sending a message, handoff, question, or reply to another agent (e.g. "send this to reviewer", "tell the implementer", "notify the other agent", "hand this off"), when a received message starts with `[cyclops m-...]`, or when coordinating multi-agent work across panes. Replaces any prior pane-messaging approach (tmux send-keys, COORDINATION.md).
+description: Communicate with other AI agents running in tmux panes via the cyclops CLI. Use when sending a message, handoff, question, or reply to another agent (e.g. "send this to reviewer", "tell the implementer", "notify the other agent", "hand this off"), when a line starting with `[cyclops from` appears in your composer, or when coordinating multi-agent work across panes. Replaces any prior pane-messaging approach (tmux send-keys, COORDINATION.md).
 ---
 
 # Cyclops: talking to other agents
@@ -155,13 +155,20 @@ pane notification:
 $ cyclops send implementer --subject "Run the tests" \
     --summary "Run the focused test suite. Report any exact failure." \
     --body "make test"
-accepted m-18bfdb
+accepted cyc-18bfdb42-a3c90e17
 ✓ accepted · wake queued
 ```
 
 (The exact wake state may advance before the receipt is rendered.)
-Examples abbreviate message ids; live ids use `m-` plus 32 lowercase
-hexadecimal UUID digits.
+
+Message ids are `cyc-<thread>-<message>`: two runs of eight lowercase hex
+characters. Every message in one thread shares the `<thread>` run and gets
+its own `<message>` run, so read the first run as "which conversation" and
+the second as "which message in it". A reply's receipt names the thread it
+joined (`accepted cyc-18bfdb42-c91a55e0 · thread cyc-18bfdb42-a3c90e17`),
+and `cyclops thread <id>` lists a thread in order with each message's part.
+Journals an older daemon wrote hold `m-` plus 32 lowercase hex characters;
+those ids still work everywhere an id is accepted.
 
 `accepted` proves the durable record and mailbox entry exist. `wake queued`
 means terminal delivery is queued. Neither proves the recipient claimed or
@@ -173,9 +180,13 @@ first. The request may already be durable. Repeat a send or reply only with the
 same explicit `--client-key`; an unkeyed retry can create a second message.
 
 `--summary` is optional for both `send` and `reply`. When you give one it
-must be one non-empty line of at most 240 characters; when you omit it the
-daemon derives the preview from the subject, never from the body. Write a
-useful human preview: what the message is about and what should happen next.
+must be one non-empty line; when you omit it the daemon derives the preview
+from the subject, never from the body. Keep it under about 100 characters:
+the pane shows one row, the header and the claim command share that row, and
+a long summary wraps into a paragraph the recipient has to scroll past before
+finding the claim command. There is no hard cap, but the CLI warns above 160
+characters. Write a useful human preview: what the message is about and what
+should happen next.
 
 Cyclops writes the summary beside one exact claim instruction after proving
 the pane is present and alive, a manifest binds it, and the foreground
@@ -183,8 +194,13 @@ program is the intended recipient agent or a tool it handed the terminal to
 while the screen still reads as that agent:
 
 ```text
-[cyclops from codey-cyclops] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>
+[cyclops from codey-cyclops to reviewer] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>
 ```
+
+The header is `[cyclops from <sender> to <recipients>]`: up to three
+recipient names joined by `, `, then `<first>, <second>, +N`, and `to all`
+for a broadcast. The claim command after the `|` is the only part you act
+on; run it exactly as written.
 
 Every `send` and `reply` has two independent results:
 
@@ -239,24 +255,24 @@ unverified raw write, so it never passes for a gated delivery.
 
 The current wake line names the exact notification attempt. When its `cyclops
 inbox claim m-att_...` command is visible in your pane, run that command once
-and continue from the returned canonical `m-...` envelope. It is not a cue to
+and continue from the returned canonical `cyc-...` envelope. It is not a cue to
 use `inbox next` to wake the pane or look for a second message. List pending
 metadata if you need the queue:
 
 ```console
 $ cyclops inbox list
-m-d7e4ba admin · Review the rate limiter
+cyc-d7e4ba90-1f3a6c2e admin · Review the rate limiter
 ```
 
 Claim only that id. This atomically marks the recipient mailbox entry claimed
 and returns the immutable payload:
 
 ```
-$ cyclops inbox claim m-d7e4ba
-[cyclops m-d7e4ba] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
+$ cyclops inbox claim cyc-d7e4ba90-1f3a6c2e
+[cyclops cyc-d7e4ba90-1f3a6c2e] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
-Reply: cyclops reply m-d7e4ba --summary "The review is complete. No blockers remain." --body "..."
-[cyclops:end m-d7e4ba]
+Reply: cyclops reply cyc-d7e4ba90-1f3a6c2e --summary "The review is complete. No blockers remain." --body "..."
+[cyclops:end cyc-d7e4ba90-1f3a6c2e]
 ```
 
 A repeat claim returns the same payload and creates no second task. A claim
@@ -267,12 +283,15 @@ rename. Reply using the id so the daemon derives the recipient, thread, and
 subject from the parent:
 
 ```
-$ cyclops reply m-d7e4ba \
+$ cyclops reply cyc-d7e4ba90-1f3a6c2e \
     --summary "The review is complete. No blockers remain." \
     --body "Looked at retry.rs. Tests pass."
-accepted m-42b817
+accepted cyc-d7e4ba90-42b817fe · thread cyc-d7e4ba90-1f3a6c2e
 ✓ accepted · wake queued
 ```
+
+The reply's id shares the parent's `<thread>` run; only its `<message>` run
+is new.
 
 `accepted` means the reply is durable. `wake queued` means the sender's pane
 notification is a separate, required delivery in progress; it is not proof
@@ -290,25 +309,63 @@ The command subscribes before checking the inbox, claims at most one message,
 and exits `2` if none arrives before the deadline. It only prints the mailbox
 payload to the terminal that ran it; it does not create a pane notification.
 
+If you are running inside a tmux pane that Cyclops watches, use the normal flow: your doorbell arrives in your composer and you claim it. Only an agent with no pane should poll with `cyclops inbox next`.
+
 Do **not** run `inbox next` in an interactive agent pane while waiting for a
 colleague. It makes the CLI command the foreground program, so Cyclops cannot
 safely prove that the agent itself is ready for a direct notification. Use the
 visible exact `m-att_...` notification instead. `inbox next` is for bounded,
-unattended automation. Claiming through it never cancels the separate pane
-notification obligation.
+unattended automation. A claim before the doorbell is written withdraws that
+doorbell (nothing is pasted into the pane); a claim after Enter is its
+receipt.
 
 For one sender, copy the canonical `sender` key from `cyclops inbox list
 --json` and use `inbox next --from <recipient-key>`. Do not pass a display
 label. Exit `1` with `claim_outcome_unknown` means the claim was sent but its
 answer missed the deadline. Inspect the message id before retrying.
 
+### Headless agents: no pane, socket only
+
+If you run in no tmux pane at all (a script, a service, a sub-agent started
+without a terminal), register yourself once at startup from that process:
+
+```bash
+cyclops name <label> --self
+```
+
+Outside tmux, `--self` registers you headless. The daemon proves who you are
+from your process tree, the same way it proves a pane agent: the label binds
+to the nearest agent process above the command, and nothing you send names a
+process. There is no token to keep or pass along. The receipt line reads
+`named <label> · headless, no pane`. From inside a watched pane the same
+command is refused with `use_pane`; a pane agent is named from its pane.
+
+A message sent to you closes its notification as `notified` with transport
+`mailbox`: the message is in your mailbox and no pane was written. The
+sender's receipt reads `accepted · in mailbox, no pane`. Read your mailbox
+with a wait that has no deadline:
+
+```bash
+cyclops inbox next --wait
+```
+
+It subscribes first, claims the oldest pending message when one arrives, and
+prints it exactly like a bounded `inbox next`. It ends without a message only
+when cyclopsd closes the connection, which exits `1` as `daemon_gone`; start
+the daemon again and rerun it. `--wait` and `--timeout` cannot be combined.
+Every helper you start inherits your identity, so run `inbox next --wait`
+from your own process or a child of it. Exiting releases your label: the
+daemon learns of the exit from the kernel and takes the name back, and a
+later registration is a new mailbox, not the old one.
+
 `admin` is a valid durable mailbox address even though no pane may use that
 label. Send to it with `cyclops send admin ...`. Admin gets no pane wake; the
 operator sees the pending count in `cyclops status`. A same-user shell with no
 agent-vendor ancestor has the `admin` inbox identity, including a shell inside
 a watched pane. A vendor process gets an agent identity only through its
-current watched pane. `--all` targets agent panes only, so address admin
-explicitly.
+current watched pane, or through a headless registration made from its own
+process tree. `--all` targets every agent, pane or headless, and never admin,
+so address admin explicitly.
 
 `cyclops messages` shows body-free inbox, outbound, and notification state.
 `cyclops history --with <agent>` and `cyclops thread <id>` reconstruct the
@@ -436,6 +493,7 @@ and the proof).
   (e.g., an alarm followed later by a clearance). If you are parsing the
   ledger yourself, read forward and let the last line for an id win;
   never assume you can edit or delete one.
+- **If you are in a tmux pane the daemon watches, you use the normal Cyclops system.** Headless (socket-only) delivery is for a process that has no pane at all. Do not register `--self` from inside tmux, and do not wait in `inbox next --wait` from a watched pane.
 
 ## Read more
 

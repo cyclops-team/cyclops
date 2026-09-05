@@ -1,0 +1,50 @@
+# Cyclops detection manifest: Jazz
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No jazz binary was run and nothing was measured: this file binds the pane
+# and nothing more. Sources:
+#   https://github.com/lvndry/jazz
+#   https://jazz-cli.vercel.app/docs/use-cases
+#   https://www.npmjs.com/package/jazz-ai
+#
+# Skills directory (skills.sh catalog key jazz): ~/.jazz/skills
+#
+# NO HOOK CONFIG. Jazz documents Markdown workflows and built-in tools but
+# no shell-command lifecycle hook, so no [hooks] table and no wiring ships.
+# This manifest binds the pane so the agent's own `cyclops send` resolves
+# its identity, and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  jazz is an npm package (jazz-ai) run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED for
+#            gemini, inferred here). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest jazz.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The docs describe three glyphs ("»" you speaking,
+#            "╶" agent speaking, "▐" asking for authority) but no full prompt
+#            row; a lone glyph is too weak to anchor, so no idle or blocked
+#            rule ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "jazz"
+display_name = "Jazz"
+version_tested = "unverified"
+process_names = ["jazz"]
+argv_basenames = ["jazz"]
+launch = "jazz"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Jazz."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

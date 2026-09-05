@@ -141,6 +141,14 @@ fn normalize_boot_token(token: &str) -> String {
     token.trim().to_ascii_lowercase()
 }
 
+/// The current OS boot, as the durable identity a headless registration is
+/// filed under. A process birth is comparable only within one boot, so a
+/// registration from another boot names nothing and is dropped at boot
+/// reverification.
+pub(crate) fn current_os_boot_id() -> Option<OsBootId> {
+    OsBootId::new(normalize_boot_token(&boot_token()?)).ok()
+}
+
 /// The OS boot token. MEASURED on macOS 26.5: `kern.bootsessionuuid` is
 /// a per-boot UUID, and not `kern.boottime`, which NTP adjusts while the
 /// machine runs.

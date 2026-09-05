@@ -37,7 +37,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use cyclops_proto::{ProcessInstanceId, RecipientKey};
+use cyclops_proto::{OsBootId, ProcessInstanceId, RecipientKey};
 use cyclops_state::{StateError, StateRoot};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,32 @@ pub(crate) struct Adoption {
     pub(crate) border_format: Option<String>,
 }
 
+/// One headless registration: an agent process with no pane.
+///
+/// The root is the vendor process the registration was proven from, and
+/// it is the whole identity: a caller resolves to this label by descending
+/// from that exact process generation, and the label is released when the
+/// process exits. The boot token is kept because a process birth is only
+/// comparable within one OS boot; a row from another boot names nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct HeadlessAdoption {
+    pub(crate) label: String,
+    pub(crate) recipient: RecipientKey,
+    pub(crate) root: ProcessInstanceId,
+    pub(crate) os_boot_id: OsBootId,
+    /// The manifest the root process was classified under at registration,
+    /// or the explicit `--manifest` pin. Recorded for the roster; nothing
+    /// is ever gated on it because nothing is ever written to a terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest: Option<String>,
+}
+
+/// Who answers to a label right now.
+pub(crate) enum LabelHolder {
+    Pane(Adoption),
+    Headless(HeadlessAdoption),
+}
+
 /// The window-scoped half of the chrome snapshot.
 ///
 /// `pane-border-status` decides whether a border carries text at all, and
@@ -103,6 +129,12 @@ struct File {
     panes: Vec<Adoption>,
     #[serde(default)]
     windows: Vec<WindowChrome>,
+    /// Headless registrations. Absent in files older daemons wrote; an
+    /// older daemon reading a file with this list ignores it, which is
+    /// safe because the process generations it names are re-verified at
+    /// every boot anyway.
+    #[serde(default)]
+    headless: Vec<HeadlessAdoption>,
 }
 
 /// The live registry. Exact adoptions are keyed by their durable mailbox
@@ -113,6 +145,7 @@ pub(crate) struct Registry {
     panes: HashMap<RecipientKey, Adoption>,
     legacy_panes: Vec<Adoption>,
     windows: HashMap<String, WindowChrome>,
+    headless: HashMap<RecipientKey, HeadlessAdoption>,
 }
 
 impl Registry {
@@ -126,6 +159,7 @@ impl Registry {
             panes: HashMap::new(),
             legacy_panes: Vec::new(),
             windows: HashMap::new(),
+            headless: HashMap::new(),
         };
         let path = reg.state_root.path().join(FILE);
         let shown = path.display().to_string();
@@ -169,6 +203,11 @@ impl Registry {
         for w in file.windows {
             reg.windows.insert(w.window_id.clone(), w);
         }
+        for adoption in file.headless {
+            if adoption.recipient.is_headless() {
+                reg.headless.insert(adoption.recipient, adoption);
+            }
+        }
         (reg, Vec::new())
     }
 
@@ -194,6 +233,128 @@ impl Registry {
         self.panes
             .get(&recipient)
             .filter(|adoption| adoption.pane_root == Some(pane_root))
+    }
+
+    /// Whether an exact route is on the roster: a pane adoption at that
+    /// pane generation, or a headless registration at that process
+    /// generation. This is the question the mailbox origin check asks.
+    pub(crate) fn route_is_current(
+        &self,
+        recipient: RecipientKey,
+        root: ProcessInstanceId,
+    ) -> bool {
+        if recipient.is_headless() {
+            self.headless
+                .get(&recipient)
+                .is_some_and(|adoption| adoption.root == root)
+        } else {
+            self.for_route(recipient, root).is_some()
+        }
+    }
+
+    /// The headless registration rooted at one exact process generation.
+    pub(crate) fn headless_for_root(&self, root: ProcessInstanceId) -> Option<&HeadlessAdoption> {
+        self.headless
+            .values()
+            .find(|adoption| adoption.root == root)
+    }
+
+    /// Every headless registration, for the surfaces that render or
+    /// resolve the whole roster.
+    pub(crate) fn headless_adoptions(&self) -> Vec<HeadlessAdoption> {
+        let mut out: Vec<HeadlessAdoption> = self.headless.values().cloned().collect();
+        out.sort_by_key(|adoption| adoption.recipient);
+        out
+    }
+
+    /// Whoever answers to a label, pane or headless, other than `except`.
+    pub(crate) fn label_holder(
+        &self,
+        label: &str,
+        except: Option<RecipientKey>,
+    ) -> Option<LabelHolder> {
+        if let Some(pane) = self
+            .panes
+            .values()
+            .find(|adoption| adoption.label == label && adoption.recipient != except)
+        {
+            return Some(LabelHolder::Pane(pane.clone()));
+        }
+        self.headless
+            .values()
+            .find(|adoption| adoption.label == label && Some(adoption.recipient) != except)
+            .cloned()
+            .map(LabelHolder::Headless)
+    }
+
+    /// Add or replace a headless registration. Persists before it
+    /// commits, like [`Self::adopt`]: a registration that cannot be
+    /// written down did not happen.
+    pub(crate) fn adopt_headless(&mut self, adoption: HeadlessAdoption) -> Result<(), StateError> {
+        assert!(
+            adoption.recipient.is_headless(),
+            "headless registrations carry a headless recipient"
+        );
+        let mut headless = self.headless.clone();
+        headless.insert(adoption.recipient, adoption);
+        self.commit_all(
+            self.panes.clone(),
+            self.legacy_panes.clone(),
+            self.windows.clone(),
+            headless,
+        )
+    }
+
+    /// Release one headless label. Returns the registration that was
+    /// there. A failed write still drops it from the live map: the process
+    /// is gone either way, and a dead label answering to messages is the
+    /// worse outcome.
+    pub(crate) fn retire_headless(&mut self, recipient: RecipientKey) -> Option<HeadlessAdoption> {
+        let gone = self.headless.get(&recipient)?.clone();
+        let mut headless = self.headless.clone();
+        headless.remove(&recipient);
+        if let Err(error) = self.commit_all(
+            self.panes.clone(),
+            self.legacy_panes.clone(),
+            self.windows.clone(),
+            headless,
+        ) {
+            tracing::error!(recipient = %recipient, error = %error, "registry write failed while retiring a headless label");
+            self.headless.remove(&recipient);
+        }
+        Some(gone)
+    }
+
+    /// Drop every headless registration `keep` refuses, and hand back the
+    /// ones dropped. Boot runs this with the current OS boot token and a
+    /// live process check, so a row from a previous boot or a dead process
+    /// never answers to its label again.
+    pub(crate) fn retain_headless(
+        &mut self,
+        keep: impl Fn(&HeadlessAdoption) -> bool,
+    ) -> Vec<HeadlessAdoption> {
+        let mut headless = self.headless.clone();
+        let mut dropped = Vec::new();
+        headless.retain(|_, adoption| {
+            let kept = keep(adoption);
+            if !kept {
+                dropped.push(adoption.clone());
+            }
+            kept
+        });
+        if dropped.is_empty() {
+            return dropped;
+        }
+        if let Err(error) = self.commit_all(
+            self.panes.clone(),
+            self.legacy_panes.clone(),
+            self.windows.clone(),
+            headless.clone(),
+        ) {
+            tracing::error!(error = %error, "registry write failed while reverifying headless registrations");
+            self.headless = headless;
+        }
+        dropped
     }
 
     /// Exact adoption for a durable recipient, regardless of pane root.
@@ -626,6 +787,16 @@ impl Registry {
         legacy_panes: Vec<Adoption>,
         windows: HashMap<String, WindowChrome>,
     ) -> Result<(), StateError> {
+        self.commit_all(panes, legacy_panes, windows, self.headless.clone())
+    }
+
+    fn commit_all(
+        &mut self,
+        panes: HashMap<RecipientKey, Adoption>,
+        legacy_panes: Vec<Adoption>,
+        windows: HashMap<String, WindowChrome>,
+        headless: HashMap<RecipientKey, HeadlessAdoption>,
+    ) -> Result<(), StateError> {
         let mut file = File {
             version: VERSION,
             panes: panes
@@ -634,10 +805,12 @@ impl Registry {
                 .chain(legacy_panes.iter().cloned())
                 .collect(),
             windows: windows.values().cloned().collect(),
+            headless: headless.values().cloned().collect(),
         };
         file.panes
             .sort_by(|a, b| (&a.session, &a.pane_id).cmp(&(&b.session, &b.pane_id)));
         file.windows.sort_by(|a, b| a.window_id.cmp(&b.window_id));
+        file.headless.sort_by_key(|a| a.recipient);
         let path = self.state_root.path().join(FILE);
         let mut text = serde_json::to_string_pretty(&file).map_err(|source| StateError::Io {
             path: path.clone(),
@@ -649,6 +822,7 @@ impl Registry {
         self.panes = panes;
         self.legacy_panes = legacy_panes;
         self.windows = windows;
+        self.headless = headless;
         Ok(())
     }
 }
@@ -764,6 +938,64 @@ mod tests {
             0o600
         );
         assert!(!dir.join("registry.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn headless(label: &str, pid: i32, instance: u128) -> HeadlessAdoption {
+        HeadlessAdoption {
+            label: label.into(),
+            recipient: RecipientKey::headless(
+                WorkspaceId::from_uuid(Uuid::from_u128(1)).unwrap(),
+                cyclops_proto::AgentInstanceId::from_uuid(Uuid::from_u128(instance)).unwrap(),
+            ),
+            root: ProcessInstanceId::new(pid, pid as u64 + 10_000).unwrap(),
+            os_boot_id: OsBootId::new("boot-test").unwrap(),
+            manifest: Some("claude".into()),
+        }
+    }
+
+    /// A headless registration is a registry row like a pane adoption: it
+    /// survives a reload, answers to its label and its root, and a file an
+    /// older daemon wrote (no `headless` list) still loads.
+    #[test]
+    fn a_headless_registration_survives_a_reload_and_collides_on_labels() {
+        let dir = home("headless");
+        let (mut reg, warnings) = load(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        reg.adopt(adoption("%1", "reviewer", 4242, "@0"), window("@0", None))
+            .expect("adopt writes");
+        let worker = headless("worker", 5151, 7);
+        reg.adopt_headless(worker.clone()).expect("register writes");
+
+        let (mut back, warnings) = load(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(back.route_is_current(worker.recipient, worker.root));
+        assert!(!back.route_is_current(worker.recipient, ProcessInstanceId::new(5151, 1).unwrap()));
+        assert_eq!(
+            back.headless_for_root(worker.root)
+                .map(|a| a.label.as_str()),
+            Some("worker")
+        );
+        assert!(matches!(
+            back.label_holder("worker", None),
+            Some(LabelHolder::Headless(holder)) if holder.recipient == worker.recipient
+        ));
+        assert!(matches!(
+            back.label_holder("reviewer", None),
+            Some(LabelHolder::Pane(holder)) if holder.pane_id == "%1"
+        ));
+        assert!(back
+            .label_holder("worker", Some(worker.recipient))
+            .is_none());
+
+        // Reverification drops a row whose process generation is gone.
+        let dropped = back.retain_headless(|a| a.root.pid() != 5151);
+        assert_eq!(dropped.len(), 1);
+        let (again, _) = load(&dir);
+        assert!(again.headless_adoptions().is_empty());
+
+        // The pane adoption is untouched throughout.
+        assert_eq!(again.label_of("%1").as_deref(), Some("reviewer"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1069,6 +1301,7 @@ mod tests {
             version: VERSION,
             panes: vec![legacy],
             windows: vec![window("@0", None)],
+            headless: Vec::new(),
         };
         std::fs::write(
             dir.join(FILE),

@@ -1,0 +1,97 @@
+# Cyclops detection manifest: Autohand Code
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No autohand binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://github.com/autohandai/code-cli
+#   https://github.com/autohandai/code-cli/blob/main/docs/hooks.md
+#   https://github.com/autohandai/code-cli/blob/main/docs/features.md
+#   https://autohand.ai/docs/working-with-autohand-code/cli
+#
+# Skills directory (skills.sh catalog key autohand-code): ~/.autohand/skills
+# ($AUTOHAND_HOME/skills)
+#
+# Sensor summary for this CLI:
+#   process  autohand is an Ink TUI installed by curl or Homebrew
+#            (autohandai/code/autohand-code); the runtime behind it is
+#            unmeasured, so the pane may read "node" or "bun" instead of the
+#            names below. The documented third alias, `agent`, is
+#            deliberately NOT listed: the installer replaces any existing
+#            `agent` on PATH, and a process name that generic would claim
+#            unrelated panes. If the pane does not bind, pin it:
+#            cyclops name %N <label> --manifest autohand.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, own shape: ~/.autohand/config.json holds
+#            {"hooks":{"enabled":true,"hooks":[{"event","command",
+#            "description","enabled"}]}}. Hooks get HOOK_EVENT,
+#            HOOK_WORKSPACE, HOOK_SESSION_ID, HOOK_TOOL, HOOK_INSTRUCTION,
+#            HOOK_TOKENS, HOOK_ERROR in the environment and JSON on stdin
+#            with instruction, tool_name, tool_input, session_id, cwd,
+#            hook_event_name, error, notification_message, automode_prompt.
+#            The prompt text is documented as `instruction`; the docs do not
+#            say per event which fields are populated, so its presence on
+#            pre-prompt is inferred from the field's meaning, not proven.
+#            pre-prompt is the closest documented edge to a prompt submit
+#            and is declared the dispatch candidate on that basis. stop
+#            shares no turn field with it, so no end is declared; stop is
+#            wired for liveness.
+#   screen   UNMEASURED. The docs describe a status line (model, mode,
+#            tokens) with no verbatim text and no prompt string, so no idle
+#            rule ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "autohand"
+display_name = "Autohand Code"
+version_tested = "unverified"
+process_names = ["autohand", "autohand-code"]
+argv_basenames = ["autohand", "autohand-code"]
+launch = "autohand"
+
+[hooks]
+config_mechanism = "hooks.hooks[] in ~/.autohand/config.json"
+turn_start = "pre-prompt"
+turn_start_evidence = "candidate"
+ack = "pre-prompt"
+ack_payload_field = "instruction"
+ack_evidence = "dispatch"
+attention = "notification"
+available = [
+  "pre-tool", "post-tool", "file-modified", "pre-prompt", "stop",
+  "post-response", "session-start", "session-end", "pre-clear",
+  "session-error", "rate-limit", "subagent-stop", "permission-request",
+  "notification", "automode:start", "automode:iteration",
+  "automode:checkpoint", "automode:pause", "automode:resume",
+  "automode:cancel", "automode:complete", "automode:error", "pre-learn",
+  "post-learn", "goal-written:completed", "team-created", "teammate-spawned",
+  "teammate-idle", "task-assigned", "task-completed", "team-shutdown",
+  "review:start", "review:end", "review:paused", "review:failed",
+  "review:completed", "mode-change", "context:compact", "context:overflow",
+  "context:warning", "context:critical",
+]
+
+[hooks.wiring]
+shape = "autohand"
+file = "~/.autohand/config.json"
+payload_prompt_field = "instruction"
+
+[hooks.wiring.events]
+session_start = "session-start"
+prompt_submit = "pre-prompt"
+stop = "stop"
+notification = "notification"
+permission_request = "permission-request"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Autohand Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

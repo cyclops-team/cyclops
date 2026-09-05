@@ -1,0 +1,70 @@
+# Cyclops detection manifest: Neovate (neovateai)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no neovate binary was run on the evidence host and
+# no turn, title, or screen was captured. Sources:
+#   https://github.com/neovateai/neovate-code        `neovate` / `neo`; `>` default, `!` bash, `#` memory; StatusLine
+#   https://neovateai.dev/en/docs/overview
+#   https://www.npmjs.com/package/@neovate/code
+#   skills.sh catalog row `neovate`: skills directory ~/.neovate/skills
+#
+# Sensor summary for this CLI:
+#   process  neovate is an npm package (@neovate/code) run by Node with a
+#            `neo` alias, so #{pane_current_command} is expected to read
+#            "node" (MEASURED for gemini, inferred here). "node" is not
+#            listed: it would claim every Node process. Until the daemon
+#            reads the script path behind an interpreter, pin the pane:
+#            cyclops name %N <label> --manifest neovate.
+#   title    UNMEASURED.
+#   hooks    NONE as shell commands. Neovate's "24+ hooks" belong to an
+#            in-process, Vite-style JavaScript plugin system (initialization,
+#            session lifecycle, tool augmentation), not to a file that runs
+#            a command, so no [hooks] or [hooks.wiring] table is declared.
+#   screen   DOCUMENTED, not measured: the README names the `>` default
+#            prompt and a StatusLine carrying [provider/model], cwd, tokens,
+#            context %, the approval mode and `🆔 <session id>`, plus the
+#            startup hint "💡 Use /help to get started". The idle rule
+#            below needs a bare `>` row and the `🆔` glyph together; the
+#            rest of the status line is described, not quoted, and the
+#            hint is startup chrome that carries no rule. Whether the
+#            prompt row and the status line also paint mid-turn is
+#            unmeasured, and no working line is documented, so a delivery
+#            admitted by this rule could land during a turn.
+#   config   ~/.neovate/ (config.json, skills/).
+
+[agent]
+id = "neovate"
+display_name = "Neovate"
+version_tested = "unverified"
+process_names = ["neovate", "neo"]
+argv_basenames = ["neovate", "neo"]
+launch = "neovate"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Neovate."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "composer_empty_with_status"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(8)"
+# Both clauses must hold: an empty `>` prompt row (typed text after the
+# glyph refuses the rule) and the session-id glyph of the StatusLine.
+line_regex = ['^\s*>\s*$']
+contains = ["🆔"]
+note = """Documented bare `>` prompt plus the documented StatusLine glyph
+`🆔 <session id>`. Unmeasured whether either row persists mid-turn; no
+working rule exists to outrank this one."""
+evidence = "DOCUMENTED, not measured: github.com/neovateai/neovate-code README"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

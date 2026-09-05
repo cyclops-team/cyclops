@@ -466,7 +466,10 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
             .recipient
             .current_route
             .as_ref()
-            .map(|route| format!("{} ({})", route.label, route.pane_id))
+            .map(|route| match route.pane_id {
+                Some(pane_id) => format!("{} ({pane_id})", route.label),
+                None => format!("{} (headless)", route.label),
+            })
             .unwrap_or_else(|| "route unavailable".into());
         rows.push(format!(
             "  {} {} · {reason} · waited {} · {position} · {route}",
@@ -1878,7 +1881,7 @@ mod tests {
                     can_withdraw_notification: true,
                     current_route: Some(cyclops_proto::MessageRecipientRoute {
                         label: "reviewer-now".into(),
-                        pane_id: "%1".parse().unwrap(),
+                        pane_id: Some("%1".parse().unwrap()),
                     }),
                     available: true,
                     mailbox: cyclops_proto::MailboxEntryState::Pending,

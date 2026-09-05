@@ -159,7 +159,7 @@ $ cyclops start --setup-only
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
   wrote 2 sounds to /Users/you/.cyclops/sounds
-  wrote 12 detection manifests to /Users/you/.cyclops/manifests
+  wrote 52 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
@@ -468,11 +468,12 @@ whole install and not one pane:
   1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
 ```
 
-Twelve manifests ship. Five are measured against a live CLI; seven are
-written from vendor documentation and say so (`version_tested =
-"unverified"`): they bind the pane and seed the skill, and a doorbell to one
-of them never detects a human draft, so it is effectively a raw write with a
-receipt until someone measures the composer.
+Supported agents come in three tiers. The first two ship a manifest in
+[`resources/manifests/`](../../resources/manifests/); the third takes the
+skill and nothing else.
+
+**Verified.** Five manifests are measured against a live CLI. Their hooks are
+wired from the templates in [`resources/hooks/`](../../resources/hooks/).
 
 | CLI | manifest id | tier | binds the pane by | hooks Cyclops wires | skill file |
 |---|---|---|---|---|---|
@@ -481,13 +482,95 @@ receipt until someone measures the composer.
 | Antigravity CLI | `agy` | verified | process | `~/.agents/hooks.json` | `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` |
 | Cursor Agent CLI | `cursor` | verified (fixtures) | argv | `~/.cursor/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
 | Kimi Code CLI | `kimi` | verified | process and argv | `~/.kimi-code/config.toml` | `~/.kimi-code/skills/cyclops/SKILL.md` |
-| Gemini CLI | `gemini` | unverified | argv, the script behind `node` | `~/.gemini/settings.json` | `~/.agents/skills/cyclops/SKILL.md` |
-| Qwen Code | `qwen` | unverified | argv, the script behind `node` | `~/.qwen/settings.json` | `~/.qwen/skills/cyclops/SKILL.md` |
-| goose | `goose` | unverified | process `goose` | `~/.agents/plugins/cyclops/hooks/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
-| OpenCode | `opencode` | unverified | process `opencode` | none (JavaScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
-| Amp | `amp` | unverified | argv, the script behind `node` | none (TypeScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
-| Crush | `crush` | unverified | process `crush` | none (`PreToolUse` only; see hooks.md) | `~/.agents/skills/cyclops/SKILL.md` |
-| aider | `aider` | unverified | argv, the script behind `python` | none | none (add the skill to `read:`) |
+
+**Unverified terminal CLIs with a manifest.** Written from vendor
+documentation and marked so (`version_tested = "unverified"`): each binds the
+pane, declares the hook events the vendor documents, and seeds the skill. A
+doorbell to one of them never detects a human draft, so it is effectively a
+raw write with a receipt until someone measures the composer. Gemini CLI,
+Qwen Code, and goose are wired from `resources/hooks/` templates; every other
+hook column below is wired from the manifest's own `[hooks.wiring]` table
+([MANIFESTS.md](../reference/MANIFESTS.md#hookswiring-how-cyclops-writes-the-hook-file)),
+the shape in parentheses. `none` means the vendor documents no shell hook
+(a JavaScript or TypeScript plugin API, or nothing), so the manifest binds the
+pane and seeds the skill only.
+
+| CLI | manifest id | launch | hooks Cyclops wires | skill file |
+|---|---|---|---|---|
+| Gemini CLI | `gemini` | `gemini` | `~/.gemini/settings.json` (template) | `~/.agents/skills/cyclops/SKILL.md` |
+| Qwen Code | `qwen` | `qwen` | `~/.qwen/settings.json` (template) | `~/.qwen/skills/cyclops/SKILL.md` |
+| goose | `goose` | `goose session` | `~/.agents/plugins/cyclops/hooks/hooks.json` (template) | `~/.agents/skills/cyclops/SKILL.md` |
+| AdaL | `adal` | `adal` | `~/.adal/settings.json` (claude-settings) | `~/.adal/skills/cyclops/SKILL.md` |
+| aider | `aider` | `aider` | none | none (add the skill to `read:`) |
+| Amp | `amp` | `amp` | none | `~/.agents/skills/cyclops/SKILL.md` |
+| Auggie | `auggie` | `auggie` | `~/.augment/settings.json` (claude-settings) | `~/.augment/skills/cyclops/SKILL.md` |
+| Autohand Code | `autohand` | `autohand` | `~/.autohand/config.json` (autohand) | `~/.autohand/skills/cyclops/SKILL.md` |
+| IBM Bob Shell | `bob` | `bob chat` | `~/.bob/settings/settings.json` (claude-settings) | `~/.bob/skills/cyclops/SKILL.md` |
+| Cline CLI | `cline` | `cline` | none | `~/.agents/skills/cyclops/SKILL.md` |
+| CodeArts Agent | `codearts` | `codearts` | none | `~/.codeartsdoer/skills/cyclops/SKILL.md` |
+| CodeBuddy Code | `codebuddy` | `codebuddy` | `~/.codebuddy/settings.json` (claude-settings) | `~/.codebuddy/skills/cyclops/SKILL.md` |
+| Command Code | `commandcode` | `cmd` | `~/.commandcode/settings.json` (claude-settings) | `~/.commandcode/skills/cyclops/SKILL.md` |
+| Continue CLI | `continue` | `cn` | `~/.continue/settings.json` (claude-settings) | `~/.continue/skills/cyclops/SKILL.md` |
+| GitHub Copilot CLI | `copilot` | `copilot` | `~/.copilot/hooks/cyclops.json` (copilot) | `~/.copilot/skills/cyclops/SKILL.md` |
+| Cortex Code | `cortex` | `cortex` | `~/.snowflake/cortex/hooks.json` (claude-hooks-file) | `~/.snowflake/cortex/skills/cyclops/SKILL.md` |
+| Crush | `crush` | `crush` | none (`PreToolUse` only; see hooks.md) | `~/.agents/skills/cyclops/SKILL.md` |
+| Deep Agents Code | `dcode` | `dcode` | `~/.deepagents/hooks.json` (claude-hooks-file) | `~/.deepagents/agent/skills/cyclops/SKILL.md` |
+| Devin for Terminal | `devin` | `devin` | `~/.config/devin/config.json` (claude-settings) | `~/.config/devin/skills/cyclops/SKILL.md` |
+| Dexto | `dexto` | `dexto --mode cli` | none | `~/.agents/skills/cyclops/SKILL.md` |
+| Droid | `droid` | `droid` | `~/.factory/settings.json` (claude-settings) | `~/.factory/skills/cyclops/SKILL.md` |
+| ForgeCode | `forge` | `forge` | none | `~/.forge/skills/cyclops/SKILL.md` |
+| Grok Build | `grok` | `grok` | `~/.grok/hooks/cyclops.json` (claude-hooks-file) | `~/.grok/skills/cyclops/SKILL.md` |
+| Hermes Agent | `hermes` | `hermes` | `~/.hermes/config.yaml` (hermes-yaml) | `~/.hermes/skills/cyclops/SKILL.md` |
+| iFlow CLI | `iflow` | `iflow` | `~/.iflow/settings.json` (claude-settings) | `~/.iflow/skills/cyclops/SKILL.md` |
+| Jazz | `jazz` | `jazz` | none | `~/.jazz/skills/cyclops/SKILL.md` |
+| Junie CLI | `junie` | `junie` | `~/.junie/config.json` (claude-settings) | `~/.junie/skills/cyclops/SKILL.md` |
+| Kilo CLI | `kilo` | `kilo` | none | `~/.kilocode/skills/cyclops/SKILL.md` |
+| Kimchi | `kimchi` | `kimchi` | none | `~/.config/kimchi/harness/skills/cyclops/SKILL.md` |
+| Kiro CLI | `kiro` | `kiro-cli` | `~/.kiro/agents/cyclops.json` (kiro-agent) | `~/.kiro/skills/cyclops/SKILL.md` |
+| Kode | `kode` | `kode` | none | `~/.kode/skills/cyclops/SKILL.md` |
+| Loaf | `loaf` | `loaf` | none | `~/.agents/skills/cyclops/SKILL.md` |
+| MiniMax Code CLI | `mcode` | `mcode` | none | `~/.minimax/skills/cyclops/SKILL.md` |
+| Neovate | `neovate` | `neovate` | none | `~/.neovate/skills/cyclops/SKILL.md` |
+| OpenClaw | `openclaw` | `openclaw tui` | none | `~/.openclaw/skills/cyclops/SKILL.md` |
+| OpenCode | `opencode` | `opencode` | none | `~/.agents/skills/cyclops/SKILL.md` |
+| OpenHands CLI | `openhands` | `openhands` | none (repository-level `<project>/.openhands/hooks.json` only) | `~/.openhands/skills/cyclops/SKILL.md` |
+| Posit Assistant TUI | `pa` | `pa` | `~/.posit/assistant/settings.json` (claude-settings) | `~/.posit/assistant/skills/cyclops/SKILL.md` |
+| Pi | `pi` | `pi` | none | `~/.pi/agent/skills/cyclops/SKILL.md` |
+| Qoder CLI | `qoder` | `qoder` | `~/.qoder/settings.json` (claude-settings) | `~/.qoder/skills/cyclops/SKILL.md` |
+| Qoder CN CLI | `qodercn` | `qoderclicn` | `~/.qoder-cn/settings.json` (claude-settings) | `~/.qoder-cn/skills/cyclops/SKILL.md` |
+| Reasonix | `reasonix` | `reasonix` | none | `~/.reasonix/skills/cyclops/SKILL.md` |
+| Rovo Dev | `rovodev` | `acli rovodev run` | none | `~/.rovodev/skills/cyclops/SKILL.md` |
+| Tabnine CLI | `tabnine` | `tabnine` | `~/.tabnine/agent/settings.json` (tabnine) | `~/.tabnine/agent/skills/cyclops/SKILL.md` |
+| TraeCode CLI | `traecli` | `traecli` | `~/.trae-cn/hooks.json` (claude-hooks-file) | `~/.trae-cn/skills/cyclops/SKILL.md` |
+| Mistral Vibe | `vibe` | `vibe` | `~/.vibe/hooks.toml` (vibe-toml) | `~/.vibe/skills/cyclops/SKILL.md` |
+| Warp Agent CLI | `warp` | `warp` | none | `~/.agents/skills/cyclops/SKILL.md` |
+
+**Skill-only products.** IDEs, desktop apps, and bots that read a skills
+directory but run in no tmux pane: no manifest, no hooks. When the directory
+in the middle column exists, `--wire-hooks` seeds the skill at the path on
+the right. Zed reads the shared `~/.agents/skills` copy; Zenflow reads
+Zencoder's directory and is the same entry.
+
+| Product | installed when this exists | skill file |
+|---|---|---|
+| AiderDesk | `~/.aider-desk` | `~/.aider-desk/skills/cyclops/SKILL.md` |
+| AstrBot | `~/.astrbot` | `~/.astrbot/data/skills/cyclops/SKILL.md` |
+| Codemaker | `~/.codemaker` | `~/.codemaker/skills/cyclops/SKILL.md` |
+| Code Studio | `~/.codestudio` | `~/.codestudio/skills/cyclops/SKILL.md` |
+| Firebender | `~/.firebender` | `~/.firebender/skills/cyclops/SKILL.md` |
+| inference.sh | `~/.inferencesh` | `~/.inferencesh/skills/cyclops/SKILL.md` |
+| Lingma | `~/.lingma` | `~/.lingma/skills/cyclops/SKILL.md` |
+| MCPJam | `~/.mcpjam` | `~/.mcpjam/skills/cyclops/SKILL.md` |
+| Moxby | `~/.moxby` | `~/.moxby/skills/cyclops/SKILL.md` |
+| Mux | `~/.mux` | `~/.mux/skills/cyclops/SKILL.md` |
+| Ona | `~/.ona` | `~/.ona/skills/cyclops/SKILL.md` |
+| Pochi | `~/.pochi` | `~/.pochi/skills/cyclops/SKILL.md` |
+| Terramind | `~/.terramind` | `~/.terramind/skills/cyclops/SKILL.md` |
+| Trae | `~/.trae` | `~/.trae/skills/cyclops/SKILL.md` |
+| Windsurf | `~/.codeium/windsurf` | `~/.codeium/windsurf/skills/cyclops/SKILL.md` |
+| ZCode | `~/.zcode` | `~/.zcode/skills/cyclops/SKILL.md` |
+| Zencoder (and Zenflow) | `~/.zencoder` | `~/.zencoder/skills/cyclops/SKILL.md` |
+| Zed | `~/.config/zed` | `~/.agents/skills/cyclops/SKILL.md` |
 
 A CLI that runs under an interpreter reports `node` or `python` as its
 command; Cyclops reads the script name behind the interpreter to bind it

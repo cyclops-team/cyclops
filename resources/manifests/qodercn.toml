@@ -1,0 +1,75 @@
+# Cyclops detection manifest: Qoder CN CLI (Qoder, China build)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no qoderclicn binary was run on the evidence host
+# and no turn, title, or screen was captured. Sources:
+#   https://help.aliyun.com/en/lingma/qoder-cli-cn-get-started-quickly   install, `>` chat, `!` bash, `/` slash, `#` memory
+#   https://docs.qoder.cn/cli/installation                                npm @qodercn-ai/qoderclicn
+#   https://docs.qoder.com/cli/hooks-reference                            docs.qoder.cn mirrors this page; events and common fields
+#   skills.sh catalog row `qoder-cn`: skills directory ~/.qoder-cn/skills
+#
+# Sensor summary for this CLI:
+#   process  the npm package is @qodercn-ai/qoderclicn and its command is
+#            `qoderclicn`; an earlier catalog pass recorded the command as
+#            `qodercn`, so both names are listed until one is measured.
+#            Either way it is a Node script, so #{pane_current_command} is
+#            expected to read "node" (MEASURED for gemini, inferred here).
+#            "node" is not listed: it would claim every Node process. Pin
+#            the pane if binding fails:
+#            cyclops name %N <label> --manifest qodercn.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED on the mirror, assumed identical to Qoder CLI: a
+#            `hooks` object in ~/.qoder-cn/settings.json, Claude-shaped.
+#            The event list below is the one the catalog pass recorded for
+#            the CN build. Common payload fields are session_id,
+#            transcript_path, cwd, hook_event_name, permission_mode,
+#            agent_id, agent_type; the UserPromptSubmit prompt field is
+#            undocumented, so no ACK payload field is declared. No turn id
+#            ties Stop to its UserPromptSubmit.
+#   screen   UNMEASURED. The docs name `>` for chat, `!` for bash, `/` for
+#            slash commands and `#` for memory but quote no status row, so
+#            no idle or working rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+
+[agent]
+id = "qodercn"
+display_name = "Qoder CN CLI"
+version_tested = "unverified"
+process_names = ["qoderclicn", "qodercn"]
+argv_basenames = ["qoderclicn", "qodercn"]
+launch = "qoderclicn"
+
+[hooks]
+config_mechanism = "hooks object in ~/.qoder-cn/settings.json"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse",
+  "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart",
+  "SubagentStop", "PreCompact", "Notification", "PermissionRequest",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.qoder-cn/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Qoder CN CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

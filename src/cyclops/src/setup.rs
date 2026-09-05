@@ -272,8 +272,8 @@ fn skill_state(installation: Installation, asset: AssetRead) -> (&'static str, b
 
 fn hook_state(
     installation: Installation,
-    kind: crate::hookset::CliKind,
     asset: AssetRead,
+    inspect: impl FnOnce(&[u8]) -> crate::hookset::WiringState,
 ) -> (&'static str, bool) {
     match installation {
         Installation::Absent => ("not_installed", true),
@@ -283,7 +283,7 @@ fn hook_state(
             AssetRead::Unreadable => ("unreadable", false),
             AssetRead::ManualReview => ("manual_review_required", false),
             AssetRead::Bytes(bytes) => {
-                let state = crate::hookset::inspect_wiring_bytes(kind, &bytes);
+                let state = inspect(&bytes);
                 (state.word(), state.ready())
             }
         },
@@ -302,12 +302,12 @@ fn consumer_check(
     let hook_path = locations.hook.path();
     let (hook_state, hook_ready) = hook_state(
         installation,
-        spec.kind,
         if installation == Installation::Present {
             read_asset(&locations.hook.root, &locations.hook.relative)
         } else {
             AssetRead::Missing
         },
+        |bytes| crate::hookset::inspect_wiring_bytes(spec.kind, bytes),
     );
     let required_receipt = installed.then_some(spec.receipt);
     let skill_path = locations.skill.path();
@@ -335,6 +335,59 @@ fn consumer_check(
     }
 }
 
+/// [`consumer_check`] for a vendor wired from its manifest's
+/// `[hooks.wiring]` table. A project-scoped wiring has no one file to
+/// inspect and is the operator's to place, so it counts as ready.
+fn catalog_check(
+    cyclops_home: &Path,
+    user_home: &Path,
+    consumer: &crate::wiring::Consumer,
+) -> ConsumerCheck {
+    let locations = consumer.locations(user_home);
+    let installation = Installation::inspect(&locations.install_root);
+    let installed = installation.installed();
+    let manifest = manifest_check(cyclops_home, consumer.id);
+    let (hook_path, hook_state, hook_ready) = match &locations.hook {
+        None => (None, "project_scoped", true),
+        Some(hook) => {
+            let (state, ready) = hook_state(
+                installation,
+                if installation == Installation::Present {
+                    read_asset(&hook.root, &hook.relative)
+                } else {
+                    AssetRead::Missing
+                },
+                |bytes| crate::wiring::inspect_bytes(consumer, bytes),
+            );
+            (Some(hook.path()), state, ready)
+        }
+    };
+    let required_receipt = installed.then(|| consumer.receipt());
+    let skill_path = locations.skill.path();
+    let (skill_state, skill_ready) = skill_state(
+        installation,
+        if installation == Installation::Present {
+            read_skill_asset(&locations.skill)
+        } else {
+            AssetRead::Missing
+        },
+    );
+    ConsumerCheck {
+        id: consumer.id,
+        name: consumer.name,
+        installation,
+        installed,
+        manifest,
+        hook_path,
+        hook_state,
+        hook_ready,
+        required_receipt,
+        skill_path,
+        skill_state,
+        skill_ready,
+    }
+}
+
 fn human_state(word: &str) -> String {
     word.replace('_', " ")
 }
@@ -345,10 +398,17 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
         return 1;
     };
     let cyclops_home = cyclops_proto::cyclops_home();
-    let checks: Vec<ConsumerCheck> = crate::consumer::SHIPPED
+    // The template-wired vendors, then every vendor wired from its
+    // manifest: one merged catalog, and adding a manifest adds a row here.
+    let mut checks: Vec<ConsumerCheck> = crate::consumer::SHIPPED
         .iter()
         .map(|spec| consumer_check(&cyclops_home, &user_home, spec))
         .collect();
+    checks.extend(
+        crate::wiring::catalog()
+            .iter()
+            .map(|consumer| catalog_check(&cyclops_home, &user_home, consumer)),
+    );
     let complete = checks.iter().all(ConsumerCheck::complete);
 
     if json_out {
