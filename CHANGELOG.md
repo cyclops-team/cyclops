@@ -49,8 +49,10 @@ versions are unreleased until admin cuts a tag.
 ### Changed
 - Delivery is a durable mailbox plus one doorbell line. The gate is three
   checks: the pane is present, alive, and not in copy-mode; a manifest binds
-  it and its foreground process is the agent; and the composer holds only on
-  a positively observed human draft or a hold an earlier attempt owns.
+  it and its foreground process is the agent, or a tool the agent handed the
+  terminal to while the screen still reads as the agent; and the composer
+  holds only on a positively observed human draft or a hold an earlier
+  attempt owns.
   Ambiguous or absent composer evidence no longer holds a doorbell. After the
   paste the daemon captures once, presses Enter regardless, and records
   `submitted` or `submitted_unverified`; a receipt comes from the hook, the

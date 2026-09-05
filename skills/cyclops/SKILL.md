@@ -179,7 +179,8 @@ useful human preview: what the message is about and what should happen next.
 
 Cyclops writes the summary beside one exact claim instruction after proving
 the pane is present and alive, a manifest binds it, and the foreground
-program is the intended, supported recipient agent:
+program is the intended recipient agent or a tool it handed the terminal to
+while the screen still reads as that agent:
 
 ```text
 [cyclops from codey-cyclops] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>

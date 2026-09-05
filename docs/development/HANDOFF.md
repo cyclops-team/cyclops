@@ -223,7 +223,7 @@ tells you where to look. These are the causes the daemon writes today:
 | `pane_in_mode`, `blocked_quota`, `blocked:<rule id>`, `composer_hold` | The gate is holding on purpose: copy-mode, a quota screen, a modal or permission prompt, or a seen draft or unconsumed doorbell | Fusion: is the state right? `cyclops read <pane> --source detection --raw` |
 | `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
 | `occupant_unprovable`, then `binding_unprovable` | The process table could not prove who holds the terminal; held once, then a durable pre-write block | The process tree of the pane; pin the manifest if binding is ambiguous |
-| `foreground_not_agent` | The agent handed the terminal to a tool | Wait, or look at what the agent is running |
+| `foreground_not_agent` | The agent handed the terminal to a tool and the screen does not read as the agent | Wait, or look at what the agent is running |
 | `binding_changed`, `write_readiness_changed`, `pane_rebound` | The occupant changed between the gate's proof and the write; nothing was written, the attempt re-enters the gate | Something restarted in that pane |
 | `barrier_held` | Another attempt claimed the composer in the gap; re-read after 50ms | Nothing: two doorbells to one pane serialize |
 | `session_unavailable`, `manifest_unavailable`, `payload_unavailable`, `spool_failed`, `worker_failed` | A pre-write proof failed repeatedly; nothing written; durably blocked and withdrawable | The named thing; `cyclops health` for a worker failure |

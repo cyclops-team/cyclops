@@ -639,7 +639,7 @@ check "--raw without detection is a usage error" 'pairs with --source detection'
 check_exit "and exits 2" 2
 
 run "$CYC" name "$P2" reviewer --manifest cluade --plain
-check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, claude, codex, cursor, demo$'
+check "an unknown manifest lists the known ones" '^no manifest "cluade"; loaded: agy, aider, amp, claude, codex, crush, cursor, demo, gemini, goose, kimi, opencode, qwen$'
 
 echo
 echo "#### Rung 4: layouts"
@@ -806,8 +806,8 @@ check "the workspace journal is plain NDJSON" '"subject":"Release notes review"'
 check_file_absent "standard messages are not copied to the session ledger" \
   "$CYCLOPS_HOME/ledger/main.ndjson" '"subject":"Release notes review"'
 
-run "$CYC" --json ui
-check "ui points machine readers at watch" 'cyclops watch --json'
+run "$CYC" ui
+check "the retired ui alias is gone" "unrecognized subcommand 'ui'"
 check_exit "and exits on usage" 2
 
 run "$CYC" theme --plain

@@ -20,7 +20,7 @@ is recorded, never retried automatically.
 ```mermaid
 flowchart TD
     a["1. accept: message + one mailbox entry per recipient,<br/>fsynced before the response"] --> q["2. queue: one FIFO worker per recipient"]
-    q --> g{"3. gate: pane present, alive, not in copy-mode;<br/>manifest binds it, no named block, foreground process is the agent;<br/>composer not held"}
+    q --> g{"3. gate: pane present, alive, not in copy-mode;<br/>manifest binds it, no named block, the agent is in the foreground<br/>or the screen still reads as it; composer not held"}
     g -->|"named block: modal, permission, quota, dead, in mode,<br/>seen draft, owned hold"| hold["hold on the next pane event;<br/>one admin ping after gate_hold_notify_ms"]
     hold --> g
     g -->|"admitted"| p["4. paste one line (writing)"]
@@ -49,8 +49,8 @@ flowchart TD
 3. **Gate.** Three checks, in `gate.rs` `admit`, against one fresh capture:
    the pane is present, alive, and not in copy-mode; a manifest binds the
    pane, no named block is on screen, and the pane's foreground process is
-   that agent, not a tool it handed the terminal to; and the composer is not
-   held. A named block holds the attempt on the next pane event, with one
+   that agent, or a tool it handed the terminal to while the screen still
+   reads as the agent; and the composer is not held. A named block holds the attempt on the next pane event, with one
    admin ping after `gate_hold_notify_ms`. A modal whose rule has
    `auto_dismiss` and `decline_keys` gets those keys, at most `MAX_DECLINES`
    times, and the screen is re-read before the final confirming key.
@@ -116,7 +116,7 @@ The gate's hold causes, as the journal spells them:
 | `pane_in_mode` | A human is reading scrollback in copy-mode |
 | `no_manifest` | Nothing binds the pane; Cyclops cannot read it |
 | `occupant_unprovable` | The process table could not prove the occupant; held once, then a durable `binding_unprovable` block |
-| `foreground_not_agent` | The agent handed the terminal to a tool |
+| `foreground_not_agent` | The agent handed the terminal to a tool and the screen does not read as the agent |
 | `binding_changed` | The occupant changed between the gate's proof and the write |
 | `composer_hold` | A seen human draft, or a doorbell this recipient has not consumed |
 | `barrier_held` | Another attempt claimed the composer in the gap; re-read after 50ms |

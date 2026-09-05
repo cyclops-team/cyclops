@@ -78,8 +78,8 @@ pub(crate) enum HoldCause {
     NoManifest,
     /// Nothing proved that the pane's foreground process is the bound agent.
     BindingUnprovable,
-    /// The agent handed the terminal to a tool: keystrokes would land in
-    /// the tool, not the agent.
+    /// The agent handed the terminal to a tool and the screen does not
+    /// read as the agent: keystrokes would land in the tool.
     ForegroundNotAgent,
     /// The occupant changed between the gate's proof and the write.
     BindingChanged,
@@ -1280,14 +1280,20 @@ async fn admit(
     if fusion::composer_is_held(inner, handle.session_idx, &handle.pane_id) {
         return Err(Refusal::Hold(HoldCause::ComposerHold));
     }
-    // 6. The binding: the pane's foreground process must be the agent this
-    //    manifest describes, itself and not a tool it handed the terminal
-    //    to, because the foreground process is where the keystrokes land.
-    //    Falling back to the pane root would pin the delivery to the SHELL
-    //    and resolve receipts against whoever sits at that prompt next, so
-    //    an unreadable process table is a hold.
+    // 6. The binding: the agent this manifest describes must be the pane's
+    //    foreground process or an ancestor of it. The foreground process is
+    //    where the keystrokes land, so a tool the agent handed the terminal
+    //    to is admitted only while the fused screen positively reads as the
+    //    agent (an agent that runs its composer in a child process, as the
+    //    parity fixture does); an unrecognized screen in front of a live
+    //    agent holds. Falling back to the pane root would pin the delivery
+    //    to the SHELL and resolve receipts against whoever sits at that
+    //    prompt next, so an unreadable process table is a hold.
     match fusion::admitted_binding(inner, handle.session_idx, &row) {
-        Some(binding) if binding.manifest == manifest_id && binding.leader == binding.agent => {
+        Some(binding)
+            if binding.manifest == manifest_id
+                && (binding.leader == binding.agent || det.state != AgentState::Unknown) =>
+        {
             Ok(Admission::Doorbell {
                 binding,
                 decided_by: det.decided_by,

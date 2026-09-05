@@ -50,8 +50,8 @@ flowchart TD
 
 The gate's checks, in order: the pane is present, alive, and not in
 copy-mode; a manifest binds it and the pane's foreground process is that
-agent, not a tool it handed the terminal to; and the composer is not held
-(rule 3). The capture that decides the composer is the last read before the
+agent, or a tool it handed the terminal to while the screen still reads as
+the agent; and the composer is not held (rule 3). The capture that decides the composer is the last read before the
 paste, so the snapshot is fresher than any human keystroke round trip.
 
 A raw send (`--raw`) is the one admission that checks only the first
