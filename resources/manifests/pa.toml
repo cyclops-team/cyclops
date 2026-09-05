@@ -1,0 +1,77 @@
+# Cyclops detection manifest: Posit Assistant TUI (Posit)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no pa binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://assistant.posit.co/docs/features/hooks/         hooks object, events, `prompt` payload field
+#   https://assistant.posit.co/docs/reference/config-file/  ~/.posit/assistant/settings.json, project .posit/assistant/settings.json
+#   https://assistant.posit.co/docs/getting-started/        the `pa` TUI; install: curl assistant.posit.co/builds/install-tui.sh
+#   skills.sh catalog row `posit-assistant`: skills directory ~/.posit/assistant/skills
+#
+# Sensor summary for this CLI:
+#   process  `pa` is installed by a shell script; whether it is a native
+#            binary or an interpreter script is unmeasured. If binding
+#            fails, pin the pane: cyclops name %N <label> --manifest pa.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in settings.json
+#            keyed by event, each [{matcher, hooks: [{type: "command",
+#            command, timeout}]}]. UserPromptSubmit carries `prompt`; Stop
+#            carries stop_hook_active and last_assistant_message;
+#            Notification carries notification_type (permission_prompt |
+#            agent_needs_input) and message. Every payload carries
+#            session_id, transcript_path, cwd, hook_event_name,
+#            permission_mode; no turn id ties Stop to its
+#            UserPromptSubmit. The hooks page does not say in so many
+#            words that the pa TUI honours them; the catalog pass says the
+#            TUI reads this settings file.
+#   screen   UNMEASURED. The docs quote no prompt glyph, status row, or
+#            working line, so no idle or working rule ships and deliveries
+#            fail closed (not write-ready) until someone measures the
+#            composer.
+
+[agent]
+id = "pa"
+display_name = "Posit Assistant TUI"
+version_tested = "unverified"
+process_names = ["pa"]
+argv_basenames = ["pa"]
+launch = "pa"
+
+[hooks]
+config_mechanism = "hooks object in ~/.posit/assistant/settings.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse",
+  "PostToolUse", "Stop", "SubagentStart", "SubagentStop", "Notification",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.posit/assistant/settings.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Posit Assistant TUI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

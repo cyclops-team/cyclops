@@ -1,0 +1,49 @@
+# Cyclops detection manifest: Dexto (Truffle AI)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No dexto binary was run and nothing was measured: this file binds the
+# pane and nothing more. Sources:
+#   https://github.com/truffle-ai/dexto
+#   https://docs.dexto.ai/docs/getting-started/installation
+#   https://www.npmjs.com/package/dexto
+#
+# Skills directory (skills.sh catalog key dexto): ~/.agents/skills
+#
+# NO HOOK CONFIG. Dexto documents agents as YAML under ~/.dexto/ and no
+# shell-command lifecycle hook, so no [hooks] table and no wiring ships.
+# This manifest binds the pane so the agent's own `cyclops send` resolves
+# its identity, and the skill is seeded.
+#
+# Sensor summary for this CLI:
+#   process  dexto is an npm package run by Node, so #{pane_current_command}
+#            is expected to read "node" (MEASURED for gemini, inferred here).
+#            "node" is not listed: it would claim every Node process. Pin
+#            the pane: cyclops name %N <label> --manifest dexto.
+#   title    UNMEASURED.
+#   screen   UNMEASURED. The docs quote no prompt string, so no idle rule
+#            ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "dexto"
+display_name = "Dexto"
+version_tested = "unverified"
+process_names = ["dexto"]
+argv_basenames = ["dexto"]
+# Bare `dexto` opens the web UI; `--mode cli` is the interactive terminal
+# session with slash commands.
+launch = "dexto --mode cli"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Dexto."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

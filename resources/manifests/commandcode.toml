@@ -1,0 +1,65 @@
+# Cyclops detection manifest: Command Code
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No Command Code binary was run and nothing was measured: this file binds
+# the pane and declares the documented hook contract and nothing more.
+# Sources:
+#   https://commandcode.ai/docs/hooks
+#   https://commandcode.ai/docs/reference/cli
+#   https://commandcode.ai/docs/skills
+#
+# Skills directory (skills.sh catalog key command-code): ~/.commandcode/skills
+#
+# Sensor summary for this CLI:
+#   process  Command Code is the npm package command-code, invoked as `cmd`
+#            (aliases command-code, cmdc), run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED for
+#            gemini, inferred here). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest commandcode.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.commandcode/settings.json (user) or .commandcode/settings.json
+#            (project), events PreToolUse, PostToolUse, Stop, SessionStart
+#            only. There is no prompt-submit event and the docs say user
+#            prompts are not passed to hooks, so no start or ACK is
+#            declared; SessionStart and Stop are wired for liveness. No
+#            notification or permission event exists.
+#   screen   UNMEASURED. The docs show an input line "> ..." and a footer
+#            such as "In auth.ts opus-5 default", neither a stable anchor,
+#            so no idle rule ships and deliveries fail closed.
+
+[agent]
+id = "commandcode"
+display_name = "Command Code"
+version_tested = "unverified"
+process_names = ["command-code", "cmd", "cmdc"]
+argv_basenames = ["command-code", "cmd", "cmdc"]
+launch = "cmd"
+
+[hooks]
+config_mechanism = "hooks object in ~/.commandcode/settings.json"
+available = ["PreToolUse", "PostToolUse", "Stop", "SessionStart"]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.commandcode/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+stop = "Stop"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Command Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

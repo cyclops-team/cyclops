@@ -1,0 +1,85 @@
+# Cyclops detection manifest: CodeBuddy Code (Tencent)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No codebuddy binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://www.codebuddy.ai/docs/cli/hooks
+#   https://www.codebuddy.ai/docs/cli/hooks-guide
+#   https://www.codebuddy.ai/docs/cli/settings
+#   https://www.codebuddy.ai/docs/cli/statusline
+#
+# Skills directory (skills.sh catalog key codebuddy): ~/.codebuddy/skills
+#
+# Sensor summary for this CLI:
+#   process  codebuddy is npm @tencent-ai/codebuddy-code run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED for
+#            gemini, inferred here). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest codebuddy.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.codebuddy/settings.json ($CODEBUDDY_CONFIG_DIR), or the
+#            project .codebuddy/settings.json and settings.local.json;
+#            entries are type "command" or "prompt". UserPromptSubmit
+#            carries `prompt` (with session_id, transcript_path, cwd,
+#            permission_mode, hook_event_name), so it is the dispatch
+#            candidate and the ACK field. Stop shares no turn field with it
+#            in the docs, so no end is declared: the loader refuses a
+#            candidate end without turn_key_fields. Stop is still wired for
+#            liveness.
+#   screen   UNMEASURED. The docs show a welcome banner
+#            "🤖 CodeBuddy Code v1.0.0" and then a bare ">" prompt, which
+#            is too weak to anchor alone; the status line is user-defined
+#            (/statusline). No idle rule ships and deliveries fail closed.
+
+[agent]
+id = "codebuddy"
+display_name = "CodeBuddy Code"
+version_tested = "unverified"
+process_names = ["codebuddy"]
+argv_basenames = ["codebuddy"]
+launch = "codebuddy"
+
+[hooks]
+config_mechanism = "hooks object in ~/.codebuddy/settings.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "Notification", "UserPromptSubmit", "Stop",
+  "SubagentStop", "PreCompact", "PostCompact", "InstructionsLoaded",
+  "ConfigChange", "TaskCreated", "TaskCompleted", "TeammateIdle",
+  "FileChanged", "CwdChanged", "WorktreeCreate", "WorktreeRemove", "Setup",
+  "SessionStart", "SessionEnd", "PermissionRequest", "PermissionDenied",
+  "Elicitation", "ElicitationResult",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.codebuddy/settings.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for CodeBuddy Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

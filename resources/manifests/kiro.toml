@@ -1,0 +1,70 @@
+# Cyclops detection manifest: Kiro CLI (AWS)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No kiro-cli binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://kiro.dev/docs/custom-agents/configuration-reference/
+#   https://kiro.dev/docs/hooks/
+#   https://kiro.dev/docs/cli/chat/
+#   https://kiro.dev/docs/reference/cli-commands/
+#
+# Skills directory (skills.sh catalog key kiro-cli): ~/.kiro/skills
+#
+# Sensor summary for this CLI:
+#   process  kiro-cli is a native install (curl cli.kiro.dev/install or the
+#            kiro-cli Homebrew cask), so #{pane_current_command} is expected
+#            to read "kiro-cli" (inferred, not measured).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED in two shapes, both in flux. Agent configs under
+#            ~/.kiro/agents/<name>.json carry a `hooks` object keyed
+#            agentSpawn, userPromptSubmit, preToolUse, postToolUse, stop,
+#            each a list of {command, matcher}; those hooks fire only while
+#            that agent is active (`kiro-cli chat --agent <name>` or /agent),
+#            which is why the wiring file below is a dedicated agent. The
+#            other shape, <project>/.kiro/hooks/<id>.json with triggers
+#            PromptSubmit, AgentStop, AgentSpawn, PreToolUse, PostToolUse,
+#            PreTaskExecution, PostTaskExecution, is project-level only. The
+#            docs say the command "receives session context as JSON on
+#            STDIN" but name no field, so no ACK field and no candidate
+#            start is declared; the events are wired for liveness only.
+#            agentSpawn is the closest documented edge to a session start.
+#   screen   UNMEASURED. The docs show a bare "> " prompt ("!>" with all
+#            tools trusted, "[agent] >" under a custom agent), which is too
+#            weak to anchor alone, so no idle rule ships and deliveries fail
+#            closed (not write-ready).
+
+[agent]
+id = "kiro"
+display_name = "Kiro CLI"
+version_tested = "unverified"
+process_names = ["kiro-cli"]
+argv_basenames = ["kiro-cli"]
+launch = "kiro-cli"
+
+[hooks]
+config_mechanism = "hooks object in the agent config ~/.kiro/agents/cyclops.json"
+available = ["agentSpawn", "userPromptSubmit", "preToolUse", "postToolUse", "stop"]
+
+[hooks.wiring]
+shape = "kiro-agent"
+file = "~/.kiro/agents/cyclops.json"
+
+[hooks.wiring.events]
+session_start = "agentSpawn"
+prompt_submit = "userPromptSubmit"
+stop = "stop"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Kiro CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

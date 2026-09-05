@@ -1,0 +1,75 @@
+# Cyclops detection manifest: Droid (Factory)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No droid binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://docs.factory.ai/reference/hooks-reference
+#   https://docs.factory.ai/droid-cli/settings
+#   https://docs.factory.ai/droid-cli/overview
+#
+# Skills directory (skills.sh catalog key droid): ~/.factory/skills
+#
+# Sensor summary for this CLI:
+#   process  droid is a Homebrew cask, so #{pane_current_command} is
+#            expected to read "droid" (inferred, not measured).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: a `hooks` object in
+#            ~/.factory/settings.json, or the standalone ~/.factory/hooks.json
+#            and .factory/hooks.json where the event map is the whole file
+#            (no `hooks` wrapper). The wiring targets settings.json because
+#            its shape is the plain Claude one. JSON on stdin;
+#            UserPromptSubmit carries `prompt` and `has_images`, so it is the
+#            dispatch candidate and the ACK field. Stop shares no turn field
+#            with it in the docs, so no end is declared: the loader refuses
+#            a candidate end without turn_key_fields. Stop is still wired
+#            for liveness. A `hooksDisabled` setting switches everything off.
+#   screen   UNMEASURED. The docs describe a /statusline-configured row
+#            above the input with no verbatim default and no prompt string,
+#            so no idle rule ships and deliveries fail closed.
+
+[agent]
+id = "droid"
+display_name = "Droid"
+version_tested = "unverified"
+process_names = ["droid"]
+argv_basenames = ["droid"]
+launch = "droid"
+
+[hooks]
+config_mechanism = "hooks object in ~/.factory/settings.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification", "Stop",
+  "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.factory/settings.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Droid."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

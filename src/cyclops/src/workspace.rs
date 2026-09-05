@@ -1275,6 +1275,16 @@ fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
             Err(cause) => eprintln!("  hooks: {cause}"),
         }
     }
+    // Then every vendor wired from its manifest's [hooks.wiring] table:
+    // the same acts, driven by data, so a new manifest is wired here with
+    // no list to edit.
+    for consumer in crate::wiring::catalog() {
+        match crate::wiring::wire(consumer) {
+            Ok(Some(w)) => out.push(w),
+            Ok(None) => {}
+            Err(cause) => eprintln!("  hooks: {cause}"),
+        }
+    }
     out
 }
 
@@ -2311,10 +2321,11 @@ mod tests {
         // would have worked.
         let why = refuse(&["cluade", "codex"], &duo, "preset duo");
         assert!(why.starts_with("no agent CLI called \"cluade\""), "{why}");
-        assert!(
-            why.contains("agy, aider, amp, claude, codex, crush, cursor, gemini, goose, kimi, opencode, qwen"),
-            "{why}"
-        );
+        let mut ids: Vec<&str> = crate::manifests::shipped()
+            .map(|(name, _)| name.trim_end_matches(".toml"))
+            .collect();
+        ids.sort_unstable();
+        assert!(why.contains(&ids.join(", ")), "{why}");
 
         // An empty id: a stray comma, not a CLI called "".
         assert!(refuse(&["claude", ""], &duo, "preset duo").contains("empty id"));

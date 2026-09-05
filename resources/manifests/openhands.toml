@@ -1,0 +1,104 @@
+# Cyclops detection manifest: OpenHands CLI (OpenHands)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no openhands binary was run on the evidence host
+# and no turn, title, or screen was captured. Sources:
+#   https://docs.openhands.dev/openhands/usage/customization/hooks  .openhands/hooks.json, events, `message` payload
+#   https://docs.openhands.dev/openhands/usage/cli/terminal        TUI keys: Ctrl+P palette, Esc pauses, Ctrl+Q exits
+#   https://github.com/OpenHands/OpenHands-CLI                     Textual TUI; `uv tool install openhands`
+#   https://pypi.org/project/openhands/
+#   skills.sh catalog row `openhands`: skills directory ~/.openhands/skills
+#
+# Sensor summary for this CLI:
+#   process  openhands is a Python (Textual) TUI installed with
+#            `uv tool install openhands`, so #{pane_current_command} may
+#            read "python" or "python3" rather than "openhands" (inferred
+#            from the packaging, not measured). Interpreter names are NOT
+#            listed: they would claim every Python process. If binding
+#            fails, pin the pane: cyclops name %N <label> --manifest
+#            openhands. The catalog pass notes the CLI project is
+#            unmaintained.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-compatible but repo-level only: the file
+#            is <cwd>/.openhands/hooks.json and no user-level file exists,
+#            so wiring is per working directory (the `file` below is
+#            relative to the pane's cwd on purpose). The file keys are
+#            snake_case (user_prompt_submit, stop, session_start, ...)
+#            while the docs name the events in PascalCase; both reduce to
+#            the same comparable name. Each key holds
+#            [{matcher, hooks: [{command, timeout, async, type}]}]. The
+#            UserPromptSubmit payload carries the prompt in `message`
+#            (like goose, not `prompt`); every payload carries session_id
+#            and working_dir. Stop's own fields are not documented and no
+#            turn id ties Stop to its UserPromptSubmit. No Notification or
+#            permission event exists.
+#   screen   DOCUMENTED, not measured: the docs quote a working row
+#            (`Working` with a spinner and `(Ns • ESC: pause)`) and an idle
+#            status row (`ctx N/A • $ 0.00 (↑ 0 ↓ 0 cache N/A)`), which are
+#            the two screen rules below. Whether the ctx row also stays on
+#            screen mid-turn is unmeasured; the working rule outranks it so
+#            a visible Working row wins. The composer hint
+#            `[Ctrl+L for multi-line • Ctrl+X for custom editor]` is quoted
+#            too but is composer chrome, not an idle proof, so it carries
+#            no rule.
+
+[agent]
+id = "openhands"
+display_name = "OpenHands CLI"
+version_tested = "unverified"
+process_names = ["openhands"]
+argv_basenames = ["openhands"]
+launch = "openhands"
+
+[hooks]
+# No [hooks.wiring]: the only documented hook file is repo-level
+# .openhands/hooks.json, and Cyclops wires user-level files only.
+config_mechanism = "hooks.json in <cwd>/.openhands/ (repo-level only)"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "message"
+ack_evidence = "dispatch"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PreToolUse",
+  "PostToolUse",
+]
+
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for OpenHands CLI."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "screen_working_esc_pause"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(8)"
+contains = ["Working", "ESC: pause"]
+note = """The documented working row: `Working`, a spinner, and
+`(Ns • ESC: pause)`. Both fragments must be present in the region; the
+spinner glyph and the elapsed seconds are not matched."""
+evidence = "DOCUMENTED, not measured: docs.openhands.dev CLI pages"
+
+[[rule]]
+id = "status_ctx_row_idle"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*ctx\s+\S+\s+•\s+\$\s*[\d.,]+\s+\(↑\s*\S+\s+↓\s*\S+\s+cache\s+\S+\)']
+note = """The documented status row `ctx N/A • $ 0.00 (↑ 0 ↓ 0 cache N/A)`.
+Labels and glyphs are anchored exactly; the values (context, cost, token
+counts, cache) are the only free slots. Unmeasured whether the row also
+paints mid-turn, which is why screen_working_esc_pause outranks it."""
+evidence = "DOCUMENTED, not measured: docs.openhands.dev CLI pages"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

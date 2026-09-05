@@ -1,0 +1,84 @@
+# Cyclops detection manifest: Continue CLI (cn)
+# UNVERIFIED best effort from primary documentation and source, written
+# 2026-09-04. No cn binary was run and nothing was measured: this file binds
+# the pane and declares the hook contract found in source and nothing more.
+# Sources:
+#   https://docs.continue.dev/cli/tui-mode
+#   https://docs.continue.dev/cli/quickstart
+#   https://www.npmjs.com/package/@continuedev/cli
+#   https://github.com/continuedev/continue/blob/main/extensions/cli/src/hooks/types.ts
+#
+# Skills directory (skills.sh catalog key continue): ~/.continue/skills
+#
+# Sensor summary for this CLI:
+#   process  cn is npm @continuedev/cli run by Node, so
+#            #{pane_current_command} is expected to read "node" (MEASURED for
+#            gemini, inferred here). "node" is not listed: it would claim
+#            every Node process. Pin the pane: cyclops name %N <label>
+#            --manifest continue.
+#   title    UNMEASURED.
+#   hooks    IMPLEMENTED BUT UNDOCUMENTED: the public docs describe no hook
+#            surface; the CLI source reads a Claude-shaped `hooks` object
+#            from ~/.continue/settings.json, .continue/settings.json and
+#            .continue/settings.local.json (and ~/.claude/settings.json,
+#            which Cyclops must never write). The source types
+#            UserPromptSubmit with `prompt: string`, so it is the dispatch
+#            candidate and the ACK field. Stop shares only session_id with
+#            it, which is not a turn key, so no end is declared: the loader
+#            refuses a candidate end without turn_key_fields. Stop is still
+#            wired for liveness. Treat the whole contract as provisional
+#            until the vendor documents it.
+#   screen   UNMEASURED. The docs describe "a prompt where you can type
+#            messages" with a bare "> ", too weak to anchor alone, so no
+#            idle rule ships and deliveries fail closed (not write-ready).
+
+[agent]
+id = "continue"
+display_name = "Continue CLI"
+version_tested = "unverified"
+process_names = ["cn"]
+argv_basenames = ["cn"]
+launch = "cn"
+
+[hooks]
+config_mechanism = "hooks object in ~/.continue/settings.json (found in source, undocumented)"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest",
+  "UserPromptSubmit", "SessionStart", "SessionEnd", "Stop", "Notification",
+  "SubagentStart", "SubagentStop", "PreCompact", "ConfigChange",
+  "TeammateIdle", "TaskCompleted", "WorktreeCreate", "WorktreeRemove",
+]
+
+[hooks.wiring]
+shape = "claude-settings"
+file = "~/.continue/settings.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Continue CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

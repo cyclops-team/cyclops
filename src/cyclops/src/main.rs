@@ -60,6 +60,7 @@ mod style;
 mod theme;
 mod themeseed;
 mod update;
+mod wiring;
 mod workspace;
 
 use std::collections::BTreeSet;

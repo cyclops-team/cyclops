@@ -1,0 +1,65 @@
+# Cyclops detection manifest: Kimchi
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No kimchi binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://docs.kimchi.dev/docs/kimchi-cli
+#   https://docs.kimchi.dev/docs/coding-overview
+#   https://github.com/getkimchi/kimchi
+#
+# Skills directory (skills.sh catalog key kimchi):
+# ~/.config/kimchi/harness/skills
+#
+# Sensor summary for this CLI:
+#   process  kimchi is a Homebrew binary (getkimchi/tap/kimchi), so
+#            #{pane_current_command} is expected to read "kimchi" (inferred).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped, but only at PROJECT level:
+#            .kimchi/hooks.json and .kimchi/hooks.local.json hold
+#            {"hooks":{"Event":[{"matcher","hooks":[{"type":"command",
+#            "command"}]}]}}. The only user-level location the docs name,
+#            ~/.config/kimchi/harness/hooks/bash/, holds bash scripts that
+#            rewrite or block shell commands (a tool hook, not a lifecycle
+#            hook); a Claude Code adapter also reads ~/.claude/settings.json,
+#            which Cyclops must never write. No documented file under ~/
+#            takes lifecycle hooks, so NO [hooks.wiring] ships: wire the
+#            project file by hand. The UserPromptSubmit payload field is not
+#            documented, so no ACK field and no candidate start is declared.
+#   screen   UNMEASURED. The docs describe a configurable status bar
+#            (permission mode, model, context usage) with no verbatim
+#            default and no prompt string, so no idle rule ships and
+#            deliveries fail closed (not write-ready).
+
+[agent]
+id = "kimchi"
+display_name = "Kimchi"
+version_tested = "unverified"
+process_names = ["kimchi"]
+argv_basenames = ["kimchi"]
+launch = "kimchi"
+
+[hooks]
+config_mechanism = "hooks object in <project>/.kimchi/hooks.json (no documented user-level file)"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "PostToolUseFail", "PostToolBatch",
+  "Notification", "SessionStart", "PreCompact", "PostCompact",
+  "UserPromptSubmit", "Stop", "StopFail", "TaskCompleted", "TurnStart",
+  "MessageStart", "MessageEnd", "ModelSelect", "UserBash", "SubagentStart",
+  "SubagentStop", "SessionEnd",
+]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Kimchi."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

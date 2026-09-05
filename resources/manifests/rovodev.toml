@@ -1,0 +1,58 @@
+# Cyclops detection manifest: Rovo Dev (Atlassian)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no acli binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://developer.atlassian.com/cloud/acli/reference/commands/rovodev/            `acli rovodev run`
+#   https://support.atlassian.com/rovo/docs/manage-rovo-dev-cli-settings/             ~/.rovodev/config.yml; default prompt `> `
+#   https://support.atlassian.com/rovo/docs/rovo-dev-cli-commands/                    /help, /config, /hooks
+#   https://www.atlassian.com/blog/development/streamline-rovo-dev-cli-with-event-hooks  eventHooks
+#   brew atlassian/homebrew-acli/acli
+#   skills.sh catalog row `rovodev`: skills directory ~/.rovodev/skills
+#
+# Sensor summary for this CLI:
+#   process  the executable is Atlassian's multi-product `acli`, and the
+#            interactive agent is the `acli rovodev run` subcommand. Binding
+#            on the comm name therefore claims every acli pane, including
+#            `acli jira ...`; the daemon reads only the first argv token,
+#            so the subcommand cannot narrow it today. Pin the pane when
+#            that matters: cyclops name %N <label> --manifest rovodev.
+#   title    UNMEASURED.
+#   hooks    UNDER-DOCUMENTED, so nothing is declared. Hooks live in an
+#            `eventHooks` section of ~/.rovodev/config.yml, edited through
+#            the /hooks command, and the only event named by the docs is
+#            on_tool_permission (a search snippet mentions an on_response
+#            hook, but no page with the full event list, the YAML shape,
+#            or a stdin payload was located). Without a prompt-submit or
+#            stop event and without a file shape, no [hooks] or
+#            [hooks.wiring] table can be written honestly.
+#   screen   UNMEASURED. The settings docs say the default prompt is `> `
+#            (a setting can replace it with a shell-generated one), which
+#            is too weak to stand as an idle rule, and the panels for
+#            input, output and status are described, not quoted, so no
+#            idle or working rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+
+[agent]
+id = "rovodev"
+display_name = "Rovo Dev"
+version_tested = "unverified"
+process_names = ["acli"]
+argv_basenames = ["acli"]
+# Bare `acli` is the Atlassian CLI; the agent is a subcommand.
+launch = "acli rovodev run"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Rovo Dev."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

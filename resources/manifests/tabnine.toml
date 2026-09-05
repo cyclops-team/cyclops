@@ -1,0 +1,77 @@
+# Cyclops detection manifest: Tabnine CLI (Tabnine)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no tabnine binary was run on the evidence host and
+# no turn, title, or screen was captured. Sources:
+#   https://docs.tabnine.com/main/getting-started/tabnine-cli/features/hooks                        events, hook entry keys, common stdin fields
+#   https://docs.tabnine.com/main/getting-started/tabnine-cli/features/settings/settings-reference  settings.json layers
+#   https://docs.tabnine.com/main/getting-started/tabnine-cli/getting-started                       `tabnine` chat; `> ` input mock-up
+#   https://docs.tabnine.com/main/getting-started/tabnine-cli/features/agent-skills
+#   skills.sh catalog row `tabnine-cli`: skills directory ~/.tabnine/agent/skills
+#
+# Sensor summary for this CLI:
+#   process  bare `tabnine` opens the chat; `tabnine -p "..."` is the
+#            non-interactive mode. Whether the installed file is a native
+#            binary or an interpreter script is unmeasured. If binding
+#            fails, pin the pane: cyclops name %N <label> --manifest tabnine.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Gemini-shaped rather than Claude-shaped: a `hooks`
+#            object in ~/.tabnine/agent/settings.json (user) or
+#            <project>/.tabnine/agent/settings.json (workspace), keyed by
+#            event, each entry {type: "command", command, name, env?}
+#            (matcher and timeout are referenced but not detailed).
+#            BeforeAgent fires before the agent processes a request and is
+#            the candidate start; AfterAgent is the candidate end. Every
+#            payload carries session_id, transcript_path, cwd,
+#            hook_event_name, timestamp; the field carrying the prompt on
+#            BeforeAgent is not documented, so no ACK payload field is
+#            declared, and no turn id ties AfterAgent to its BeforeAgent.
+#   screen   UNMEASURED. The getting-started page shows a docs mock-up
+#            (input `> █`, footer "Type /help for commands", header
+#            "Model: gpt-4o | Dir: /my/project") rather than a capture, and
+#            a bare `> ` is too weak to stand as an idle rule, so no idle
+#            or working rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+
+[agent]
+id = "tabnine"
+display_name = "Tabnine CLI"
+version_tested = "unverified"
+process_names = ["tabnine"]
+argv_basenames = ["tabnine"]
+launch = "tabnine"
+
+[hooks]
+config_mechanism = "hooks object in ~/.tabnine/agent/settings.json"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "BeforeModel",
+  "AfterModel", "BeforeToolSelection", "BeforeTool", "AfterTool",
+  "PreCompress", "Notification",
+]
+
+# Each event key holds an array of {type: "command", command, name}.
+[hooks.wiring]
+shape = "tabnine"
+file = "~/.tabnine/agent/settings.json"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "BeforeAgent"
+stop = "AfterAgent"
+notification = "Notification"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Tabnine CLI."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

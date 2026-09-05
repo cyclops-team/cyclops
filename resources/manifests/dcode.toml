@@ -1,0 +1,85 @@
+# Cyclops detection manifest: Deep Agents Code (LangChain, dcode)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No dcode binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://docs.langchain.com/oss/deepagents/code/hooks
+#   https://docs.langchain.com/oss/python/deepagents/cli/configuration
+#   https://reference.langchain.com/python/deepagents-cli
+#
+# Skills directory (skills.sh catalog key deepagents):
+# ~/.deepagents/agent/skills ({agent}/skills under $DEEPAGENTS_HOME)
+#
+# Sensor summary for this CLI:
+#   process  dcode is a Python Textual TUI, so #{pane_current_command} is
+#            expected to read "Python" or "python3.x" (inferred from the
+#            gemini measurement of the same shebang mechanism). The
+#            interpreter is not listed: it would claim every Python process.
+#            The names below cover the current and legacy entry points; if
+#            the pane does not bind, pin it: cyclops name %N <label>
+#            --manifest dcode.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: ~/.deepagents/hooks.json (global) or
+#            <project>/.deepagents/hooks.json (needs workspace trust) holds
+#            {"hooks":{"Event":[{"matcher","hooks":[{"type":"command",
+#            "command","timeout"}]}]}}, JSON on stdin. UserPromptSubmit
+#            carries `prompt`, so it is the dispatch candidate and the ACK
+#            field. Every payload also carries prompt_id ("UUID for the
+#            current user prompt, when available"), shared by
+#            UserPromptSubmit and Stop: a turn-key candidate for a follow-up
+#            once a settle window is measured. Until then no end is
+#            declared (Stop can re-fire, stop_hook_active) and Stop is wired
+#            for liveness only.
+#   screen   UNMEASURED. The docs describe a status-bar footer (mode,
+#            auto-approve, cwd, branch, tokens, model) with no verbatim
+#            text and no prompt string, so no idle rule ships and deliveries
+#            fail closed (not write-ready).
+
+[agent]
+id = "dcode"
+display_name = "Deep Agents Code"
+version_tested = "unverified"
+process_names = ["dcode", "deepagents-code", "deepagents", "deepagents-cli"]
+argv_basenames = ["dcode", "deepagents-code", "deepagents", "deepagents-cli"]
+launch = "dcode"
+
+[hooks]
+config_mechanism = "hooks object in ~/.deepagents/hooks.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "SessionStart", "UserPromptSubmit", "SessionEnd", "PermissionRequest",
+  "Notification", "PreToolUse", "PostToolUse", "PreCompact", "Stop",
+  "SubagentStart", "SubagentStop",
+]
+
+[hooks.wiring]
+shape = "claude-hooks-file"
+file = "~/.deepagents/hooks.json"
+payload_prompt_field = "prompt"
+
+[hooks.wiring.events]
+session_start = "SessionStart"
+prompt_submit = "UserPromptSubmit"
+stop = "Stop"
+notification = "Notification"
+permission_request = "PermissionRequest"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Deep Agents Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

@@ -1,0 +1,84 @@
+# Cyclops detection manifest: Mistral Vibe (Mistral AI)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no vibe binary was run on the evidence host and no
+# turn, title, or screen was captured. Sources:
+#   https://docs.mistral.ai/vibe/code/cli/configuration   ~/.vibe ($VIBE_HOME), config.toml, hooks.toml
+#   https://docs.mistral.ai/vibe/code/cli/work-with-cli   input box, Escape interrupts, "(Esc/Ctrl+C to interrupt)"
+#   https://github.com/mistralai/mistral-vibe             install script, pip mistral-vibe
+#   skills.sh catalog row `mistral-vibe`: skills directory $VIBE_HOME/skills (~/.vibe/skills)
+#
+# Sensor summary for this CLI:
+#   process  vibe is a Python (Textual) TUI installed by
+#            `curl mistral.ai/vibe/install.sh` or `pip install mistral-vibe`,
+#            so #{pane_current_command} may read "python" or "python3"
+#            rather than "vibe" (inferred from the packaging, not
+#            measured). Interpreter names are deliberately NOT listed: they
+#            would claim every Python process. If binding fails, pin the
+#            pane: cyclops name %N <label> --manifest vibe.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, TOML-shaped and NOT Claude-shaped: `[[hooks]]`
+#            entries in ~/.vibe/hooks.toml (user) or ./.vibe/hooks.toml
+#            (project), each with name, type, match, command, strict; the
+#            hook reads its payload as JSON on stdin. Only three events
+#            exist: pre_tool, post_tool, post_agent. There is no
+#            prompt-submit event, so no turn start and no ACK can be
+#            declared and no payload field carries the injected text.
+#            post_agent fires when the agent finishes, so it is the
+#            candidate end. $VIBE_HOME relocates ~/.vibe; the wiring path
+#            below assumes the default.
+#   screen   UNMEASURED beyond one documented line: the docs quote
+#            "(Esc/Ctrl+C to interrupt)" while the agent runs, which is
+#            the working rule below. The prompt is documented as a bare
+#            `> `, too weak to stand as an idle rule, and the status line
+#            (agent name plus approval style) is described, not quoted, so
+#            no idle rule ships and deliveries fail closed (not
+#            write-ready) until someone measures the composer.
+
+[agent]
+id = "vibe"
+display_name = "Mistral Vibe"
+version_tested = "unverified"
+process_names = ["vibe"]
+argv_basenames = ["vibe"]
+launch = "vibe"
+
+[hooks]
+config_mechanism = "[[hooks]] entries in ~/.vibe/hooks.toml"
+available = ["pre_tool", "post_tool", "post_agent"]
+
+# What cyclops writes to wire a vibe pane: one `[[hooks]]` entry per event,
+# `name = "..."`, `type = "<event>"`, `command = "..."`; `match` (a tool
+# name) and `strict` are optional.
+[hooks.wiring]
+shape = "vibe-toml"
+file = "~/.vibe/hooks.toml"
+
+[hooks.wiring.events]
+stop = "post_agent"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Mistral Vibe."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "screen_working_interrupt_hint"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(8)"
+contains = ["(Esc/Ctrl+C to interrupt)"]
+note = """The interrupt hint the docs say is painted while the agent runs.
+Whether it stays on screen in an unfocused tmux pane, and whether it
+disappears the moment the turn ends, is unmeasured."""
+evidence = "DOCUMENTED, not measured: docs.mistral.ai work-with-cli"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

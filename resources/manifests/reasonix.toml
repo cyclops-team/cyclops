@@ -1,0 +1,71 @@
+# Cyclops detection manifest: Reasonix (esengine)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# Nothing was measured: no reasonix binary was run on the evidence host
+# and no turn, title, or screen was captured. Sources:
+#   https://github.com/esengine/deepseek-reasonix   single Go binary; npm `reasonix`; brew esengine/reasonix/reasonix
+#   https://reasonix.io/
+#   skills.sh catalog row `reasonix`: skills directory ~/.reasonix/skills (project .reasonix/skills/)
+#
+# Sensor summary for this CLI:
+#   process  reasonix is a single Go binary, so #{pane_current_command} is
+#            expected to read "reasonix" (inferred, not measured). The npm
+#            wrapper may run it through Node; if binding fails, pin the
+#            pane: cyclops name %N <label> --manifest reasonix.
+#   title    UNMEASURED.
+#   hooks    UNDER-DOCUMENTED, so nothing is declared. The catalog pass
+#            found hooks configured in ~/.reasonix/config.json with events
+#            PreToolUse, PostToolUse, UserPromptSubmit and Stop, but the
+#            JSON shape is unverified (an earlier pass found reasonix.toml
+#            and only plugin-package / Extension Protocol sidecar hooks).
+#            A wiring shape nobody can name would write a file the CLI may
+#            not read, so no [hooks] or [hooks.wiring] table ships until
+#            the shape is confirmed.
+#   screen   DOCUMENTED, not measured: the input line ends in `›` and the
+#            footer reads `surface cli | tools 9 calls | session 18m |
+#            cost $0.043`. The idle rule below needs both: the bare `›`
+#            row (no text after it) and the footer with its labels anchored
+#            exactly. Whether either row also paints mid-turn is
+#            unmeasured, and no working line is documented, so a delivery
+#            admitted by this rule could land during a turn.
+
+[agent]
+id = "reasonix"
+display_name = "Reasonix"
+version_tested = "unverified"
+process_names = ["reasonix"]
+argv_basenames = ["reasonix"]
+launch = "reasonix"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Reasonix."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "composer_empty_with_footer"
+state = "idle"
+priority = 900
+region = "bottom_non_empty_lines(8)"
+# Both clauses must hold: an input row that ends in the `›` glyph (so a
+# typed draft after it refuses the rule) and the footer row with every
+# label in place; only the numbers are free.
+line_regex = [
+  '›\s*$',
+  '^\s*surface\s+cli\s+\|\s+tools\s+\d+\s+calls?\s+\|\s+session\s+\S+\s+\|\s+cost\s+\$[\d.,]+',
+]
+note = """Documented composer glyph plus the documented footer
+`surface cli | tools 9 calls | session 18m | cost $0.043`. Unmeasured
+whether the footer persists mid-turn; no working rule exists to outrank
+this one."""
+evidence = "DOCUMENTED, not measured: github.com/esengine/deepseek-reasonix"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

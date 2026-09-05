@@ -86,9 +86,28 @@ fn shipped_composer_semantics_match_measured_rules_only() {
 #[test]
 fn documentation_only_manifests_claim_no_measured_behavior() {
     let all = shipped();
-    let unverified = [
+    // The five measured manifests. Every other file in the directory is
+    // written from vendor documentation and must say so; the list is not
+    // fixed because adding a terminal agent is one TOML file, and this
+    // test must hold for a file it has never heard of.
+    let measured = ["agy", "claude", "codex", "cursor", "kimi"];
+    // The seven reviewed under the original rule: no state but unknown or
+    // a blocked modal. The vendor-catalog manifests that came later carry
+    // documented working-state hints (an interrupt line the vendor's docs
+    // quote) marked as such in their evidence; those keep every other
+    // rule below but may name a state.
+    let reviewed = [
         "aider", "amp", "crush", "gemini", "goose", "opencode", "qwen",
     ];
+    for id in reviewed {
+        assert!(all.contains_key(id), "{id} no longer ships");
+    }
+    let mut unverified: Vec<&str> = all
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !measured.contains(id))
+        .collect();
+    unverified.sort_unstable();
     for id in unverified {
         let manifest = &all[id];
         assert_eq!(manifest.agent.id, id);
@@ -99,7 +118,8 @@ fn documentation_only_manifests_claim_no_measured_behavior() {
         );
         for rule in &manifest.rules {
             assert!(
-                matches!(rule.state, AgentState::Unknown | AgentState::BlockedModal),
+                !reviewed.contains(&id)
+                    || matches!(rule.state, AgentState::Unknown | AgentState::BlockedModal),
                 "{id}/{} claims a state only a measurement can back",
                 rule.id
             );
@@ -114,8 +134,65 @@ fn documentation_only_manifests_claim_no_measured_behavior() {
         assert!(manifest.injection.verify_before_submit, "{id}");
         assert_eq!(manifest.injection.safe_states, ["idle"], "{id}");
     }
-    // Five measured manifests plus the seven above.
-    assert_eq!(all.len(), 12, "{:?}", all.keys().collect::<Vec<_>>());
+    for id in measured {
+        assert_ne!(all[id].agent.version_tested, "unverified", "{id}");
+    }
+}
+
+/// A manifest that wires itself from `[hooks.wiring]` must agree with its
+/// own `[hooks]` table: when it declares an acknowledgment, the prompt edge
+/// it wires is that acknowledgment, and the payload field it names is the
+/// one the daemon searches for the doorbell. A mismatch would wire one
+/// event and wait for another. A wired prompt edge with no `ack` is
+/// allowed: it is turn-start liveness for a vendor whose payload field is
+/// undocumented. The eight template-wired vendors carry no table, and the
+/// loader refuses a table on any of them: their files come from
+/// `resources/hooks/`, and a second source of truth would drift.
+#[test]
+fn declared_wiring_agrees_with_the_hooks_table() {
+    let template_wired = [
+        "agy", "claude", "codex", "cursor", "gemini", "goose", "kimi", "qwen",
+    ];
+    for (id, manifest) in shipped() {
+        let Some(wiring) = &manifest.hooks.wiring else {
+            continue;
+        };
+        assert!(
+            !template_wired.contains(&id.as_str()),
+            "{id} is wired from resources/hooks/ and also declares [hooks.wiring]"
+        );
+        assert_eq!(
+            manifest.agent.version_tested, "unverified",
+            "{id} declares wiring but was never measured"
+        );
+        if let Some(ack) = manifest.hooks.ack.as_deref() {
+            assert_eq!(
+                wiring.events.prompt_submit.as_deref(),
+                Some(ack),
+                "{id}: hooks.ack names an event the wiring never registers"
+            );
+            assert_eq!(
+                wiring.payload_prompt_field.as_deref(),
+                manifest.hooks.ack_payload_field.as_deref(),
+                "{id}: hooks.ack_payload_field and hooks.wiring.payload_prompt_field disagree"
+            );
+        } else {
+            assert!(
+                wiring.payload_prompt_field.is_none(),
+                "{id}: payload_prompt_field without hooks.ack proves nothing to the receipt floor"
+            );
+        }
+        for (_, name) in wiring.events.declared() {
+            assert!(
+                manifest
+                    .hooks
+                    .available
+                    .iter()
+                    .any(|available| available == name),
+                "{id}: wired event {name} is not in hooks.available"
+            );
+        }
+    }
 }
 
 /// Each wired documentation-only vendor names the payload field its prompt

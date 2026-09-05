@@ -1,0 +1,108 @@
+# Cyclops detection manifest: Hermes Agent (Nous Research)
+# UNVERIFIED best effort from primary documentation, written 2026-09-04.
+# No hermes binary was run and nothing was measured: this file binds the
+# pane and declares the documented hook contract and nothing more. Sources:
+#   https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks
+#   https://hermes-agent.nousresearch.com/docs/user-guide/cli/
+#   https://hermes-agent.nousresearch.com/docs/reference/cli-commands
+#   https://github.com/NousResearch/hermes-agent
+#
+# Skills directory (skills.sh catalog key hermes-agent): ~/.hermes/skills
+# ($HERMES_HOME)
+#
+# Sensor summary for this CLI:
+#   process  hermes is installed by a curl script; #{pane_current_command}
+#            is expected to read "hermes" (inferred, not measured).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED: a `hooks:` block in ~/.hermes/config.yaml, keyed by
+#            event, each entry {matcher, command, timeout, fail_closed};
+#            JSON on stdin with hook_event_name, tool_name, tool_input,
+#            session_id, cwd, extra. There is NO prompt-submit or stop
+#            event (pre_llm_call fires per model call, not per turn), so no
+#            start, ACK or end is declared; on_session_start is wired for
+#            liveness and pre_approval_request is the attention edge. A
+#            newly added hook needs first-use consent: an interactive run
+#            prompts for it, a non-TTY run needs --accept-hooks,
+#            HERMES_ACCEPT_HOOKS=1 or hooks_auto_accept: true, or the hook
+#            silently stays unregistered. That consent prompt is a startup
+#            dialog nobody has captured, so no modal rule ships for it.
+#   screen   The docs quote the REPL prompt "❯ " and a status toolbar
+#            "⚕ <model> │ 12.4K/200K │ [██████░░░░] 6% │ $0.06 │ 15m" plus
+#            the statuses "ready", "thinking…" and "running…". The rules
+#            below anchor exactly that text and nothing else; they are
+#            UNMEASURED, so the idle rule is not lifecycle evidence and can
+#            neither confirm idle nor end a turn on its own.
+
+[agent]
+id = "hermes"
+display_name = "Hermes Agent"
+version_tested = "unverified"
+process_names = ["hermes"]
+argv_basenames = ["hermes"]
+# Bare `hermes` (or `hermes chat`) is the TUI; `hermes gateway` is a daemon.
+launch = "hermes"
+
+[hooks]
+config_mechanism = "hooks block in ~/.hermes/config.yaml"
+attention = "pre_approval_request"
+available = [
+  "pre_tool_call", "post_tool_call", "pre_llm_call", "post_llm_call",
+  "pre_verify", "on_session_start", "on_session_end", "on_session_finalize",
+  "on_session_reset", "subagent_start", "subagent_stop", "pre_gateway_dispatch",
+  "gateway_platform_event", "pre_approval_request", "post_approval_response",
+  "pre_transcription", "transform_tool_result", "transform_terminal_output",
+  "transform_llm_output", "pre_api_request", "post_api_request",
+  "api_request_error", "on_skill_lifecycle",
+]
+
+[hooks.wiring]
+shape = "hermes-yaml"
+file = "~/.hermes/config.yaml"
+
+[hooks.wiring.events]
+session_start = "on_session_start"
+permission_request = "pre_approval_request"
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Hermes Agent."
+evidence = "UNMEASURED"
+
+[[rule]]
+id = "status_working"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(4)"
+lifecycle_evidence = false
+any = [
+  { contains = ["thinking…"] },
+  { contains = ["running…"] },
+]
+note = """The documented TUI statuses while a turn runs. Kept above the
+idle rule so a visible bare prompt never reads idle while hermes says it
+is thinking or running. UNMEASURED: written from the docs, never captured."""
+evidence = "DOCUMENTED only (user-guide/cli): statuses ready, thinking…, running…"
+
+[[rule]]
+id = "composer_empty_with_toolbar"
+state = "idle"
+priority = 1000
+region = "bottom_non_empty_lines(4)"
+lifecycle_evidence = false
+line_regex = ['^\s*❯\s*$', '^⚕ .*│']
+note = """A bare ❯ prompt row together with the ⚕ status toolbar, both as
+the docs quote them. The bare glyph alone is too weak to mean idle, so the
+toolbar row is required as well. UNMEASURED: whether the prompt stays
+visible mid-turn is unknown, which is why this is not lifecycle evidence."""
+evidence = "DOCUMENTED only (user-guide/cli): '❯ ' prompt and '⚕ <model> │ 12.4K/200K │ ...' toolbar"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
