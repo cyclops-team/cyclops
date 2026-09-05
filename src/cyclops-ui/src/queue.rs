@@ -548,6 +548,10 @@ pub struct HumanQueue {
     /// keypress scans the whole view to find where the cursor is, which
     /// is a linear cost per keystroke on a large snapshot.
     cursor: Option<usize>,
+    /// Counts every change to the rows, the scope or the session filter:
+    /// everything a rendered timeline is built from except the cursor. A
+    /// renderer that caches its build compares this instead of the rows.
+    revision: u64,
 }
 
 impl Default for HumanQueue {
@@ -567,11 +571,18 @@ impl HumanQueue {
             counts: Counts::default(),
             selected: None,
             cursor: None,
+            revision: 0,
         }
     }
 
     pub fn watermark(&self) -> u64 {
         self.watermark
+    }
+
+    /// Which view this is. Changes whenever [`HumanQueue::rebuild_view`]
+    /// runs; the cursor moving does not change it.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn scope(&self) -> Scope {
@@ -631,6 +642,7 @@ impl HumanQueue {
     /// inbox, and the daemon's own sequence inside each band. Ties break
     /// on the target id so two reads of one state produce one order.
     fn rebuild_view(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         let scope = self.scope;
         let session = self.session.as_ref();
         let rows = &self.rows;

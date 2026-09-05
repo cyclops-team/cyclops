@@ -230,6 +230,8 @@ pub enum ChatAction {
     Reply,
     Announce,
     Open,
+    /// Show or hide message bodies under their headings.
+    Body,
     Scope,
     /// Clear the local presentation through its current durable sequence.
     /// The mailbox and journal remain unchanged.
@@ -249,6 +251,7 @@ impl ChatAction {
             ChatAction::Reply => "r reply",
             ChatAction::Announce => "a announce",
             ChatAction::Open => "enter open",
+            ChatAction::Body => "b body",
             ChatAction::Scope => "s scope",
             ChatAction::Clear => "c clear",
             ChatAction::Sessions => "t sessions",
@@ -277,6 +280,7 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
         ChatAction::Reply,
         ChatAction::Announce,
         ChatAction::Open,
+        ChatAction::Body,
         ChatAction::Clear,
         ChatAction::Sessions,
     ];
@@ -437,12 +441,30 @@ pub enum ChatLineKind {
     Blank,
 }
 
+/// The queue rows one timeline line speaks for.
+///
+/// A message heading carries every recipient of its message; a
+/// recipient's own status line carries exactly that one. A surface maps a
+/// click on the line to a selection through it, and the frame paints the
+/// cursor on every line whose owner holds the selected target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineOwner {
+    pub message_id: MessageId,
+    pub targets: Vec<QueueTarget>,
+}
+
 /// One exact-width line of the drawer: inked runs that concatenate to the
 /// plain row [`render_chat`] returns.
+///
+/// An owned line's first span starts with one blank cell: the cursor
+/// cell, painted `>` by [`ChatLine::mark_cursor`] when its owner is
+/// selected. Keeping the mark out of the build is what lets a built
+/// timeline be reused while the cursor moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatLine {
     pub kind: ChatLineKind,
     pub spans: Vec<ChatSpan>,
+    pub owner: Option<LineOwner>,
 }
 
 impl ChatLine {
@@ -450,7 +472,32 @@ impl ChatLine {
         Self {
             kind,
             spans: Vec::new(),
+            owner: None,
         }
+    }
+
+    /// Name the rows this line speaks for.
+    pub fn owned(mut self, owner: LineOwner) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Paint the cursor cell. Only an owned line has one; the first cell
+    /// of its first span is blank until the line is selected.
+    pub fn mark_cursor(&mut self) {
+        if self.owner.is_none() {
+            return;
+        }
+        if let Some(first) = self.spans.first_mut() {
+            if first.text.starts_with(' ') {
+                first.text.replace_range(..1, ">");
+            }
+        }
+    }
+
+    /// The message this line speaks for, if any.
+    pub fn message_id(&self) -> Option<&MessageId> {
+        self.owner.as_ref().map(|owner| &owner.message_id)
     }
 
     /// Append one run. An empty run is dropped rather than kept as a
@@ -647,7 +694,6 @@ pub struct RecipientEntry {
     /// Attention decay follows the hold, not the older message envelope.
     pub updated_at: u64,
     pub is_attention: bool,
-    pub is_selected: bool,
     pub target: QueueTarget,
 }
 
@@ -665,26 +711,42 @@ pub struct TimelineItem {
     pub thread_root: MessageId,
     pub thread_message_count: u64,
     pub ts: u64,
-    pub is_selected: bool,
+    /// The body the daemon handed to the open detail, or to its thread.
     pub authorized_body: Option<String>,
     pub thread_history: Vec<ThreadEntry>,
+    /// This message is the one the open detail froze.
+    pub detail_open: bool,
 }
 
 impl TimelineItem {
+    /// The rows a heading speaks for: every recipient.
+    pub fn owner(&self) -> LineOwner {
+        LineOwner {
+            message_id: self.message_id.clone(),
+            targets: self.recipients.iter().map(|r| r.target.clone()).collect(),
+        }
+    }
+
+    /// The one row a recipient's status line speaks for.
+    pub fn owner_of(&self, recipient: &RecipientEntry) -> LineOwner {
+        LineOwner {
+            message_id: self.message_id.clone(),
+            targets: vec![recipient.target.clone()],
+        }
+    }
+
     /// Aggregate QueueRows by MessageId into timeline entries.
     pub fn aggregate_from_rows(
-        rows: &[QueueRow],
+        rows: &[&QueueRow],
         avatar_registry: &AvatarRegistry,
         live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
         pane_manifests: Option<&HashMap<String, String>>,
-        selected_target: Option<&QueueTarget>,
         detail: Option<&Detail>,
     ) -> Vec<Self> {
         let mut grouped: Vec<TimelineItem> = Vec::new();
         let mut index_by_id: HashMap<MessageId, usize> = HashMap::new();
 
         for row in rows {
-            let is_sel = selected_target == Some(&row.target);
             let recip_avatar = avatar_registry.resolve_route_endpoint(
                 &row.recipient,
                 &row.recipient_label,
@@ -710,16 +772,12 @@ impl TimelineItem {
                 fifo_position: row.fifo_position,
                 updated_at: row.updated_at,
                 is_attention: row.needs_human(),
-                is_selected: is_sel,
                 target: row.target.clone(),
             };
 
             if let Some(&idx) = index_by_id.get(&row.message_id) {
                 let item = &mut grouped[idx];
                 item.recipients.push(recip_entry);
-                if is_sel {
-                    item.is_selected = true;
-                }
                 item.is_broadcast = item.recipients.len() > 1 || row.kind == Kind::Fyi;
             } else {
                 let sender_avatar = avatar_registry.resolve_route_endpoint(
@@ -731,9 +789,11 @@ impl TimelineItem {
 
                 let is_broadcast = row.recipient_count > 1 || row.kind == Kind::Fyi;
 
+                let detail_open =
+                    detail.is_some_and(|d| d.target().target.message_id == row.message_id);
                 let (authorized_body, thread_history) = if let Some(d) = detail {
                     let loaded = d.loaded();
-                    if d.target().target.message_id == row.message_id {
+                    if detail_open {
                         let row_msg_ids: std::collections::HashSet<&str> =
                             rows.iter().map(|r| r.message_id.as_str()).collect();
                         let filtered_history: Vec<ThreadEntry> = loaded
@@ -768,9 +828,9 @@ impl TimelineItem {
                     thread_root: row.thread_root.clone(),
                     thread_message_count: row.thread_message_count,
                     ts: row.ts,
-                    is_selected: is_sel,
                     authorized_body,
                     thread_history,
+                    detail_open,
                 };
                 index_by_id.insert(row.message_id.clone(), grouped.len());
                 grouped.push(item);
@@ -859,6 +919,56 @@ fn timeline_viewport_top(
         .unwrap_or(last_top)
 }
 
+/// What one operator read of a message body came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyState {
+    /// Asked, not yet answered.
+    Loading,
+    /// The daemon authorized the read. `None` is a message with no body,
+    /// which is not the same as a body the reader may not see.
+    Loaded(Option<String>),
+    /// The daemon refused the read, or does not offer it.
+    Unavailable,
+}
+
+/// Bodies read through `msg.read`, one per message id.
+///
+/// A body is immutable once accepted, so an answer is kept for the life
+/// of the surface. The revision counts changes, so a cached timeline can
+/// tell that it was built before an answer landed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageBodies {
+    by_id: HashMap<MessageId, BodyState>,
+    revision: u64,
+}
+
+impl MessageBodies {
+    pub fn get(&self, message_id: &MessageId) -> Option<&BodyState> {
+        self.by_id.get(message_id)
+    }
+
+    pub fn contains(&self, message_id: &MessageId) -> bool {
+        self.by_id.contains_key(message_id)
+    }
+
+    pub fn set(&mut self, message_id: MessageId, state: BodyState) {
+        self.by_id.insert(message_id, state);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Forget an unanswered read so it can be asked again.
+    pub fn forget_loading(&mut self, message_id: &MessageId) {
+        if self.by_id.get(message_id) == Some(&BodyState::Loading) {
+            self.by_id.remove(message_id);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
 /// Read-only context used to paint one Messages frame.
 #[derive(Clone, Copy)]
 pub struct ChatRenderContext<'a> {
@@ -874,6 +984,12 @@ pub struct ChatRenderContext<'a> {
     pub retry_available: bool,
     pub now_ms: Option<u64>,
     pub view_journal: bool,
+    /// Full rows: bodies, thread and every recipient's fact under each
+    /// heading. Off is the compact default, one heading per message.
+    pub show_bodies: bool,
+    /// Bodies the operator read through `msg.read`, shown only while
+    /// `show_bodies` is on.
+    pub bodies: Option<&'a MessageBodies>,
 }
 
 impl<'a> ChatRenderContext<'a> {
@@ -888,7 +1004,19 @@ impl<'a> ChatRenderContext<'a> {
             retry_available: false,
             now_ms: None,
             view_journal: false,
+            show_bodies: false,
+            bodies: None,
         }
+    }
+
+    pub fn with_show_bodies(mut self, show_bodies: bool) -> Self {
+        self.show_bodies = show_bodies;
+        self
+    }
+
+    pub fn with_bodies(mut self, bodies: &'a MessageBodies) -> Self {
+        self.bodies = Some(bodies);
+        self
     }
 
     pub fn with_detail(mut self, detail: &'a Detail) -> Self {
@@ -920,13 +1048,6 @@ impl<'a> ChatRenderContext<'a> {
         self.now_ms = Some(now_ms);
         self
     }
-}
-
-/// The short form of a message id for a row: enough to tell two apart,
-/// not the whole thirty-four cells. The full id is in the detail.
-fn short_id(id: &MessageId) -> &str {
-    let s = id.as_str();
-    &s[..s.len().min(10)]
 }
 
 /// The avatar as a chip: the badge with one cell of air each side, so the
@@ -979,27 +1100,693 @@ pub fn render_chat(
         .collect()
 }
 
+/// The timeline built once for one queue state, width and body choice,
+/// ready to be sliced into frames. Header and footer are not here: they
+/// are cheap and depend on the composer, which changes with every key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTimeline {
+    pub lines: Vec<ChatLine>,
+}
+
+impl ChatTimeline {
+    /// The line the viewport centers on: the first line that speaks for
+    /// the selected target.
+    pub fn anchor_line(&self, selected: Option<&QueueTarget>) -> Option<usize> {
+        let selected = selected?;
+        self.lines.iter().position(|line| {
+            line.owner
+                .as_ref()
+                .is_some_and(|owner| owner.targets.contains(selected))
+        })
+    }
+}
+
+/// Where a frame's timeline window sat, for a caller that scrolls it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChatViewport {
+    /// First timeline line shown.
+    pub top: usize,
+    /// Timeline rows the frame had room for.
+    pub visible: usize,
+    /// Timeline lines in total.
+    pub total: usize,
+}
+
+/// One painted frame: exact-width inked rows and the window they show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatFrame {
+    pub lines: Vec<ChatLine>,
+    pub viewport: ChatViewport,
+}
+
 /// Render the group-chat timeline and bottom bounded composer into
-/// exact-width inked lines.
+/// exact-width inked lines: [`build_chat_timeline`] then
+/// [`render_chat_frame`], for callers that do not keep the timeline.
 pub fn render_chat_lines(
     queue: &HumanQueue,
     context: ChatRenderContext<'_>,
     width: usize,
     height: usize,
 ) -> Vec<ChatLine> {
+    let timeline = build_chat_timeline(queue, context, width);
+    render_chat_frame(&timeline, queue, context, width, height, None).lines
+}
+
+/// Build every timeline line for the queue's visible rows at `width`.
+///
+/// Selection is not an input: the cursor is painted by
+/// [`render_chat_frame`], so moving it costs a slice and not a rebuild.
+/// Everything else the lines depend on (rows, scope, session filter,
+/// avatars, the open detail, read bodies, the clock the relative times
+/// use) is, and a caller that caches the result must rebuild when any of
+/// those change.
+pub fn build_chat_timeline(
+    queue: &HumanQueue,
+    context: ChatRenderContext<'_>,
+    width: usize,
+) -> ChatTimeline {
     let ChatRenderContext {
         detail,
-        composer,
         avatar_registry,
         live_routes,
         pane_manifests,
-        status,
-        retry_available,
         now_ms,
         view_journal,
+        show_bodies,
+        bodies,
+        ..
+    } = context;
+    if width == 0 {
+        return ChatTimeline { lines: Vec::new() };
+    }
+    let visible_rows: Vec<&QueueRow> = queue.visible().collect();
+    let items = TimelineItem::aggregate_from_rows(
+        &visible_rows,
+        avatar_registry,
+        live_routes,
+        pane_manifests,
+        detail,
+    );
+
+    let mut timeline: Vec<ChatLine> = Vec::new();
+    let hidden = queue.hidden_pending();
+    if items.is_empty() && hidden > 0 {
+        let mut notice = ChatLine::new(ChatLineKind::Status);
+        notice.push(
+            format!("  ! {} pending hidden by scope · press s for all", hidden),
+            ChatInk::Attention,
+        );
+        timeline.push(plain(ChatLineKind::Blank, "", width));
+        timeline.push(notice.fitted(width));
+    }
+    let pending_behind = |entry: &RecipientEntry| {
+        visible_rows
+            .iter()
+            .filter(|row| row.recipient == entry.recipient && row.mailbox == MailboxWord::Pending)
+            .count()
+            .saturating_sub(1)
+    };
+
+    if width < 24 {
+        // Ultra-narrow: one line per message with initials (never icon
+        // only), one line per recipient, and the hold lines.
+        for item in &items {
+            let attn_mark = if item.recipients.iter().any(|r| r.is_attention) {
+                "!"
+            } else {
+                " "
+            };
+            let s_initials = &item.sender_avatar.initials;
+            let id = item.message_id.as_str();
+            let short = &id[id.len().saturating_sub(6)..];
+            let status_short = item
+                .recipients
+                .first()
+                .map(|r| proven_status_short(r.mailbox, r.wake))
+                .unwrap_or("*pend");
+            let mut line1 = ChatLine::new(ChatLineKind::Message);
+            line1.push(" ", ChatInk::Accent);
+            line1.push(
+                format!("{attn_mark}[{s_initials}]{short} {status_short}"),
+                ChatInk::Text,
+            );
+            timeline.push(line1.owned(item.owner()).fitted(width));
+            for r in &item.recipients {
+                let mut line = ChatLine::new(ChatLineKind::Message);
+                line.push(" ", ChatInk::Accent);
+                line.push(format!("-> {}", r.label), ChatInk::Text);
+                timeline.push(line.owned(item.owner_of(r)).fitted(width));
+                if r.is_attention || r.cause.is_some() {
+                    let mut line = ChatLine::new(ChatLineKind::Status);
+                    line.push(
+                        format!(" ! [{}]", held_words(r, status_short, pending_behind(r))),
+                        held_ink(r.updated_at, now_ms),
+                    );
+                    timeline.push(line.fitted(width));
+                }
+            }
+            if show_bodies {
+                match body_view(
+                    &item.message_id,
+                    item.authorized_body.as_ref(),
+                    item.detail_open,
+                    show_bodies,
+                    bodies,
+                ) {
+                    BodyView::Shown(body) => {
+                        for row in wrap_words(body, width.saturating_sub(2).max(1)) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("  ", ChatInk::Text);
+                            line.push(row, ChatInk::Text);
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                    BodyView::Unavailable => {
+                        timeline.push(dim_line("  body unavailable", width));
+                    }
+                    BodyView::Hidden => {}
+                }
+            }
+        }
+    } else if view_journal {
+        // Transmission journal: one chronological line per delivery fact.
+        if visible_rows.is_empty() {
+            let mut empty = ChatLine::new(ChatLineKind::Status);
+            empty.push("  No transmission records in journal", ChatInk::Dim);
+            timeline.push(empty.fitted(width));
+        }
+        let body_width = width.saturating_sub(4).max(1);
+        for row in &visible_rows {
+            let time_str = format_time(row.ts, now_ms);
+            let status = proven_status_label(row.mailbox, row.wake);
+
+            let mut heading = ChatLine::new(ChatLineKind::Message);
+            heading.push("  ", ChatInk::Accent);
+            heading.push(format!("[{time_str}] "), ChatInk::Dim);
+            heading.push(&row.sender_label, ChatInk::Role(row.sender_label.clone()));
+            if let Some(pane) = row.sender.pane_id() {
+                heading.push(format!(" ({pane})"), ChatInk::Dim);
+            } else if row.sender.is_admin() {
+                heading.push(" [admin]", ChatInk::Dim);
+            } else if row.sender.is_headless() {
+                heading.push(" (headless)", ChatInk::Dim);
+            }
+            heading.push(" → ", ChatInk::Dim);
+            heading.push(
+                &row.recipient_label,
+                ChatInk::Role(row.recipient_label.clone()),
+            );
+            if let Some(pane) = row.recipient.pane_id() {
+                heading.push(format!(" ({pane})"), ChatInk::Dim);
+            }
+            heading.push(" · ", ChatInk::Dim);
+            heading.push(status, ChatInk::Accent);
+
+            let used = heading.width();
+            let id = row.message_id.as_str();
+            let id_w = display_width(id);
+            if used + 2 + id_w <= width {
+                heading.push(" ".repeat(width - used - id_w), ChatInk::Text);
+                heading.push(id, ChatInk::Dim);
+            }
+            let owner = LineOwner {
+                message_id: row.message_id.clone(),
+                targets: vec![row.target.clone()],
+            };
+            timeline.push(heading.owned(owner).fitted(width));
+
+            if let Some(ref reply) = row.reply_to {
+                let mut line = ChatLine::new(ChatLineKind::Message);
+                line.push("   ↳ reply to ", ChatInk::Dim);
+                line.push(reply.as_str(), ChatInk::Dim);
+                timeline.push(line.fitted(width));
+            }
+
+            let detail_open =
+                detail.is_some_and(|d| d.target().target.message_id == row.message_id);
+            let authorized = detail.and_then(|d| {
+                let loaded = d.loaded();
+                if detail_open {
+                    loaded.body.as_ref()
+                } else {
+                    loaded
+                        .thread
+                        .iter()
+                        .find(|e| e.message_id == row.message_id.as_str())
+                        .and_then(|e| e.body.as_ref())
+                }
+            });
+            match body_view(
+                &row.message_id,
+                authorized,
+                detail_open,
+                show_bodies,
+                bodies,
+            ) {
+                BodyView::Shown(body_text) => {
+                    let show_subject = row.reply_to.is_none()
+                        && row
+                            .subject
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .is_some_and(|s| s != "Direct Message" && !body_text.starts_with(s));
+                    if show_subject {
+                        if let Some(ref subj) = row.subject {
+                            for line_text in wrap_words(subj, body_width) {
+                                let mut line = ChatLine::new(ChatLineKind::Message);
+                                line.push("   ", ChatInk::Text);
+                                line.push(line_text, ChatInk::Role(row.sender_label.clone()));
+                                timeline.push(line.fitted(width));
+                            }
+                        }
+                    }
+                    for line_text in wrap_words(body_text, body_width) {
+                        let mut line = ChatLine::new(ChatLineKind::Message);
+                        line.push("   | ", ChatInk::Dim);
+                        line.push(line_text, ChatInk::Text);
+                        timeline.push(line.fitted(width));
+                    }
+                }
+                BodyView::Unavailable => {
+                    if let Some(ref subject) = row.subject {
+                        for line_text in wrap_words(subject, body_width) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("   ", ChatInk::Text);
+                            line.push(line_text, ChatInk::Text);
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                    timeline.push(dim_line("   body unavailable", width));
+                }
+                BodyView::Hidden => {
+                    if let Some(ref subject) = row.subject {
+                        for line_text in wrap_words(subject, body_width) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("   ", ChatInk::Text);
+                            line.push(line_text, ChatInk::Text);
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref cause) = row.cause {
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                line.push(
+                    format!("   ! cause: {}", attention_cause_label(*cause)),
+                    ChatInk::Attention,
+                );
+                timeline.push(line.fitted(width));
+            }
+            if let Some(ref block) = row.pre_write_block {
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                line.push(format!("   ! block: {}", block), ChatInk::Attention);
+                timeline.push(line.fitted(width));
+            }
+
+            timeline.push(plain(ChatLineKind::Blank, "", width));
+        }
+    } else {
+        // Group chat: one heading per message that carries everything a
+        // reader scans for (who, to whom, the subject, the proven status,
+        // the full id). Compact is the heading plus any hold that needs a
+        // person; full adds the body, the thread and every recipient's
+        // fact.
+        let body_width = width.saturating_sub(3).max(1);
+        let parts: Vec<HeadingParts<'_>> = items
+            .iter()
+            .map(|item| HeadingParts::new(item, now_ms))
+            .collect();
+        let level = heading_level(&parts, width);
+        for (item, parts) in items.iter().zip(parts) {
+            timeline.push(parts.line(width, level));
+            let expanded = show_bodies || item.detail_open;
+            if expanded {
+                if let Some(ref reply) = item.reply_to {
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   ↳ reply to ", ChatInk::Dim);
+                    line.push(reply.as_str(), ChatInk::Dim);
+                    timeline.push(line.fitted(width));
+                }
+                for entry in &item.thread_history {
+                    let entry_avatar = Avatar::from_label(&entry.sender_label);
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   ", ChatInk::Text);
+                    line.push(
+                        chip(&entry_avatar),
+                        ChatInk::Avatar(entry.sender_label.clone()),
+                    );
+                    line.push(" ", ChatInk::Text);
+                    line.push(
+                        &entry.sender_label,
+                        ChatInk::Role(entry.sender_label.clone()),
+                    );
+                    line.push("  ", ChatInk::Text);
+                    line.push(format_time(entry.ts, now_ms), ChatInk::Dim);
+                    timeline.push(line.fitted(width));
+                    if let Some(ref b) = entry.body {
+                        for row in wrap_words(b, width.saturating_sub(5).max(1)) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("     ", ChatInk::Text);
+                            line.push(row, ChatInk::Text);
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                }
+                match body_view(
+                    &item.message_id,
+                    item.authorized_body.as_ref(),
+                    item.detail_open,
+                    show_bodies,
+                    bodies,
+                ) {
+                    BodyView::Shown(body) => {
+                        for row in wrap_words(body, body_width) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("   ", ChatInk::Text);
+                            line.push(row, ChatInk::Text);
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                    BodyView::Unavailable => {
+                        timeline.push(dim_line("   body unavailable", width));
+                    }
+                    BodyView::Hidden => {}
+                }
+            }
+
+            // Recipient delivery facts. A hold always gets its line: it is
+            // what needs a person. The rest of a broadcast's recipients
+            // only spell theirs out in the full view; a direct message's
+            // one fact is already on its heading.
+            for r in &item.recipients {
+                let held = r.is_attention || r.cause.is_some();
+                if !(held || (show_bodies && item.is_broadcast)) {
+                    continue;
+                }
+                let status_label = proven_status_label(r.mailbox, r.wake);
+                let (glyph, ink) = status_ink(r);
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                line.push("    ", ChatInk::Accent);
+                if item.is_broadcast {
+                    line.push(&r.label, ChatInk::Role(r.label.clone()));
+                    if let Some(pane) = r.recipient.pane_id() {
+                        line.push(format!(" ({pane})"), ChatInk::Dim);
+                    } else if r.recipient.is_admin() {
+                        line.push(" [admin]", ChatInk::Dim);
+                    } else if r.recipient.is_headless() {
+                        line.push(" (headless)", ChatInk::Dim);
+                    }
+                    line.push(" ", ChatInk::Text);
+                }
+                line.push(glyph, ink.clone());
+                line.push(" ", ChatInk::Text);
+                line.push(status_label, ink);
+                // The hold rides the status line it qualifies instead of
+                // claiming a row of its own. Same words, same causes, one
+                // line: a message used to spend two rows on transport for
+                // every one row of what it said.
+                if held {
+                    line.push(" · ", ChatInk::Dim);
+                    line.push(
+                        held_words(r, status_label, pending_behind(r)),
+                        held_ink(r.updated_at, now_ms),
+                    );
+                }
+                timeline.push(line.owned(item.owner_of(r)).fitted(width));
+            }
+            if show_bodies {
+                timeline.push(plain(ChatLineKind::Blank, "", width));
+            }
+        }
+    }
+    ChatTimeline { lines: timeline }
+}
+
+/// Everything a message heading is made of, measured once so one layout
+/// can be chosen for the whole timeline before any row is laid out.
+struct HeadingParts<'a> {
+    item: &'a TimelineItem,
+    /// The cursor cell, the sender chip and name, the arrow and the
+    /// recipient(s): the part that never yields.
+    who: ChatLine,
+    who_w: usize,
+    glyph: &'static str,
+    label: &'static str,
+    short: &'static str,
+    ink: ChatInk,
+    subject: Option<&'a str>,
+    time: String,
+}
+
+impl<'a> HeadingParts<'a> {
+    fn new(item: &'a TimelineItem, now_ms: Option<u64>) -> Self {
+        let mut who = ChatLine::new(ChatLineKind::Message);
+        who.push("  ", ChatInk::Accent);
+        who.push(
+            chip(&item.sender_avatar),
+            ChatInk::Avatar(item.sender_label.clone()),
+        );
+        who.push(" ", ChatInk::Text);
+        who.push(&item.sender_label, ChatInk::Role(item.sender_label.clone()));
+        who.push(" → ", ChatInk::Dim);
+        if item.is_broadcast {
+            who.push("@all", ChatInk::Accent);
+            who.push(format!(" ({})", item.recipients.len()), ChatInk::Dim);
+        } else if let Some(r) = item.recipients.first() {
+            who.push(&r.label, ChatInk::Role(r.label.clone()));
+        }
+        let who_w = who.width();
+
+        // One fact for the whole message. A broadcast whose recipients
+        // disagree says so rather than reporting the first one's fact as
+        // everyone's.
+        let (glyph, label, short, ink) = match item.recipients.first() {
+            Some(first)
+                if item
+                    .recipients
+                    .iter()
+                    .all(|r| (r.mailbox, r.wake) == (first.mailbox, first.wake)) =>
+            {
+                let (glyph, ink) = status_ink(first);
+                (
+                    glyph,
+                    proven_status_label(first.mailbox, first.wake),
+                    proven_status_short(first.mailbox, first.wake),
+                    ink,
+                )
+            }
+            Some(_) => ("·", "mixed", "mixed", ChatInk::Dim),
+            None => ("·", "no recipients", "none", ChatInk::Dim),
+        };
+        // The plain glyph is the separator's own dot; only a mark that
+        // says something is worth a cell.
+        let glyph = if glyph == "·" { "" } else { glyph };
+        let subject = item
+            .subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "Direct Message");
+        HeadingParts {
+            item,
+            who,
+            who_w,
+            glyph,
+            label,
+            short,
+            ink,
+            subject,
+            time: format_time(item.ts, now_ms),
+        }
+    }
+
+    fn status(&self, form: StatusForm) -> String {
+        let word = match form {
+            StatusForm::Label => self.label,
+            StatusForm::Short => self.short,
+            StatusForm::Glyph => "",
+        };
+        match (self.glyph.is_empty(), word.is_empty()) {
+            (true, _) => word.to_string(),
+            (false, true) => self.glyph.to_string(),
+            (false, false) => format!("{} {}", self.glyph, word),
+        }
+    }
+
+    /// Cells one cascade level needs, the subject at its minimum.
+    fn width_at(&self, level: usize) -> usize {
+        let (form, with_id, with_time, with_subject) = HEADING_CASCADE[level];
+        let sep = 3; // " · "
+        let mut w = self.who_w;
+        if with_subject && self.subject.is_some() {
+            w += sep + SUBJECT_MIN;
+        }
+        let status = self.status(form);
+        if !status.is_empty() {
+            w += sep + display_width(&status);
+        }
+        if with_time {
+            w += sep + display_width(&self.time);
+        }
+        if with_id {
+            w += 2 + display_width(self.item.message_id.as_str());
+        }
+        w
+    }
+
+    /// The heading at one cascade level. What the level leaves over
+    /// widens the subject.
+    fn line(self, width: usize, level: usize) -> ChatLine {
+        let (form, with_id, with_time, with_subject) = HEADING_CASCADE[level];
+        let status = self.status(form);
+        // Everything but the subject, which then gets the rest.
+        let fixed = self.width_at(level)
+            - if self.subject.is_some() && with_subject {
+                SUBJECT_MIN
+            } else {
+                0
+            };
+        let item = self.item;
+        let id = item.message_id.as_str();
+        let mut heading = self.who;
+        if let (true, Some(subject)) = (with_subject, self.subject) {
+            let room = width.saturating_sub(fixed).min(display_width(subject));
+            heading.push(" · ", ChatInk::Dim);
+            heading.push(fit(subject, room), ChatInk::Text);
+        }
+        if !status.is_empty() {
+            heading.push(" · ", ChatInk::Dim);
+            heading.push(status, self.ink);
+        }
+        if with_time {
+            heading.push(" · ", ChatInk::Dim);
+            heading.push(self.time, ChatInk::Dim);
+        }
+        if with_id {
+            let used = heading.width();
+            heading.push(
+                " ".repeat(width.saturating_sub(used + display_width(id))),
+                ChatInk::Text,
+            );
+            heading.push(id, ChatInk::Dim);
+        }
+        heading.owned(item.owner()).fitted(width)
+    }
+}
+
+/// The one cascade level every heading of the timeline fits at, so the
+/// columns line up down the pane: a row that shows its id beside one
+/// that shows its status instead is two layouts, not one compact view.
+/// The last level when even that does not fit; [`ChatLine::fitted`]
+/// cuts what is left.
+fn heading_level(parts: &[HeadingParts<'_>], width: usize) -> usize {
+    (0..HEADING_CASCADE.len())
+        .find(|&level| parts.iter().all(|part| part.width_at(level) <= width))
+        .unwrap_or(HEADING_CASCADE.len() - 1)
+}
+
+/// The least of a subject a heading shows: fewer cells than this tell a
+/// reader nothing, so the row spends them on the id or status instead.
+const SUBJECT_MIN: usize = 8;
+
+/// How the heading names the proven status, largest first.
+#[derive(Clone, Copy)]
+enum StatusForm {
+    Label,
+    Short,
+    Glyph,
+}
+
+/// The heading layouts in the order they are tried: (status form, id,
+/// time, subject). Who never yields; the status shrinks from its proven
+/// label to its short code to its glyph alone, then the time goes, then
+/// the id, and a subject keeps at least [`SUBJECT_MIN`] cells whenever it
+/// is shown at all, because a row an operator cannot tell from its
+/// neighbours is not a compact row but a blank one.
+const HEADING_CASCADE: [(StatusForm, bool, bool, bool); 10] = [
+    (StatusForm::Label, true, true, true),
+    (StatusForm::Label, true, false, true),
+    (StatusForm::Short, true, false, true),
+    (StatusForm::Glyph, true, false, true),
+    (StatusForm::Short, false, false, true),
+    (StatusForm::Glyph, false, false, true),
+    (StatusForm::Label, true, false, false),
+    (StatusForm::Short, true, false, false),
+    (StatusForm::Short, false, false, false),
+    (StatusForm::Glyph, false, false, false),
+];
+
+/// One dim line of plain words.
+fn dim_line(text: &str, width: usize) -> ChatLine {
+    let mut line = ChatLine::new(ChatLineKind::Message);
+    line.push(text, ChatInk::Dim);
+    line.fitted(width)
+}
+
+/// What the timeline shows under a message's heading for its body.
+enum BodyView<'a> {
+    Shown(&'a str),
+    /// The operator asked for bodies and this one was refused, or the
+    /// daemon does not offer the read.
+    Unavailable,
+    Hidden,
+}
+
+/// The body to show for one message.
+///
+/// 1. A body the daemon handed to the open detail (a claim) shows while
+///    that detail is open, and whenever bodies are on.
+/// 2. With bodies on, a body the operator read through `msg.read` shows;
+///    a refused read says so in one line rather than showing nothing.
+/// 3. Otherwise nothing: the UI never decides a body may be shown.
+fn body_view<'a>(
+    message_id: &MessageId,
+    authorized: Option<&'a String>,
+    detail_open: bool,
+    show_bodies: bool,
+    bodies: Option<&'a MessageBodies>,
+) -> BodyView<'a> {
+    if let Some(body) = authorized {
+        if show_bodies || detail_open {
+            return BodyView::Shown(body);
+        }
+    }
+    if !show_bodies {
+        return BodyView::Hidden;
+    }
+    match bodies.and_then(|bodies| bodies.get(message_id)) {
+        Some(BodyState::Loaded(Some(body))) => BodyView::Shown(body),
+        Some(BodyState::Unavailable) => BodyView::Unavailable,
+        Some(BodyState::Loaded(None)) | Some(BodyState::Loading) | None => BodyView::Hidden,
+    }
+}
+
+/// Paint one frame from a built timeline: header, the timeline window,
+/// the status row and the composer or action strip, exactly `height` rows.
+///
+/// `scroll_top` is a window the operator moved by hand; `None` centers on
+/// the selection. Either way the cursor cell of every line that speaks
+/// for the selected target is painted here, so the timeline itself never
+/// has to know what is selected.
+pub fn render_chat_frame(
+    timeline: &ChatTimeline,
+    queue: &HumanQueue,
+    context: ChatRenderContext<'_>,
+    width: usize,
+    height: usize,
+    scroll_top: Option<usize>,
+) -> ChatFrame {
+    let ChatRenderContext {
+        composer,
+        status,
+        retry_available,
+        ..
     } = context;
     if width == 0 || height == 0 {
-        return Vec::new();
+        return ChatFrame {
+            lines: Vec::new(),
+            viewport: ChatViewport::default(),
+        };
     }
 
     let mut out: Vec<ChatLine> = Vec::with_capacity(height);
@@ -1050,7 +1837,7 @@ pub fn render_chat_lines(
     }
     out.push(header.fitted(width));
 
-    // Reserve the exact footer height before slicing the timeline. The
+    // 2. Reserve the exact footer height before slicing the timeline. The
     // passive footer may wrap as the pane narrows, and every wrapped row is
     // part of the fixed chrome rather than expendable message space.
     let action_lines = if composer.is_some_and(|c| c.mode.is_some()) {
@@ -1066,392 +1853,38 @@ pub fn render_chat_lines(
     let status_rows = usize::from(status.is_some());
     let timeline_height = height.saturating_sub(1 + composer_rows + status_rows);
 
-    // 2. Aggregate timeline rows by MessageId
-    let visible_rows: Vec<QueueRow> = queue.visible().cloned().collect();
-    let selected_target = queue.selected().map(|r| &r.target);
-    let items = TimelineItem::aggregate_from_rows(
-        &visible_rows,
-        avatar_registry,
-        live_routes,
-        pane_manifests,
-        selected_target,
-        detail,
-    );
-
-    let mut timeline: Vec<ChatLine> = Vec::new();
-    let mut selected_anchor_line: Option<usize> = None;
-    if items.is_empty() && hidden > 0 {
-        let mut notice = ChatLine::new(ChatLineKind::Status);
-        notice.push(
-            format!("  ! {} pending hidden by scope · press s for all", hidden),
-            ChatInk::Attention,
-        );
-        timeline.push(plain(ChatLineKind::Blank, "", width));
-        timeline.push(notice.fitted(width));
-    }
-    let pending_behind = |entry: &RecipientEntry| {
-        visible_rows
-            .iter()
-            .filter(|row| row.recipient == entry.recipient && row.mailbox == MailboxWord::Pending)
-            .count()
-            .saturating_sub(1)
+    // 3. The timeline window, cursor cells painted as it is copied.
+    let selected = queue.selected().map(|row| &row.target);
+    let total = timeline.lines.len();
+    let top = match scroll_top {
+        Some(top) => top.min(total.saturating_sub(timeline_height)),
+        None => timeline_viewport_top(total, timeline_height, timeline.anchor_line(selected)),
     };
-
-    if width < 24 {
-        // Ultra-narrow mode: 1-2 lines per entry using initials (never icon only)
-        for item in &items {
-            let sel_mark = if item.is_selected { ">" } else { " " };
-            let attn_mark = if item.recipients.iter().any(|r| r.is_attention) {
-                "!"
-            } else {
-                " "
-            };
-            let s_initials = &item.sender_avatar.initials;
-            let short = if item.message_id.as_str().len() > 6 {
-                &item.message_id.as_str()[item.message_id.as_str().len() - 6..]
-            } else {
-                item.message_id.as_str()
-            };
-            let shown_recipient = item
-                .recipients
-                .iter()
-                .find(|recipient| recipient.is_selected)
-                .or_else(|| item.recipients.first());
-            let status_short = shown_recipient
-                .map(|r| proven_status_short(r.mailbox, r.wake))
-                .unwrap_or("*pend");
-
-            let line1 = format!("{sel_mark}{attn_mark}[{s_initials}]{short} {status_short}");
-            timeline.push(plain(ChatLineKind::Message, &line1, width));
-            let recip_labels = match item
-                .recipients
-                .iter()
-                .find(|recipient| recipient.is_selected)
+    for line in timeline.lines.iter().skip(top).take(timeline_height) {
+        let mut line = line.clone();
+        if let Some(selected) = selected {
+            if line
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.targets.contains(selected))
             {
-                Some(recipient) if item.recipients.len() > 1 => {
-                    format!(">{} +{}", recipient.label, item.recipients.len() - 1)
-                }
-                Some(recipient) => format!(">{}", recipient.label),
-                None => item
-                    .recipients
-                    .iter()
-                    .map(|recipient| recipient.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            };
-            timeline.push(plain(
-                ChatLineKind::Message,
-                &format!(" -> {recip_labels}"),
-                width,
-            ));
-            if item.is_selected {
-                selected_anchor_line = Some(timeline.len().saturating_sub(1));
-            }
-
-            if let Some(r) = shown_recipient {
-                if r.is_attention || r.cause.is_some() {
-                    let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
-                    let cause_desc = r.cause.as_deref().unwrap_or(status_short);
-                    let line3 = if is_head {
-                        let behind = pending_behind(r);
-                        let behind_desc = if behind > 0 {
-                            format!(" · {behind} behind")
-                        } else {
-                            String::new()
-                        };
-                        format!(" ! [head · held: {cause_desc}{behind_desc}]")
-                    } else {
-                        format!(" ! [held: {cause_desc}]")
-                    };
-                    let mut line = ChatLine::new(ChatLineKind::Status);
-                    line.push(line3, held_ink(r.updated_at, now_ms));
-                    timeline.push(line.fitted(width));
-                }
+                line.mark_cursor();
             }
         }
-    } else if view_journal {
-        // Transmission Journal mode: clean chronological log of every message delivery fact
-        if visible_rows.is_empty() {
-            let mut empty = ChatLine::new(ChatLineKind::Status);
-            empty.push("  No transmission records in journal", ChatInk::Dim);
-            timeline.push(empty.fitted(width));
-        }
-        let body_width = width.saturating_sub(4).max(1);
-        for row in &visible_rows {
-            let is_selected = selected_target == Some(&row.target);
-            let time_str = format_time(row.ts, now_ms);
-            let short_msg = short_id(&row.message_id);
-            let status = proven_status_label(row.mailbox, row.wake);
-
-            let mut heading = ChatLine::new(ChatLineKind::Message);
-            heading.push(if is_selected { "> " } else { "  " }, ChatInk::Accent);
-            heading.push(format!("[{time_str}] "), ChatInk::Dim);
-            heading.push(&row.sender_label, ChatInk::Role(row.sender_label.clone()));
-            if let Some(pane) = row.sender.pane_id() {
-                heading.push(format!(" ({pane})"), ChatInk::Dim);
-            } else if row.sender.is_admin() {
-                heading.push(" [admin]", ChatInk::Dim);
-            } else if row.sender.is_headless() {
-                heading.push(" (headless)", ChatInk::Dim);
-            }
-            heading.push(" → ", ChatInk::Dim);
-            heading.push(
-                &row.recipient_label,
-                ChatInk::Role(row.recipient_label.clone()),
-            );
-            if let Some(pane) = row.recipient.pane_id() {
-                heading.push(format!(" ({pane})"), ChatInk::Dim);
-            } else if row.recipient.is_headless() {
-                heading.push(" (headless)", ChatInk::Dim);
-            }
-            heading.push(" · ", ChatInk::Dim);
-            heading.push(status, ChatInk::Accent);
-
-            let used = heading.width();
-            let id_w = display_width(short_msg);
-            if used + 2 + id_w <= width {
-                heading.push(" ".repeat(width - used - id_w), ChatInk::Text);
-                heading.push(short_msg, ChatInk::Dim);
-            }
-            timeline.push(heading.fitted(width));
-            if is_selected {
-                selected_anchor_line = Some(timeline.len().saturating_sub(1));
-            }
-
-            if let Some(ref reply) = row.reply_to {
-                let mut line = ChatLine::new(ChatLineKind::Message);
-                line.push("   ↳ reply to ", ChatInk::Dim);
-                line.push(short_id(reply), ChatInk::Dim);
-                timeline.push(line.fitted(width));
-            }
-
-            // Expose full message body if available from detail, or fallback to metadata subject
-            let full_body = detail.and_then(|d| {
-                let loaded = d.loaded();
-                if d.target().target.message_id == row.message_id {
-                    loaded.body.as_ref()
-                } else {
-                    loaded
-                        .thread
-                        .iter()
-                        .find(|e| e.message_id == row.message_id.as_str())
-                        .and_then(|e| e.body.as_ref())
-                }
-            });
-
-            if let Some(body_text) = full_body {
-                let show_subject = row.reply_to.is_none()
-                    && row
-                        .subject
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .is_some_and(|s| s != "Direct Message" && !body_text.starts_with(s));
-                if show_subject {
-                    if let Some(ref subj) = row.subject {
-                        for line_text in wrap_words(subj, body_width) {
-                            let mut line = ChatLine::new(ChatLineKind::Message);
-                            line.push("   ", ChatInk::Text);
-                            line.push(line_text, ChatInk::Role(row.sender_label.clone()));
-                            timeline.push(line.fitted(width));
-                        }
-                    }
-                }
-                for line_text in wrap_words(body_text, body_width) {
-                    let mut line = ChatLine::new(ChatLineKind::Message);
-                    line.push("   | ", ChatInk::Dim);
-                    line.push(line_text, ChatInk::Text);
-                    timeline.push(line.fitted(width));
-                }
-            } else if let Some(ref subject) = row.subject {
-                for line_text in wrap_words(subject, body_width) {
-                    let mut line = ChatLine::new(ChatLineKind::Message);
-                    line.push("   ", ChatInk::Text);
-                    line.push(line_text, ChatInk::Text);
-                    timeline.push(line.fitted(width));
-                }
-            }
-
-            if let Some(ref cause) = row.cause {
-                let mut line = ChatLine::new(ChatLineKind::Status);
-                line.push(
-                    format!("   ! cause: {}", attention_cause_label(*cause)),
-                    ChatInk::Attention,
-                );
-                timeline.push(line.fitted(width));
-            }
-            if let Some(ref block) = row.pre_write_block {
-                let mut line = ChatLine::new(ChatLineKind::Status);
-                line.push(format!("   ! block: {}", block), ChatInk::Attention);
-                timeline.push(line.fitted(width));
-            }
-
-            timeline.push(plain(ChatLineKind::Blank, "", width));
-        }
-    } else {
-        // Full group-chat mode: one heading, the wrapped body, one proven
-        // fact per recipient.
-        let body_width = width.saturating_sub(3).max(1);
-        for item in &items {
-            let mut heading = ChatLine::new(ChatLineKind::Message);
-            heading.push(if item.is_selected { "> " } else { "  " }, ChatInk::Accent);
-            heading.push(
-                chip(&item.sender_avatar),
-                ChatInk::Avatar(item.sender_label.clone()),
-            );
-            heading.push(" ", ChatInk::Text);
-            heading.push(&item.sender_label, ChatInk::Role(item.sender_label.clone()));
-            heading.push(" → ", ChatInk::Dim);
-            if item.is_broadcast {
-                heading.push("@all", ChatInk::Accent);
-                heading.push(format!(" ({})", item.recipients.len()), ChatInk::Dim);
-            } else if let Some(r) = item.recipients.first() {
-                heading.push(chip(&r.avatar), ChatInk::Avatar(r.label.clone()));
-                heading.push(" ", ChatInk::Text);
-                heading.push(&r.label, ChatInk::Role(r.label.clone()));
-            }
-            let time = format_time(item.ts, now_ms);
-            let used = heading.width();
-            let time_w = display_width(&time);
-            if used + 2 + time_w <= width {
-                heading.push(" ".repeat(width - used - time_w), ChatInk::Text);
-            } else {
-                heading.push("  ", ChatInk::Text);
-            }
-            heading.push(time, ChatInk::Dim);
-            timeline.push(heading.fitted(width));
-            if item.is_selected {
-                selected_anchor_line = Some(timeline.len().saturating_sub(1));
-            }
-
-            if let Some(ref reply) = item.reply_to {
-                let mut line = ChatLine::new(ChatLineKind::Message);
-                line.push("   ↳ reply to ", ChatInk::Dim);
-                line.push(short_id(reply), ChatInk::Dim);
-                timeline.push(line.fitted(width));
-            }
-
-            // Expose authorized thread history if present in detail
-            for entry in &item.thread_history {
-                let entry_avatar = Avatar::from_label(&entry.sender_label);
-                let mut line = ChatLine::new(ChatLineKind::Message);
-                line.push("   ", ChatInk::Text);
-                line.push(
-                    chip(&entry_avatar),
-                    ChatInk::Avatar(entry.sender_label.clone()),
-                );
-                line.push(" ", ChatInk::Text);
-                line.push(
-                    &entry.sender_label,
-                    ChatInk::Role(entry.sender_label.clone()),
-                );
-                line.push("  ", ChatInk::Text);
-                line.push(format_time(entry.ts, now_ms), ChatInk::Dim);
-                timeline.push(line.fitted(width));
-                if let Some(ref b) = entry.body {
-                    for row in wrap_words(b, width.saturating_sub(5).max(1)) {
-                        let mut line = ChatLine::new(ChatLineKind::Message);
-                        line.push("     ", ChatInk::Text);
-                        line.push(row, ChatInk::Text);
-                        timeline.push(line.fitted(width));
-                    }
-                }
-            }
-
-            // If message body is authorized, expose it; otherwise show metadata subject
-            if let Some(ref body) = item.authorized_body {
-                let show_subject = item.reply_to.is_none()
-                    && item
-                        .subject
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .is_some_and(|s| s != "Direct Message" && !body.starts_with(s));
-                if show_subject {
-                    if let Some(ref subj) = item.subject {
-                        for row in wrap_words(subj, body_width) {
-                            let mut line = ChatLine::new(ChatLineKind::Message);
-                            line.push("   ", ChatInk::Text);
-                            line.push(row, ChatInk::Role(item.sender_label.clone()));
-                            timeline.push(line.fitted(width));
-                        }
-                    }
-                }
-                for row in wrap_words(body, body_width) {
-                    let mut line = ChatLine::new(ChatLineKind::Message);
-                    line.push("   ", ChatInk::Text);
-                    line.push(row, ChatInk::Text);
-                    timeline.push(line.fitted(width));
-                }
-            } else if let Some(words) = item.subject.as_deref() {
-                for row in wrap_words(words, body_width) {
-                    let mut line = ChatLine::new(ChatLineKind::Message);
-                    line.push("   ", ChatInk::Text);
-                    line.push(row, ChatInk::Text);
-                    timeline.push(line.fitted(width));
-                }
-            }
-
-            // Recipient delivery truth states
-            for r in &item.recipients {
-                let status_label = proven_status_label(r.mailbox, r.wake);
-                let (glyph, ink) = status_ink(r);
-                let mut line = ChatLine::new(ChatLineKind::Status);
-                if item.is_broadcast {
-                    line.push(if r.is_selected { "  > " } else { "    " }, ChatInk::Accent);
-                    line.push(&r.label, ChatInk::Role(r.label.clone()));
-                    if let Some(pane) = r.recipient.pane_id() {
-                        line.push(format!(" ({pane})"), ChatInk::Dim);
-                    } else if r.recipient.is_admin() {
-                        line.push(" [admin]", ChatInk::Dim);
-                    } else if r.recipient.is_headless() {
-                        line.push(" (headless)", ChatInk::Dim);
-                    }
-                    line.push(" ", ChatInk::Text);
-                } else {
-                    line.push("   ", ChatInk::Text);
-                }
-                line.push(glyph, ink.clone());
-                line.push(" ", ChatInk::Text);
-                line.push(status_label, ink);
-                line.push(" · ", ChatInk::Dim);
-                line.push(short_id(&item.message_id), ChatInk::Dim);
-                // The hold rides the status line it qualifies instead of
-                // claiming a row of its own. Same words, same causes, one
-                // line: a message used to spend two rows on transport for
-                // every one row of what it said.
-                if r.is_attention || r.cause.is_some() {
-                    line.push(" · ", ChatInk::Dim);
-                    line.push(
-                        held_words(r, status_label, pending_behind(r)),
-                        held_ink(r.updated_at, now_ms),
-                    );
-                }
-                timeline.push(line.fitted(width));
-                if r.is_selected {
-                    selected_anchor_line = Some(timeline.len().saturating_sub(1));
-                }
-            }
-            timeline.push(plain(ChatLineKind::Blank, "", width));
-        }
+        out.push(line);
     }
-
-    // Viewport slicing for timeline
-    let total_lines = timeline.len();
-    let start_line = timeline_viewport_top(total_lines, timeline_height, selected_anchor_line);
-    out.extend(timeline.into_iter().skip(start_line).take(timeline_height));
-
-    // Fill blank space if timeline is shorter than allocated height
     while out.len() < 1 + timeline_height {
         out.push(plain(ChatLineKind::Blank, "", width));
     }
 
-    // 3. Status row (if present)
+    // 4. Status row (if present)
     if let Some(status_text) = status {
         let mut line = ChatLine::new(ChatLineKind::Notice);
         line.push(status_text, hint_ink(status_text));
         out.push(line.fitted(width));
     }
 
-    // 4. Bottom Bounded Composer
+    // 5. Bottom bounded composer, or the rule and the action strip.
     let rule = "─".repeat(width);
     match composer.and_then(|c| c.mode.as_ref().map(|mode| (c, mode))) {
         Some((c, mode)) => {
@@ -1545,7 +1978,14 @@ pub fn render_chat_lines(
     }
 
     out.truncate(height);
-    out
+    ChatFrame {
+        lines: out,
+        viewport: ChatViewport {
+            top,
+            visible: timeline_height,
+            total,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1570,6 +2010,7 @@ mod strip_tests {
                 ChatAction::Reply,
                 ChatAction::Announce,
                 ChatAction::Open,
+                ChatAction::Body,
                 ChatAction::Clear,
                 ChatAction::Sessions,
             ],
@@ -1884,7 +2325,7 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(
-            joined.contains("operator →  CL  claude"),
+            joined.contains("operator → claude"),
             "a single-recipient message names its one recipient:\n{joined}"
         );
         assert!(
@@ -1896,8 +2337,8 @@ mod tests {
             "the direction is the address, not a tag:\n{joined}"
         );
         assert!(
-            joined.contains(" CL "),
-            "an unproven claude label must use initials"
+            joined.contains(" OP "),
+            "an unproven label must use initials"
         );
         assert!(
             !joined.contains('✳'),
@@ -2049,46 +2490,85 @@ mod tests {
         )
         .unwrap();
         let registry = AvatarRegistry::default();
+        // The full view spells out every recipient of a broadcast; the
+        // compact one keeps only the holds, so the per-recipient cursor
+        // is a full-view fact.
+        let context = || {
+            ChatRenderContext::new(&registry)
+                .at(1_010_000)
+                .with_show_bodies(true)
+        };
 
         assert!(queue.select(&QueueTarget::new(message.clone(), claude)));
-        let claude_frame = render_chat(
-            &queue,
-            ChatRenderContext::new(&registry).at(1_010_000),
-            80,
-            20,
-        )
-        .join("\n");
-        assert!(claude_frame.contains("  > claude"), "{claude_frame}");
-        assert!(!claude_frame.contains("  > codex"), "{claude_frame}");
-        let claude_narrow = render_chat(
-            &queue,
-            ChatRenderContext::new(&registry).at(1_010_000),
-            18,
-            10,
-        )
-        .join("\n");
-        assert!(claude_narrow.contains("-> >claude +1"), "{claude_narrow}");
+        let claude_frame = render_chat(&queue, context(), 80, 20).join("\n");
+        assert!(claude_frame.contains(">   claude"), "{claude_frame}");
+        assert!(!claude_frame.contains(">   codex"), "{claude_frame}");
+        let claude_narrow = render_chat(&queue, context(), 18, 14).join("\n");
+        assert!(claude_narrow.contains(">-> claude"), "{claude_narrow}");
+        assert!(claude_narrow.contains(" -> codex"), "{claude_narrow}");
         assert_eq!(queue.freeze().unwrap().target.recipient(), Some(claude));
 
         assert!(queue.select(&QueueTarget::new(message, codex)));
-        let codex_frame = render_chat(
-            &queue,
-            ChatRenderContext::new(&registry).at(1_010_000),
-            80,
-            20,
-        )
-        .join("\n");
-        assert!(codex_frame.contains("  > codex"), "{codex_frame}");
-        assert!(!codex_frame.contains("  > claude"), "{codex_frame}");
-        let codex_narrow = render_chat(
-            &queue,
-            ChatRenderContext::new(&registry).at(1_010_000),
-            18,
-            10,
-        )
-        .join("\n");
-        assert!(codex_narrow.contains("-> >codex +1"), "{codex_narrow}");
+        let codex_frame = render_chat(&queue, context(), 80, 20).join("\n");
+        assert!(codex_frame.contains(">   codex"), "{codex_frame}");
+        assert!(!codex_frame.contains(">   claude"), "{codex_frame}");
+        let codex_narrow = render_chat(&queue, context(), 18, 14).join("\n");
+        assert!(codex_narrow.contains(">-> codex"), "{codex_narrow}");
         assert_eq!(queue.freeze().unwrap().target.recipient(), Some(codex));
+    }
+
+    /// The cursor is painted when the frame is cut, not when the timeline
+    /// is built: one build serves every cursor position.
+    #[test]
+    fn the_cursor_moves_without_rebuilding_the_timeline() {
+        let mut queue = make_test_queue();
+        let registry = AvatarRegistry::default();
+        let context = ChatRenderContext::new(&registry).at(1_010_000);
+        let timeline = build_chat_timeline(&queue, context, 80);
+        assert!(
+            timeline
+                .lines
+                .iter()
+                .all(|line| !line.text().starts_with('>')),
+            "a built timeline carries no cursor"
+        );
+        let first = queue.selected().unwrap().target.clone();
+        let before = render_chat_frame(&timeline, &queue, context, 80, 20, None);
+        queue.select_next();
+        assert_ne!(queue.selected().unwrap().target, first);
+        let after = render_chat_frame(&timeline, &queue, context, 80, 20, None);
+        let marked = |frame: &ChatFrame| {
+            frame
+                .lines
+                .iter()
+                .position(|line| line.text().starts_with('>'))
+                .expect("one row carries the cursor")
+        };
+        assert_eq!(marked(&before) + 1, marked(&after));
+        assert_eq!(
+            timeline,
+            build_chat_timeline(&queue, context, 80),
+            "the selection did not change what was built"
+        );
+    }
+
+    /// The wheel moves the window, and the window is clamped to the
+    /// timeline, so a scroll past either end lands on that end.
+    #[test]
+    fn a_scrolled_window_is_clamped_to_the_timeline() {
+        let queue = make_test_queue();
+        let registry = AvatarRegistry::default();
+        let context = ChatRenderContext::new(&registry)
+            .at(1_010_000)
+            .with_show_bodies(true);
+        let timeline = build_chat_timeline(&queue, context, 80);
+        let total = timeline.lines.len();
+        let frame = render_chat_frame(&timeline, &queue, context, 80, 8, Some(usize::MAX));
+        assert_eq!(frame.viewport.total, total);
+        assert_eq!(frame.viewport.top, total - frame.viewport.visible);
+        let frame = render_chat_frame(&timeline, &queue, context, 80, 8, Some(0));
+        assert_eq!(frame.viewport.top, 0);
+        assert_eq!(frame.lines.len(), 8);
     }
 
     #[test]
@@ -2176,7 +2656,7 @@ mod tests {
                 height,
             );
             // Narrow rows carry the id's tail on the marked row; wide rows
-            // carry its head on the status row under the marked heading.
+            // carry the whole id on the marked heading.
             let selected_id = if width < 24 { "000000" } else { "m-00000000" };
             let marked = frame.iter().position(|line| line.starts_with('>'));
             assert!(
@@ -2686,9 +3166,21 @@ mod tests {
         );
         let text: String = carrying[0].spans.iter().map(|s| s.text.as_str()).collect();
         assert!(
-            text.contains("m-0000") && text.contains("held: verify failed"),
+            text.contains("Claimed") && text.contains("held: verify failed"),
             "the hold must sit on the same line as the delivery status it qualifies: {text}"
         );
+        // Compact keeps the hold line: it is what needs a person. The
+        // subject and the full id are on the heading above it.
+        let heading = lines
+            .iter()
+            .position(|l| l.text().contains("held-agent"))
+            .expect("the heading names the recipient");
+        let heading_text = lines[heading].text();
+        assert!(
+            heading_text.contains("m-0000000000000001") && heading_text.contains("Subject that"),
+            "{heading_text}"
+        );
+        assert!(lines[heading + 1].text().contains("held: verify failed"));
     }
 
     /// Decay is about attention, never about truth.
@@ -2837,10 +3329,32 @@ mod tests {
         });
 
         let reg = AvatarRegistry::default();
+        // Compact: the open detail's own body shows under its heading
+        // because opening it was the ask; the thread's other body waits
+        // for the full view.
+        let compact = render_chat(
+            &queue,
+            ChatRenderContext::new(&reg)
+                .with_detail(&detail)
+                .at(1_010_000),
+            80,
+            25,
+        )
+        .join("\n");
+        assert!(
+            compact.contains("Looks great, approved with one nit."),
+            "the open detail's body shows in the compact view: {compact}"
+        );
+        assert!(
+            !compact.contains("Line 1 of implementation"),
+            "a thread body stays folded in the compact view: {compact}"
+        );
+
         let lines = render_chat(
             &queue,
             ChatRenderContext::new(&reg)
                 .with_detail(&detail)
+                .with_show_bodies(true)
                 .at(1_010_000),
             80,
             25,

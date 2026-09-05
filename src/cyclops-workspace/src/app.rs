@@ -232,6 +232,11 @@ enum AppMsg {
         target: cyclops_ui::FrozenTarget,
         outcome: cyclops_ui::ActionOutcome,
     },
+    /// One `msg.read` answered, for the Messages pane's full view.
+    MessageBodyFinished {
+        message_id: cyclops_proto::MessageId,
+        outcome: cyclops_ui::ActionOutcome,
+    },
     /// Messages group-chat composer send outcome from background worker.
     MessagesSendFinished {
         attempt: MessagesSendAttempt,
@@ -620,6 +625,58 @@ struct App {
     message_detail_in_flight: Option<cyclops_ui::FrozenTarget>,
     /// Exact uncertain draft whose reconciliation waits for a current snapshot.
     messages_reconcile_owed: Option<MessagesDraftIdentity>,
+    /// Bodies read through `msg.read` for the Messages pane's full view.
+    /// Per id for the life of the workspace; cleared on a daemon
+    /// reconnect so a refusal from a daemon that is gone is asked again.
+    messages_bodies: cyclops_ui::MessageBodies,
+    /// The worker that performs those reads, one at a time.
+    message_body_tx: Option<mpsc::Sender<cyclops_proto::MessageId>>,
+    /// Counts every change to `messages_detail`, so the timeline cache
+    /// can compare a number instead of the detail.
+    messages_detail_revision: u64,
+    /// The timeline the last frame was cut from, with what it was built
+    /// from. Rebuilt only when that key changes; every other frame only
+    /// cuts a window out of it.
+    messages_timeline: Option<(MessagesTimelineKey, cyclops_ui::ChatTimeline)>,
+    /// A timeline window the operator moved with the wheel. `None`
+    /// follows the selection, which is where the keyboard leaves it.
+    messages_scroll_top: Option<usize>,
+    /// The window the last frame showed, for the wheel to move from.
+    messages_viewport: cyclops_ui::ChatViewport,
+    /// What the queue's session filter was last derived from. While it
+    /// is unchanged the derivation is skipped, not merely its result.
+    messages_filter_key: Option<MessagesFilterKey>,
+    /// Manifest per pane id, rebuilt when the decoration is replaced.
+    pane_manifests: std::collections::HashMap<String, String>,
+    /// Counts decoration replacements, so anything derived from the
+    /// decoration can tell a new one from the last by comparing a number.
+    decoration_revision: u64,
+}
+
+/// What the Messages timeline was built from. Two equal keys mean the
+/// same lines, so a frame whose key matches the cached one reuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessagesTimelineKey {
+    queue_revision: u64,
+    width: usize,
+    view_journal: bool,
+    show_bodies: bool,
+    bodies_revision: u64,
+    detail_revision: u64,
+    decoration_revision: u64,
+    /// The clock the relative times are formatted from, whole seconds:
+    /// the finest step any of those words change on.
+    second: Option<u64>,
+}
+
+/// What the Messages pane's session filter is derived from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessagesFilterKey {
+    scoped: bool,
+    decoration_revision: u64,
+    active_workspace: usize,
+    name: String,
+    window_ids: Vec<String>,
 }
 
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
@@ -1127,6 +1184,35 @@ pub async fn run_async() -> i32 {
         }
     });
 
+    // Body reads are operator-paced (one `b`, one snapshot) but can come
+    // in a batch of a hundred, so the lane is deep enough to hold a whole
+    // snapshot's worth; a read that finds it full is asked again on the
+    // next frame.
+    let (message_body_tx, mut message_body_rx) = mpsc::channel::<cyclops_proto::MessageId>(256);
+    let msg_body_socket = home.join(cyclops_proto::SOCK_NAME);
+    let msg_body_results = action_tx.clone();
+    tokio::spawn(async move {
+        while let Some(message_id) = message_body_rx.recv().await {
+            let outcome = cyclops_ui::perform(
+                &msg_body_socket,
+                cyclops_ui::ActionRequest::ReadBody {
+                    message_id: message_id.clone(),
+                },
+            )
+            .await;
+            if msg_body_results
+                .send(AppMsg::MessageBodyFinished {
+                    message_id,
+                    outcome,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
     let terminal_input_gate = pane_input_gate.clone();
     std::thread::spawn(move || loop {
         match event::read() {
@@ -1382,15 +1468,26 @@ pub async fn run_async() -> i32 {
         message_detail_tx: Some(message_detail_tx),
         message_detail_in_flight: None,
         messages_reconcile_owed: None,
+        messages_bodies: cyclops_ui::MessageBodies::default(),
+        message_body_tx: Some(message_body_tx),
+        messages_detail_revision: 0,
+        messages_timeline: None,
+        messages_scroll_top: None,
+        messages_viewport: cyclops_ui::ChatViewport::default(),
+        messages_filter_key: None,
+        pane_manifests: std::collections::HashMap::new(),
+        decoration_revision: 0,
     };
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
-    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_else(|error| {
-        log_err(&app.home, &format!("decoration refresh failed: {error}"));
-        DecorationSnapshot::default()
-    });
+    app.set_decoration(
+        decoration::fetch_decoration(&app.home).unwrap_or_else(|error| {
+            log_err(&app.home, &format!("decoration refresh failed: {error}"));
+            DecorationSnapshot::default()
+        }),
+    );
     if app.model.messages_visible {
         app.messages_gate.mark_dirty();
         pump_messages_refresh(&mut app);
@@ -2618,6 +2715,19 @@ impl App {
         self.repaint_requested = true;
     }
 
+    /// Replace the decoration and everything derived from it in one
+    /// place: the manifest table the Messages pane resolves avatars
+    /// through, and the revision its caches compare.
+    pub(crate) fn set_decoration(&mut self, snapshot: DecorationSnapshot) {
+        self.pane_manifests = snapshot
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| pane.manifest.as_ref().map(|m| (id.clone(), m.clone())))
+            .collect();
+        self.decoration = snapshot;
+        self.decoration_revision = self.decoration_revision.wrapping_add(1);
+    }
+
     fn save_prefs_or_log(&self) {
         if let Err(error) = persist::save_prefs(&self.home, &self.prefs) {
             log_err(&self.home, &error);
@@ -3010,6 +3120,7 @@ fn queue_message_detail(
     target: cyclops_ui::FrozenTarget,
 ) {
     debug_assert_eq!(&row.target, &target.target);
+    app.messages_detail_revision = app.messages_detail_revision.wrapping_add(1);
     let mut detail = cyclops_ui::Detail::open(&row, target.watermark);
     if !app.messages_gate.may_mutate() {
         detail.not_sent(
@@ -3061,6 +3172,7 @@ fn finish_message_detail(
         return;
     }
     app.message_detail_in_flight = None;
+    app.messages_detail_revision = app.messages_detail_revision.wrapping_add(1);
     let Some(detail) = app
         .messages_detail
         .as_mut()
@@ -3480,6 +3592,13 @@ async fn handle_app_msg(
         }
         AppMsg::MessageDetailFinished { target, outcome } => {
             finish_message_detail(app, target, outcome);
+            arm(debounce);
+        }
+        AppMsg::MessageBodyFinished {
+            message_id,
+            outcome,
+        } => {
+            finish_message_body(app, message_id, outcome);
             arm(debounce);
         }
         AppMsg::MessagesSendFinished { attempt, outcome } => {
@@ -4253,6 +4372,24 @@ async fn handle_mouse(
                     app.drag = Some(DragState::on_down(DragTarget::Messages, col, row));
                     return Ok(());
                 }
+                // A click in the pane is the statement a click on a canvas
+                // is: this is where the operator is working. On a row it
+                // also picks that row, and holds the window where it is so
+                // the rows do not move out from under the pointer.
+                HitTarget::MessagesBody => {
+                    app.close_menu();
+                    clear_selection(app);
+                    app.messages_focused = true;
+                    return Ok(());
+                }
+                HitTarget::MessagesRow { target } => {
+                    app.close_menu();
+                    clear_selection(app);
+                    app.messages_focused = true;
+                    app.messages_scroll_top = Some(app.messages_viewport.top);
+                    app.messages_queue.select(target);
+                    return Ok(());
+                }
                 HitTarget::SidebarSplit => {
                     app.close_menu();
                     clear_selection(app);
@@ -4759,6 +4896,7 @@ async fn handle_messages_key(
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
             if app.messages_detail.is_some() {
                 app.messages_detail = None;
+                app.messages_detail_revision = app.messages_detail_revision.wrapping_add(1);
                 return Ok(Some(InputOutcome::Redraw));
             }
             // Return keyboard focus to active terminal pane
@@ -4824,6 +4962,7 @@ async fn handle_messages_key(
                 detail.scroll_by(1);
             } else {
                 app.messages_queue.select_next();
+                follow_messages_selection(app);
             }
             return Ok(Some(InputOutcome::Redraw));
         }
@@ -4832,7 +4971,21 @@ async fn handle_messages_key(
                 detail.scroll_by(-1);
             } else {
                 app.messages_queue.select_previous();
+                follow_messages_selection(app);
             }
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('b') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.prefs.messages_show_bodies = !app.prefs.messages_show_bodies;
+            app.save_prefs_or_log();
+            request_message_bodies(app);
+            let mode = if app.prefs.messages_show_bodies {
+                "bodies shown"
+            } else {
+                "compact rows"
+            };
+            app.notice
+                .show(format!("Messages view: {mode}"), Instant::now());
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4865,6 +5018,7 @@ async fn handle_messages_key(
                 rows: Vec::new(),
             });
             app.messages_detail = None;
+            app.messages_detail_revision = app.messages_detail_revision.wrapping_add(1);
             app.save_prefs_or_log();
             app.notice.show(
                 "Messages cleared from this view; durable history was preserved",
@@ -4889,6 +5043,90 @@ fn apply_messages_presentation_cutoff(
 ) -> cyclops_ui::Snapshot {
     snapshot.rows.retain(|row| row.seq > cleared_through_seq);
     snapshot
+}
+
+/// Ask the daemon for every visible body the full view does not have
+/// yet. Nothing is claimed: `msg.read` is the operator's own read, and
+/// the daemon answers with the body or a refusal, which the row then
+/// shows as `body unavailable`.
+///
+/// Called before a frame is cut and on the toggle, so a snapshot that
+/// arrives while bodies are shown is filled in without a keypress. Cheap
+/// when there is nothing to ask: one table lookup per visible row.
+fn request_message_bodies(app: &mut App) {
+    if !app.prefs.messages_show_bodies {
+        return;
+    }
+    let wanted: Vec<cyclops_proto::MessageId> = app
+        .messages_queue
+        .visible()
+        .map(|row| &row.message_id)
+        .filter(|id| !app.messages_bodies.contains(id))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let Some(tx) = &app.message_body_tx else {
+        return;
+    };
+    for message_id in wanted {
+        // A full lane is left alone: the id stays absent and the next
+        // frame asks again.
+        if tx.try_send(message_id.clone()).is_ok() {
+            app.messages_bodies
+                .set(message_id, cyclops_ui::BodyState::Loading);
+        }
+    }
+}
+
+/// Record what one body read came back with. A refusal (`forbidden`, an
+/// older daemon's `unknown_method`) is an answer the row shows; a read
+/// that never reached the daemon is forgotten so it is asked again.
+fn finish_message_body(
+    app: &mut App,
+    message_id: cyclops_proto::MessageId,
+    outcome: cyclops_ui::ActionOutcome,
+) {
+    let state = match outcome {
+        cyclops_ui::ActionOutcome::Opened(loaded) => cyclops_ui::BodyState::Loaded(loaded.body),
+        cyclops_ui::ActionOutcome::Refused { .. } | cyclops_ui::ActionOutcome::Done(_) => {
+            cyclops_ui::BodyState::Unavailable
+        }
+        cyclops_ui::ActionOutcome::NotSent(_) | cyclops_ui::ActionOutcome::Uncertain(_) => {
+            app.messages_bodies.forget_loading(&message_id);
+            return;
+        }
+    };
+    app.messages_bodies.set(message_id, state);
+}
+
+/// Move the Messages timeline window by `lines`, clamped to the timeline
+/// the last frame showed.
+fn scroll_messages(app: &mut App, lines: i32) {
+    let viewport = app.messages_viewport;
+    let last_top = viewport.total.saturating_sub(viewport.visible);
+    let top = (viewport.top as i64 + i64::from(lines)).clamp(0, last_top as i64) as usize;
+    app.messages_scroll_top = Some(top);
+}
+
+/// After the keyboard moved the selection: keep a wheel-scrolled window
+/// while the selection is still inside it, and let go of it when the
+/// selection left, so the next frame centers on the selection again.
+fn follow_messages_selection(app: &mut App) {
+    let Some(top) = app.messages_scroll_top else {
+        return;
+    };
+    let selected = app.messages_queue.selected().map(|row| &row.target);
+    let anchor = app
+        .messages_timeline
+        .as_ref()
+        .and_then(|(_, timeline)| timeline.anchor_line(selected));
+    let inside =
+        anchor.is_some_and(|line| line >= top && line < top + app.messages_viewport.visible);
+    if !inside {
+        app.messages_scroll_top = None;
+    }
 }
 
 /// The session filter the Messages pane should apply right now: the active
@@ -4922,7 +5160,34 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
     ))
 }
 
+/// Give the queue the session filter for the frame about to be drawn.
+///
+/// Derived only when what it is derived from changed: the operator's
+/// choice, the decoration (the live pane table), or the active workspace
+/// and its windows. Between those the frame costs one comparison, not a
+/// pane walk and a set build the queue would then discard as equal.
 fn sync_messages_session_filter(app: &mut App) {
+    let workspace = app.model.workspaces.get(app.model.active_workspace);
+    let unchanged = match (&app.messages_filter_key, workspace) {
+        (Some(key), Some(workspace)) => {
+            key.scoped == app.messages_session_scoped
+                && key.decoration_revision == app.decoration_revision
+                && key.active_workspace == app.model.active_workspace
+                && key.name == workspace.name
+                && key.window_ids == workspace.window_ids
+        }
+        _ => false,
+    };
+    if unchanged {
+        return;
+    }
+    app.messages_filter_key = workspace.map(|workspace| MessagesFilterKey {
+        scoped: app.messages_session_scoped,
+        decoration_revision: app.decoration_revision,
+        active_workspace: app.model.active_workspace,
+        name: workspace.name.clone(),
+        window_ids: workspace.window_ids.clone(),
+    });
     let filter = messages_session_filter(app);
     app.messages_queue.set_session_filter(filter);
 }
@@ -5497,7 +5762,7 @@ fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
     {
         crate::sound::play(&app.home, &app.prefs.sound);
     }
-    app.decoration = snapshot;
+    app.set_decoration(snapshot);
 }
 
 /// The daemon subscription (re)connected: pull back what the outage lost
@@ -5528,6 +5793,9 @@ fn apply_daemon_reconnected(app: &mut App) {
     app.messages_gate.connected();
     app.messages_gate.mark_dirty();
     pump_messages_refresh(app);
+    // A refusal recorded against the daemon that went away says nothing
+    // about this one; the next frame asks again.
+    app.messages_bodies = cyclops_ui::MessageBodies::default();
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
@@ -5597,7 +5865,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // reconcile that cannot reach the daemon knows nothing new about the
     // roster, and blanking it would un-name every agent on screen.
     match decoration::fetch_decoration(&app.home) {
-        Ok(snapshot) => app.decoration = snapshot,
+        Ok(snapshot) => app.set_decoration(snapshot),
         Err(error) => log_err(&app.home, &format!("decoration reconcile failed: {error}")),
     }
     app.persist_active();
@@ -6177,8 +6445,12 @@ fn draw<B: Backend>(
     motion.observe(observed(app), now);
     app.hit_map.clear();
     // Before the frame, not during it: the Messages pane's session filter
-    // follows the live pane table, and the queue takes it by value.
+    // follows the live pane table, and the queue takes it by value. The
+    // full view's missing bodies are asked for here for the same reason.
     sync_messages_session_filter(app);
+    if app.model.messages_visible {
+        request_message_bodies(app);
+    }
     let mut shown_cursor: Option<crate::render::HostCursor> = None;
     // The whole call, write and flush included: what the slow-terminal
     // latch measures is the cost of putting a frame on the wire, not the
@@ -6235,12 +6507,6 @@ fn draw<B: Backend>(
                 );
             }
             if let Some(messages) = areas.messages {
-                let pane_manifests: std::collections::HashMap<String, String> = app
-                    .decoration
-                    .panes
-                    .iter()
-                    .filter_map(|(id, p)| p.manifest.as_ref().map(|m| (id.clone(), m.clone())))
-                    .collect();
                 let refresh_status = app
                     .messages_refresh_error
                     .as_ref()
@@ -6254,17 +6520,50 @@ fn draw<B: Backend>(
                         .then_some("daemon reconnecting")
                         .or(visible_notice)
                 });
-                paint_messages(
-                    &app.messages_queue,
-                    app.messages_detail.as_ref(),
-                    Some(&app.messages_composer),
-                    &app.avatar_registry,
-                    Some(&app.decoration.mailbox_routes),
-                    Some(&pane_manifests),
-                    link_status,
-                    app.messages_refresh_error.is_some(),
-                    app.messages_focused,
-                    app.messages_view_journal,
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64);
+                let mut context = cyclops_ui::ChatRenderContext::new(&app.avatar_registry)
+                    .with_composer(&app.messages_composer)
+                    .with_bodies(&app.messages_bodies)
+                    .with_show_bodies(app.prefs.messages_show_bodies)
+                    .with_view_journal(app.messages_view_journal);
+                context.detail = app.messages_detail.as_ref();
+                context.live_routes = Some(&app.decoration.mailbox_routes);
+                context.pane_manifests = Some(&app.pane_manifests);
+                context.status = link_status;
+                context.retry_available = app.messages_refresh_error.is_some();
+                context.now_ms = now_ms;
+                let width = crate::render::messages_content_width(messages);
+                let key = MessagesTimelineKey {
+                    queue_revision: app.messages_queue.revision(),
+                    width,
+                    view_journal: app.messages_view_journal,
+                    show_bodies: app.prefs.messages_show_bodies,
+                    bodies_revision: app.messages_bodies.revision(),
+                    detail_revision: app.messages_detail_revision,
+                    decoration_revision: app.decoration_revision,
+                    second: now_ms.map(|ms| ms / 1000),
+                };
+                let stale = app
+                    .messages_timeline
+                    .as_ref()
+                    .is_none_or(|(cached, _)| *cached != key);
+                if stale {
+                    let timeline =
+                        cyclops_ui::build_chat_timeline(&app.messages_queue, context, width);
+                    app.messages_timeline = Some((key, timeline));
+                }
+                let (_, timeline) = app.messages_timeline.as_ref().expect("built above");
+                app.messages_viewport = paint_messages(
+                    crate::render::MessagesPaint {
+                        queue: &app.messages_queue,
+                        context,
+                        timeline,
+                        scroll_top: app.messages_scroll_top,
+                        focused: app.messages_focused,
+                    },
                     messages,
                     f.buffer_mut(),
                     &app.paint,
@@ -7849,6 +8148,15 @@ mod tests {
             message_detail_tx: None,
             message_detail_in_flight: None,
             messages_reconcile_owed: None,
+            messages_bodies: cyclops_ui::MessageBodies::default(),
+            message_body_tx: None,
+            messages_detail_revision: 0,
+            messages_timeline: None,
+            messages_scroll_top: None,
+            messages_viewport: cyclops_ui::ChatViewport::default(),
+            messages_filter_key: None,
+            pane_manifests: std::collections::HashMap::new(),
+            decoration_revision: 0,
         }
     }
 
@@ -8309,6 +8617,441 @@ mod tests {
             reply_to: None,
             client_key,
         }
+    }
+
+    /// A hundred direct messages, each to the one agent of `one_pane_model`.
+    fn hundred_messages() -> cyclops_ui::Snapshot {
+        let sender: cyclops_proto::RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0"
+                .parse()
+                .expect("sender");
+        let recipient: cyclops_proto::RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
+                .parse()
+                .expect("recipient");
+        let rows = (0..100u64)
+            .map(|index| {
+                let message =
+                    cyclops_proto::MessageId::new(format!("m-t{:03}-m{index:03}", index / 4))
+                        .expect("message id");
+                cyclops_ui::QueueRow {
+                    target: cyclops_ui::QueueTarget::new(message.clone(), recipient),
+                    message_id: message.clone(),
+                    recipient,
+                    recipient_label: "reviewer".into(),
+                    sender,
+                    sender_label: "coder".into(),
+                    thread_root: message,
+                    thread_message_count: 1,
+                    ts: 1_000_000 + index,
+                    kind: cyclops_proto::Kind::Msg,
+                    recipient_count: 1,
+                    subject: Some(format!("change {index}: please review the diff")),
+                    mailbox: cyclops_ui::MailboxWord::Pending,
+                    wake: cyclops_ui::WakeWord::Queued,
+                    needs_action: true,
+                    seq: index + 1,
+                    updated_at: 1_000_000 + index,
+                    direction: cyclops_ui::Direction::Inbound,
+                    ..cyclops_ui::QueueRow::default()
+                }
+            })
+            .collect();
+        cyclops_ui::Snapshot {
+            watermark: 100,
+            rows,
+        }
+    }
+
+    /// Mean frame time with a full Messages timeline. A number to compare
+    /// across changes, not a gate, so it is ignored by default:
+    /// `cargo test -p cyclops-workspace messages_pane_frame_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn messages_pane_frame_time_with_100_messages() {
+        use ratatui::backend::TestBackend;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-frame-time");
+        let mut app = test_app(one_pane_model(), home);
+        app.model.messages_visible = true;
+        app.prefs.messages_visible = true;
+        app.prefs.messages_width = 40;
+        app.term_size = (80, 40);
+        app.window_focused = false;
+        // Every session: the scoped view needs a daemon session id the
+        // test decoration does not carry, and an empty pane measures
+        // nothing.
+        app.messages_session_scoped = false;
+        app.messages_queue.replace(hundred_messages());
+        app.messages_queue.set_scope(cyclops_ui::Scope::All);
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("warm frame");
+        let frames = 200u32;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        }
+        let mean = started.elapsed() / frames;
+        println!("messages pane frame mean: {mean:?} (100 messages, 80x40, {frames} frames)");
+    }
+
+    /// The first `count` of [`hundred_messages`].
+    fn some_messages(count: usize) -> cyclops_ui::Snapshot {
+        let mut snapshot = hundred_messages();
+        snapshot.rows.truncate(count);
+        snapshot
+    }
+
+    /// An app with the Messages pane open on `count` rows of every
+    /// session, sized so the pane has room beside one agent pane.
+    fn app_with_messages(home: std::path::PathBuf, count: usize, term: (u16, u16)) -> App {
+        let mut model = one_pane_model();
+        model.messages_visible = true;
+        let mut app = test_app(model, home);
+        app.prefs.messages_visible = true;
+        app.prefs.messages_width = term.0 / 2;
+        app.term_size = term;
+        app.window_focused = false;
+        app.messages_session_scoped = false;
+        app.messages_queue.replace(some_messages(count));
+        app.messages_queue.set_scope(cyclops_ui::Scope::All);
+        app
+    }
+
+    /// The text of one row of a test terminal's last frame.
+    fn frame_row(terminal: &Terminal<ratatui::backend::TestBackend>, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|column| buffer[(column, row)].symbol().to_string())
+            .collect()
+    }
+
+    fn frame_text(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let rows = terminal.backend().buffer().area.height;
+        (0..rows)
+            .map(|row| frame_row(terminal, row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first cell whose hit answers `wanted`, scanning rows top down.
+    fn cell_hitting(app: &App, wanted: impl Fn(&HitTarget) -> bool) -> Option<(u16, u16)> {
+        let (cols, rows) = app.term_size;
+        (0..rows)
+            .flat_map(|row| (0..cols).map(move |column| (column, row)))
+            .find(|&(column, row)| app.hit_map.hit(column, row).is_some_and(&wanted))
+    }
+
+    /// A click anywhere in the Messages pane's content is a focus click,
+    /// the way a click on a canvas is; on a row it also picks that row;
+    /// and the wheel over the pane moves its window. The canvas click
+    /// still takes the focus back.
+    #[tokio::test]
+    async fn a_click_in_the_messages_pane_focuses_it_and_a_row_selects_that_row() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use ratatui::backend::TestBackend;
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-messages-click-focus");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-click-focus-home");
+        // Three rows: enough to click one that is not selected, and few
+        // enough to leave empty content under them.
+        let mut app = app_with_messages(home.clone(), 3, (80, 24));
+        app.messages_focused = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        let mut detached = false;
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+
+        // 1. A click on the pane canvas takes the focus away.
+        let (column, row) =
+            cell_hitting(&app, |target| matches!(target, HitTarget::PaneBody { .. }))
+                .expect("a pane canvas");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("canvas click");
+        assert!(!app.messages_focused, "a canvas click unfocuses the pane");
+
+        // 2. A click on a row that is not selected focuses the pane and
+        //    selects that row.
+        let selected = app.messages_queue.selected().unwrap().target.clone();
+        let (column, row) = cell_hitting(
+            &app,
+            |target| matches!(target, HitTarget::MessagesRow { target } if *target != selected),
+        )
+        .expect("an unselected row");
+        let Some(HitTarget::MessagesRow { target: clicked }) =
+            app.hit_map.hit(column, row).cloned()
+        else {
+            unreachable!("found above");
+        };
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("row click");
+        assert!(app.messages_focused, "a row click focuses the pane");
+        assert_eq!(
+            app.messages_queue.selected().map(|row| row.target.clone()),
+            Some(clicked),
+            "the clicked row is selected"
+        );
+
+        // 3. Back to the canvas, then a click on the empty content under
+        //    the rows: focus, and the selection untouched.
+        let (column, row) =
+            cell_hitting(&app, |target| matches!(target, HitTarget::PaneBody { .. }))
+                .expect("a pane canvas");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("canvas click");
+        assert!(!app.messages_focused);
+        let before = app.messages_queue.selected().map(|row| row.target.clone());
+        let (column, row) = cell_hitting(&app, |target| matches!(target, HitTarget::MessagesBody))
+            .expect("empty content under the rows");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("body click");
+        assert!(
+            app.messages_focused,
+            "a click under the rows focuses the pane"
+        );
+        assert_eq!(
+            app.messages_queue.selected().map(|row| row.target.clone()),
+            before
+        );
+
+        // 4. The wheel over the pane moves its window, once there is more
+        //    timeline than pane.
+        app.messages_queue.replace(hundred_messages());
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        assert!(app.messages_viewport.total > app.messages_viewport.visible);
+        let (column, row) = cell_hitting(&app, |target| {
+            matches!(target, HitTarget::MessagesRow { .. })
+        })
+        .expect("a row");
+        let top_row_before = frame_row(&terminal, row);
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::ScrollDown, column, row),
+            &mut detached,
+        )
+        .await
+        .expect("wheel");
+        assert_eq!(
+            app.messages_scroll_top,
+            Some(crate::action::SCROLL_LINES as usize)
+        );
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        assert_ne!(
+            frame_row(&terminal, row),
+            top_row_before,
+            "the rows moved under the pointer"
+        );
+        assert_eq!(
+            app.messages_viewport.top,
+            crate::action::SCROLL_LINES as usize
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// `b` asks the daemon for every visible body, shows what it answers
+    /// under the headings (a refusal as one dim line), hides them again on
+    /// the next `b`, and the choice survives a restart.
+    #[tokio::test]
+    async fn b_shows_bodies_read_from_the_daemon_and_hides_them_again() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-bodies");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch");
+        // Wide enough for a compact heading to carry the full id.
+        let mut app = app_with_messages(home.clone(), 3, (120, 24));
+        app.messages_focused = true;
+        let (tx, mut asked) = mpsc::channel(8);
+        app.message_body_tx = Some(tx);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        let visible: Vec<cyclops_proto::MessageId> = app
+            .messages_queue
+            .visible()
+            .map(|row| row.message_id.clone())
+            .collect();
+
+        let b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        handle_messages_key(&mut app, b).await.expect("toggle on");
+        assert!(app.prefs.messages_show_bodies);
+        assert!(
+            persist::load_prefs(&home).messages_show_bodies,
+            "the choice is written to config.toml"
+        );
+        let mut requested = Vec::new();
+        while let Ok(id) = asked.try_recv() {
+            requested.push(id);
+        }
+        assert_eq!(requested, visible, "every visible body is asked for, once");
+
+        // Nothing has answered yet: headings only, no body lines.
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        let text = frame_text(&terminal);
+        assert!(!text.contains("body unavailable"), "{text}");
+
+        // The daemon answers one read with the claim's message shape, and
+        // refuses another.
+        let answer: cyclops_proto::InboxMessage = serde_json::from_value(serde_json::json!({
+            "message_id": visible[0].as_str(),
+            "kind": "msg",
+            "sender_label": "coder",
+            "subject": "change 0: please review the diff",
+            "body": "Please look at line 42 before merging.",
+            "thread_root": visible[0].as_str(),
+        }))
+        .expect("an inbox message");
+        finish_message_body(
+            &mut app,
+            answer.message_id.clone(),
+            cyclops_ui::ActionOutcome::Opened(Box::new(cyclops_ui::Loaded {
+                body: answer.body.clone(),
+                body_authorized: true,
+                ..cyclops_ui::Loaded::default()
+            })),
+        );
+        finish_message_body(
+            &mut app,
+            visible[1].clone(),
+            cyclops_ui::ActionOutcome::Refused {
+                code: "forbidden".into(),
+                message: "not yours to read".into(),
+            },
+        );
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        let text = frame_text(&terminal);
+        assert!(
+            text.contains("Please look at line 42"),
+            "the read body renders under its heading:\n{text}"
+        );
+        assert!(
+            text.contains("body unavailable"),
+            "a refused read says so in one line:\n{text}"
+        );
+        assert!(
+            !text.contains("not yours to read"),
+            "the refusal's words are not shown, and no dialog opened:\n{text}"
+        );
+        assert!(app.dialog.is_none());
+
+        // The answers are kept; nothing is asked twice.
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        assert!(
+            asked.try_recv().is_err(),
+            "an answered body is not asked again"
+        );
+
+        handle_messages_key(&mut app, b).await.expect("toggle off");
+        assert!(!app.prefs.messages_show_bodies);
+        assert!(!persist::load_prefs(&home).messages_show_bodies);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        let text = frame_text(&terminal);
+        assert!(!text.contains("Please look at line 42"), "{text}");
+        assert!(!text.contains("body unavailable"), "{text}");
+        assert!(
+            text.contains(visible[0].as_str()),
+            "the compact heading carries the full id:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// One built timeline serves every frame whose inputs did not change,
+    /// and the manifest table follows the decoration rather than the
+    /// frame.
+    #[test]
+    fn frames_reuse_the_built_timeline_until_an_input_changes() {
+        use ratatui::backend::TestBackend;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-timeline-cache");
+        let mut app = app_with_messages(home, 5, (80, 24));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        let first = app.messages_timeline.clone().expect("built");
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        let second = app.messages_timeline.clone().expect("built");
+        assert_eq!(first.0, second.0, "nothing changed, so the key is the same");
+        app.messages_queue.select_next();
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        assert_eq!(
+            first.0,
+            app.messages_timeline.as_ref().unwrap().0,
+            "the cursor moving does not rebuild"
+        );
+        app.messages_queue.set_scope(cyclops_ui::Scope::Work);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("frame");
+        assert_ne!(
+            first.0,
+            app.messages_timeline.as_ref().unwrap().0,
+            "a scope change rebuilds"
+        );
+
+        let mut snapshot = DecorationSnapshot::default();
+        snapshot.panes.insert(
+            "%0".into(),
+            crate::decoration::PaneDecoration {
+                pane_id: "%0".into(),
+                window_id: "@0".into(),
+                label: Some("reviewer".into()),
+                manifest: Some("claude".into()),
+                manifest_display_name: None,
+                state: cyclops_proto::AgentState::Idle,
+                needs_attention: false,
+            },
+        );
+        let revision = app.decoration_revision;
+        app.set_decoration(snapshot);
+        assert_eq!(
+            app.pane_manifests.get("%0").map(String::as_str),
+            Some("claude")
+        );
+        assert_eq!(app.decoration_revision, revision + 1);
     }
 
     #[test]

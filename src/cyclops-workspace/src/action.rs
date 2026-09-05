@@ -285,6 +285,11 @@ pub enum Action {
     /// One verb clicked in the Messages pane's action strip, dispatched through
     /// the same handler its key press reaches.
     MessagesVerb(cyclops_ui::ChatAction),
+    /// One wheel notch over the Messages pane: move its timeline window by
+    /// `lines` (negative is up).
+    ScrollMessages {
+        lines: i32,
+    },
     /// Wipe or unblock an agent's composer draft via C-u / Backspace chord.
     ClearPaneComposer {
         pane_id: String,
@@ -377,7 +382,7 @@ pub enum ScrollDirection {
 
 /// Lines per wheel notch. Matches the constant `handle_mouse` already uses
 /// for both pane scroll and the keybinds sheet.
-const SCROLL_LINES: i32 = 3;
+pub(crate) const SCROLL_LINES: i32 = 3;
 
 /// The minimal live-model context keyboard and menu routing need to resolve
 /// a stable target: which tab/pane is current, and the full tab/workspace
@@ -795,28 +800,32 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
     }
 }
 
-/// Route a wheel event over a painted hit target. Only a pane body
-/// scrolls; every other target ignores the wheel today. `at` is the
-/// pane-relative cell the caller already resolved via
-/// `HitMap::pane_geometry` and [`crate::input::mouse::HitMap::cell_at`] —
-/// this function only routes, it does no geometry lookups of its own.
+/// Route a wheel event over a painted hit target. A pane body scrolls
+/// its pane and the Messages pane scrolls its timeline; every other
+/// target ignores the wheel today. `at` is the pane-relative cell the
+/// caller already resolved via `HitMap::pane_geometry` and
+/// [`crate::input::mouse::HitMap::cell_at`] — this function only routes,
+/// it does no geometry lookups of its own.
 pub fn route_mouse_scroll(
     target: &HitTarget,
     direction: ScrollDirection,
     at: Option<crate::runtime::CellPos>,
 ) -> Option<Action> {
-    let HitTarget::PaneBody { pane_id } = target else {
-        return None;
-    };
     let lines = match direction {
         ScrollDirection::Up => -SCROLL_LINES,
         ScrollDirection::Down => SCROLL_LINES,
     };
-    Some(Action::ScrollPane {
-        pane_id: pane_id.clone(),
-        lines,
-        at,
-    })
+    match target {
+        HitTarget::PaneBody { pane_id } => Some(Action::ScrollPane {
+            pane_id: pane_id.clone(),
+            lines,
+            at,
+        }),
+        HitTarget::MessagesBody | HitTarget::MessagesRow { .. } => {
+            Some(Action::ScrollMessages { lines })
+        }
+        _ => None,
+    }
 }
 
 /// Route a drag release that never crossed its target's move threshold —

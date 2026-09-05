@@ -98,6 +98,12 @@ pub enum ActionRequest {
     ClearAlarm {
         attempt_id: NotificationAttemptId,
     },
+    /// Read one message body as the operator, without claiming it.
+    /// Answered by `msg.read`; the daemon decides whether this reader may
+    /// see the body, so a refusal is an answer and not an error.
+    ReadBody {
+        message_id: MessageId,
+    },
 }
 
 /// What came back.
