@@ -7,18 +7,19 @@
 **One eye. Many agents. A single coordinated team.**
 
 Cyclops coordinates coding agents that run in tmux. It gives them a durable
-mailbox, guarded terminal notifications, and an optional workspace where a
-human can see and control the whole team.
+mailbox, a one-line doorbell into the recipient's pane, and an optional
+workspace where a human can see and control the whole team.
 
 The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is at version `1.0.2`. It currently ships tested
-manifests for Codex CLI, Claude Code, Antigravity CLI, and Cursor Agent CLI.
-Detection is conservative and version-sensitive: unknown terminal chrome holds
-a write instead of guessing. See [STATUS.md](STATUS.md) for current evidence and
-limits.
+Cyclops is at version `1.1.0`. It ships twelve detection manifests. Five are
+measured against a live CLI: Claude Code, Codex CLI, Antigravity CLI, Cursor
+Agent CLI, and Kimi Code CLI. Seven are written from vendor documentation and
+say so with `version_tested = "unverified"`: Gemini CLI, Qwen Code, goose,
+OpenCode, Amp, Crush, and aider. See [STATUS.md](STATUS.md) for the evidence
+behind each and the limits that follow from it.
 
 [usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [documentation](#documentation)
 
@@ -27,50 +28,46 @@ limits.
 
 ## Why Cyclops
 
-Raw `tmux send-keys` is immediate, but it has no durable acceptance, recipient
-authorization, ordering, claim, or receipt. It can also overwrite text that a
-human is typing. Cyclops adds those missing boundaries:
+Raw `tmux send-keys` is immediate, but it has no durable acceptance, sender
+identity, ordering, claim, or receipt, and it types over whatever a human has
+half-written in the composer. Cyclops adds the missing boundaries:
 
-- A send is durably accepted before terminal notification begins.
-- Message bodies remain in the authenticated mailbox. CLI pane notifications
-  show a summary beside the exact claim command.
-- Notifications are FIFO per recipient and remain tied to stable pane and
-  process identities.
-- Terminal writes inspect current composer evidence: detected human input or an
-  active modal holds the notification.
-- Deliveries are guarded: direct message payloads require strict screen
-  verification before submission. Pane doorbells prioritize liveness and proceed
-  as unverified if staging is unobservable, holding when positive human typing or
-  modals are detected.
-- Claims, replies, recovery, and operator actions are append-only facts that can
-  be inspected later.
+- A send is durably accepted, fsynced, before any terminal write begins.
+- The sender is whoever connected to the socket. Nothing in a request can
+  name a sender.
+- Message bodies stay in the authenticated mailbox. The pane gets one line:
+  a summary beside the exact claim command.
+- Doorbells are FIFO per recipient and bound to a stable pane and process
+  identity.
+- A doorbell is written and submitted for a bound, live agent process unless
+  a human draft is positively observed or a named block is on screen (a
+  modal, a permission prompt, a quota screen, a dead pane, copy-mode, or a
+  doorbell the recipient has not consumed). An ambiguous or unreadable
+  composer does not hold it.
+- Every outcome is recorded, including the uncertain ones. A line that could
+  not be read back is `submitted_unverified`; a physical write failure is
+  `attention_required`. Nothing is retried on a timer.
 
-### Benchmarks: Agent CLI Commands vs. Raw tmux, smux, and commPact
+The human-draft guard is strong, not absolute. It depends on the manifest
+recognizing typed text, and the seven unverified manifests carry no such
+rule, so a doorbell to one of those panes is effectively a raw write with a
+receipt.
 
-The table below measures the actual end-to-end CLI commands executed by AI agents in active terminal panes. Unlike file-lock wrappers or raw terminal scripts, Cyclops provides hardware-level crash durability, monotonic sequence ordering, and conservative composer draft holds:
+### How fast
 
-| Executed Command | System & Architecture | Latency p50 | Latency p95 | Worst Case (p99) | Throughput | Zero-Loss Durability | Human Draft Safety |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `tmux capture-pane -pt %0` | Raw tmux (ephemeral IPC) | 2.59 ms | 2.66 ms | 4.72 ms | 385.6 ops/s | ❌ None | ❌ None |
-| `tmux send-keys -t %0 "..." Enter` | Raw tmux (ephemeral IPC) | 2.64 ms | 2.76 ms | 6.25 ms | 371.7 ops/s | ❌ None | ❌ Overwrites drafts |
-| `smux send %0 "..."` | ShawnPana `smux` (file locks) | 8.04 ms | 8.28 ms | 18.20 ms | 123.3 ops/s | ❌ Crash loss | ❌ No sensing |
-| `commpact send --to %0 "..."` | commPact v1 (flock + pipes) | 12.40 ms | 16.80 ms | 31.50 ms | 80.6 ops/s | ❌ Stale locks | ❌ No sensing |
-| **`cyclops send "@agent ..."`** | **Cyclops CLI (WAL + Sentinel)** | **10.99 ms** | **12.97 ms** | **14.96 ms** | **90.9 ops/s** | **Full WAL Fsync** | **Conservative Hold** |
-| **`cyclops inbox claim`** | **Cyclops CLI (Auth IPC + Claim)** | **10.04 ms** | **15.80 ms** | **27.03 ms** | **91.6 ops/s** | **Full WAL Fsync** | **Conservative Hold** |
-
-*(Note: When called internally or over persistent daemon sockets, `msg.send` completes in **3.99 ms** / 252 ops/s, and socket pings in **0.012 ms**.)*
-
-#### Why does the `cyclops` CLI take ~10ms at p50?
-Raw `tmux send-keys` is a fire-and-forget socket pipe that does not verify message receipt or preserve unsubmitted text. The ~10ms Cyclops CLI path provides full transactional guarantees:
-1. **Process Bootstrap (~2.5 ms)**: Starting the standalone `cyclops` binary (`fork`/`exec` and runtime init).
-2. **Peer Credential Handshake (~3.0 ms)**: Verifying caller UID and socket peer PID (`LOCAL_PEEREPID` / `SO_PEERCRED`) so malicious processes cannot spoof agent identities.
-3. **Monotonic WAL Fsync (~4.5 ms)**: Executing a synchronous hardware `fsync` to `record.jsonl` ensuring zero message loss on machine crashes or daemon restarts.
-4. **Composer Protection**: Inspecting recipient screen lines to verify the agent is idle and holding writes when human keyboard drafts are detected.
+A `cyclops send` from the CLI is about 10 ms at the median on the measured
+machine. Most of that is process start and one fsync. Raw `tmux send-keys`
+is cheaper because it proves nothing: no durable record, no sender identity,
+no ordering, no claim, no receipt. The numbers, the harnesses in this
+repository that produce them, and what each lane does and does not include
+are in [docs/reference/BENCHMARKS.md](docs/reference/BENCHMARKS.md).
 
 ## First five minutes
 
-Cyclops needs tmux 3.2+, Git, curl, and Rust. The installer can install Rust with
-rustup when it is missing, never uses `sudo`, and prints every file it changes.
+Cyclops needs tmux 3.2+, Git, and curl. The installer downloads a published
+release pair for your platform when one exists and otherwise builds from
+source, installing Rust with rustup when it is missing. It never uses
+`sudo` and prints every file it changes.
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
@@ -86,12 +83,11 @@ cd cyclops
 ./scripts/install.sh
 ```
 
-The installer builds `cyclops` and `cyclopsd` from source, installs a matched
-pair, writes the initial config, and can wire supported vendor hooks and the
-Cyclops skill without replacing unrelated settings. Use
-`CYCLOPS_NO_VENDOR_HOOKS=1` to skip that wiring. See the
-[installation guide](docs/guides/install.md) for paths, options, updates,
-rollback, and uninstall.
+The installer puts a matched `cyclops` and `cyclopsd` pair in place, writes
+the initial config, and can wire supported vendor hooks and the Cyclops
+skill without replacing unrelated settings. Use `CYCLOPS_NO_VENDOR_HOOKS=1`
+to skip that wiring. See the [installation guide](docs/guides/install.md)
+for paths, options, updates, rollback, and uninstall.
 
 ## Uninstall completely
 
@@ -133,79 +129,68 @@ the workspace or watch UI does not discard accepted messages.
 ```bash
 cyclops name implementer --self
 cyclops send reviewer --subject "Review the parser" \
-  --summary "The parser change is ready for review. Report any release blocker." \
   --body "Please review commit abc123."
 ```
 
-A standard send returns after durable acceptance. Notification continues
-asynchronously. Use `--require-wake` only when the caller must wait for the
-stronger submitted or notified boundary:
+A send returns after durable acceptance. The doorbell follows asynchronously.
+`--summary` is optional: when you omit it the daemon derives the one-line
+preview from the subject. Use `--require-wake` only when the caller must wait
+for the doorbell to reach `submitted` or `notified`:
 
 ```bash
 cyclops send reviewer --subject "Review the parser" \
-  --summary "The parser change is ready for review. Report any release blocker." \
+  --summary "The parser change is ready for review." \
   --body "Please review commit abc123." --require-wake
 ```
 
-The recipient sees the two-sentence preview plus an exact `m-att_...` claim
-token. If the composer contains human input, the notification waits until the
-composer is proven available. Narrow panes may visually soft-wrap the
-notification, but Cyclops keeps the supplied summary. Claiming through the
-socket does not cancel this independently queued pane notification. Claiming
-the token retrieves the authorized envelope, including TO, FROM, subject,
-summary, full body, and reply context:
+The recipient sees the preview plus an exact `m-att_...` claim token on one
+line. A narrow pane may soft-wrap it; the bytes are unchanged. Claiming
+through the socket does not cancel the queued doorbell. Claiming the token
+retrieves the authorized envelope, including TO, FROM, subject, summary, the
+full body, and reply context:
 
 ```bash
 cyclops inbox claim m-att_<token>
-cyclops reply <message-id> \
-  --summary "The review is complete. No blockers remain." \
-  --body "Reviewed. No blockers."
+cyclops reply <message-id> --body "Reviewed. No blockers."
 ```
+
+`cyclops reply --last` answers the most recently claimed message.
 
 These are different facts:
 
 1. **Accepted** means the journal has the message.
-2. **Notified** means a safe terminal wake was submitted.
+2. **Notified** means the doorbell was written and submitted.
 3. **Claimed** means the recipient retrieved the exact body.
-4. **Completed** requires an explicit agent-side completion or reply. Cyclops
-   does not infer task completion from idle state.
+4. **Completed** requires an explicit agent-side reply. Cyclops does not infer
+   task completion from idle state.
+
+### The raw transport
+
+`cyclops send --raw` (and `cyclops reply --raw`) pastes the whole message,
+header, body, reply hint, and end marker, into the recipient pane and presses
+Enter with no composer check. It exists for exactly two cases: Cyclops's own
+composer reading is wrong for that pane, or the recipient is an unverified
+vendor. The journal records it as an unverified raw write, so nobody mistakes
+it for a gated delivery, and Cyclops never selects it on its own.
 
 <!-- Media slot: docs/public/images/messages-queue.png
      Suggested content: a body-free resting queue and an opened authorized thread. -->
 
 ## The composer rule
 
-Agent activity and composer safety are independent.
+Agent activity and the composer are separate questions.
 
 - `idle` and `working` describe agent activity for the human.
-- `clean`, `withInput`, and `ambiguous` inform whether Cyclops may write:
-  detected human input (`withInput`) holds the notification. Direct payloads
-  require strict clean-composer proof and exact staging verification. Doorbells
-  prioritize liveness and proceed when the composer is unproven, holding when
-  human input, drafts, modals, or replaced occupants are detected.
+- The composer check asks one thing: is a human draft positively visible, or
+  does a delivery already own the composer? Only then does a doorbell wait.
 
-An idle agent with visible human input is not safe to notify. A working agent
-with a structurally proven clean composer may be safe. Cyclops holds the same
-notification attempt while human input remains. Partial backspacing remains held;
-when the final visible character is erased and the settled composer is proven
-empty, that same attempt re-enters the normal gate automatically. A
-hidden editor, modal, stale frame, replaced occupant, or
-daemon-owned recovery barrier remains blocked.
-
-To preserve multi-agent liveness across diverse agent CLI versions, pane
-doorbells (Format 4) act as wake signals and proceed even if terminal staging
-cannot be echo-verified on screen, provided no human input or modal is detected.
-Full message bodies remain guarded in the authenticated mailbox until claimed.
-
-For operators who prefer liveness over the final content guarantee on direct
-deliveries, Settings includes a default-off `Force staged submit` timer from 0 to
-20 seconds. It applies only after an exact notification was pasted but normal
-verification failed. The daemon rechecks the exact attempt and pane process,
-then reserves one key atomically with `inbox.claim` before pressing Enter without
-pasting again. A claim or replacement that wins before that reservation stops
-it. Once reserved, a later claim or setting change does not retract the one key.
-This mode can submit human input, especially at 0 seconds, so it is never
-enabled by default.
+A working agent gets its doorbell during the turn; the vendor queues the line.
+An idle agent with an unreadable composer gets it too, and the journal marks
+the attempt `submitted_unverified` if the line could not be read back. A
+positively observed draft holds the same attempt until the draft is seen
+erased or the turn ends, never on a clock. A modal, a permission prompt, a
+quota screen, a dead pane, or copy-mode holds on its name and pings the admin
+once after `gate_hold_notify_ms`.
 
 <!-- Media slot: docs/public/images/composer-hold.png
      Suggested content: visible draft, held notification, final erase, same attempt released. -->
@@ -232,19 +217,20 @@ The CLI, daemon, mailbox, and `cyclops watch` remain independently usable.
 
 Cyclops never converts uncertainty into success.
 
-- Pre-write failure leaves the message queued or durably blocked without
-  writing bytes.
-- A post-write outcome that cannot be proven stops for operator attention
-  rather than risking a duplicate paste.
-- Daemon restart replays the journal and reconstructs mailbox state.
+- A failure proven before the paste leaves the message queued or durably
+  blocked, with nothing written and the cause named.
+- A paste that could not be read back is still submitted once and recorded
+  as `submitted_unverified`; a missing receipt ends as `notified` with no
+  verifier. Neither is retried.
+- A physical write failure (a paste or submit command that failed, or a pane
+  whose occupant changed after the paste) stops as `attention_required` for
+  a human to inspect. `cyclops requeue <message-id>` starts a fresh attempt
+  after the cause is understood.
+- A daemon restart replays the journal, closes every attempt caught between
+  the paste and its receipt to `attention_required`, and reconstructs
+  mailbox state.
 - Stable tmux and process identities prevent a renamed or replaced pane from
   inheriting another occupant's delivery.
-- Raw tmux remains an operator-controlled emergency path, not an automatic
-  fallback and not a source of synthetic receipts. A human may authorize one
-  exact, labeled, unrecorded pane write only after confirming Cyclops is
-  unavailable or broken. Slow delivery, a safety hold, or an ambiguous daemon
-  outcome is not confirmation of failure. See the
-  [raw-tmux emergency doctrine](docs/development/DELIVERY.md#raw-tmux-emergency-doctrine).
 
 Start troubleshooting with `cyclops health`, `cyclops status`, and
 [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md).
@@ -256,12 +242,16 @@ Start troubleshooting with `cyclops health`, `cyclops status`, and
 | `cyclops` | Open the full workspace |
 | `cyclops start --preset duo` | Create a workspace from a shipped layout |
 | `cyclops name --self <label>` | Give the calling pane an address |
-| `cyclops send <agent> ...` | Durably accept a message and queue its wake |
+| `cyclops send <agent> ...` | Durably accept a message and queue its doorbell |
+| `cyclops send <agent> --raw ...` | Paste the whole message and press Enter with no composer check; recorded as an unverified raw write |
 | `cyclops inbox list` | List pending metadata without exposing bodies |
 | `cyclops inbox claim <m-att_...>` | Retrieve one exact authorized envelope |
-| `cyclops reply <message-id> ...` | Reply on the durable route and thread |
+| `cyclops reply <message-id> ...` | Reply on the durable route and thread; `--last` answers the last claimed message |
 | `cyclops messages` | Inspect mailbox and notification state |
-| `cyclops status` | Inspect agents, readiness, blocks, and recovery actions |
+| `cyclops status` | Inspect agents, blocks, and what needs you |
+| `cyclops clear <agent>` | Withdraw every doorbell to one agent that has not written to its pane; messages stay claimable |
+| `cyclops flush` | Flush message ledgers, cleanse state, and reset sessions to start clean |
+| `cyclops stop` | Stop the daemon; tmux panes and durable messages stay intact |
 | `cyclops watch` | Open the stream and Messages TUI |
 | `cyclops health` | Inspect install, daemon, state, and rollback readiness |
 | `cyclops update` | Prove and activate a matched CLI and daemon pair |
@@ -274,15 +264,15 @@ Every command documents its structured and plain forms with `--help`.
 flowchart LR
     A[Agent or admin CLI] -->|NDJSON RPC| D[cyclopsd]
     D -->|fsync before acceptance| J[(append-only journal)]
-    D -->|summary plus guarded claim| T[tmux pane]
+    D -->|one doorbell line: summary plus claim command| T[tmux pane]
     T -->|exact m-att claim| D
     D -->|authorized envelope| R[Recipient]
     W[Optional workspace and watch UI] -->|snapshots and events| D
     W -->|terminal cells and layout| T
 ```
 
-The daemon owns mailboxes, notification coordination, identity, recovery, and
-sensor fusion. `cyclops-tmux` owns tmux interaction. Manifests under
+The daemon owns mailboxes, the doorbell pipeline, identity, restart recovery,
+and sensor fusion. `cyclops-tmux` owns tmux interaction. Manifests under
 [`resources/manifests/`](resources/manifests/) describe supported terminal
 chrome as data. The workspace and watch UI are projections over the same
 daemon state, not the authority for delivery.
@@ -304,9 +294,8 @@ Read the [engineering map](docs/development/HANDOFF.md),
 [invariants](docs/development/INVARIANTS.md), and
 [contributing guide](CONTRIBUTING.md) before changing the delivery path. The
 [stabilization history](docs/development/archive/STABILIZATION_HISTORY.md) records the
-failures and fixes that produced the current system. The
-[next architecture work](docs/development/NEXT.md) explains the planned
-behavior-preserving delivery-core extraction.
+failures and fixes that produced the current system. [NEXT.md](docs/development/NEXT.md)
+is the short queue of what is worth doing next.
 
 ## Documentation
 

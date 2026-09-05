@@ -11,8 +11,9 @@ are written from vendor documentation alone and say so with
 `version_tested = "unverified"`: `gemini.toml`, `qwen.toml`, `goose.toml`,
 `opencode.toml`, `amp.toml`, `crush.toml`, `aider.toml`. An unverified file
 binds the pane, declares the hook events the vendor documents, and carries
-no idle or working rule, so a delivery to that pane fails closed
-(`not write-ready`) until someone measures its composer and edits the file.
+no idle, working, or composer rule, so a doorbell to that pane never detects
+a human draft: it is written and submitted like a raw write with a receipt,
+until someone measures the composer and edits the file.
 Each header names its sources and what was and was not observed. Their
 source is [`resources/manifests/`](../../resources/manifests/). A
 thirteenth is three steps away.
@@ -34,11 +35,14 @@ reviewer · ○ idle · decided by title_idle · write-ready
 `decided by` names the rule that produced the verdict. A wrong reading is
 one rule to fix.
 
-`write-ready` is the second answer and a different question: may a
-message be pasted right now. Only a screen rule can answer it, because
-only the screen can see the composer. A manifest with no idle screen rule
-reads `not write-ready: no_write_safe_composer_evidence` however confidently
-its title rule says idle.
+`write-ready` is a second answer to a different question: was the composer
+positively proven empty by this capture. Only a screen rule can answer it,
+because only the screen can see the composer. A manifest with no idle screen
+rule reads `not write-ready: no_write_safe_composer_evidence` however
+confidently its title rule says idle. Delivery does not gate on it: a
+doorbell holds only on a positively observed human draft (a rule with
+`composer_semantic = "human_input"`) or a named block, so a manifest with no
+composer rule never holds a doorbell for a person's typing.
 
 Add `--raw` and the same answer carries the pane capture the sensors
 read, under the readings. One answer means one moment: a separate
@@ -197,28 +201,27 @@ and no lookaround.
 color codes, and exists for one measured case: on Codex CLI a ghost
 suggestion and text you typed are the same characters, and the only
 difference is that the suggestion renders dim. A rule carrying these clauses
-fails closed when no color capture was taken, rather than guessing.
+does not match when no color capture was taken, rather than guessing.
 
 A blocked state is not a state cyclops clears on its own unless the rule
 says so. `auto_dismiss = false` means report and park the delivery; a human
 decides. Claude's folder-trust dialog is `false` for a measured reason:
 Escape on that dialog exits the CLI.
 
-## `[hooks]`: turn edges and legacy self-test receipts
+## `[hooks]`: turn edges and the ack receipt
 
 | Key | What it does |
 |---|---|
 | `config_mechanism` | How this CLI is told about hooks. Free text, printed by `cyclops hooks install` |
 | `turn_start`, `turn_end` | Event names for the two turn edges |
-| `ack` | The event whose payload can prove a legacy direct-delivery self-test arrived |
+| `ack` | The event whose payload can prove a doorbell arrived |
 | `ack_payload_field` | The field in that payload holding the injected text |
 | `available` | Every event name the CLI can fire. Documentation for whoever writes the next rule |
 
-`ack` plus `ack_payload_field` is what earns a legacy self-test
-`✔ delivered · verified`: the hook fires, the payload carries the text, and
-Cyclops finds the test message id inside it. Standard mailbox delivery does not
-paste the body or use these receipt tiers. It uses lifecycle edges and manifest
-readiness to guard a one-line notification.
+`ack` plus `ack_payload_field` is what earns a doorbell `verified_by: hook`:
+the hook fires, the payload carries the line, and Cyclops finds the attempt
+inside it. Without them a doorbell settles on screen evidence, or on nothing
+at all, and the journal says which.
 
 Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 
@@ -228,22 +231,15 @@ Wiring the hooks on the CLI side is [hooks.md](hooks.md).
 |---|---|
 | `method` | How the text goes in. `load-buffer + paste-buffer -p` for every shipped CLI |
 | `submit` | The key that sends it, usually `Enter` |
-| `clear_keys` | Measured key sequence that clears the whole composer. Empty means unsupported |
-| `verify_before_submit` | Read the composer back before pressing submit |
-| `verify_pattern` | What must be visible for the paste to count as staged. `<message_id>` is replaced with this delivery's marker |
-| `safe_states` | Deliver only when the agent is in one of these |
-| `unsafe_states` | Never deliver in these |
-| `busy_behavior` | Legacy measurement metadata. It never authorizes a write; omit it from new manifests |
+| `clear_keys`, `verify_before_submit`, `verify_pattern`, `safe_states`, `unsafe_states`, `busy_behavior` | Accepted from older files and ignored. The 1.1.0 daemon reads the composer back once after every paste and holds only on a seen draft or a named block; none of these keys changes that |
 | `composer_prompt_regex` | Whole joined-capture row that starts the active composer, with a named `content` capture |
 | `composer_continuation_regex` | Whole joined-capture row for each later logical payload line, with a named `content` capture |
 
-`verify_before_submit = true` with `verify_pattern = ["<message_id>"]` is the
-gate that keeps a message out of the wrong pane: cyclops pastes, reads the
-composer back, finds this exact message's id, re-checks that the pane still
-holds the same process, and only then presses Enter. Leave both on.
-
-`safe_states = ["idle"]` is the conservative default and the right one until
-you have measured what the CLI does with text pasted mid-turn.
+After the paste, cyclops reads the composer back once and compares the exact
+doorbell row, re-checks that the pane still holds the same process, and then
+presses `submit`. A row that did not read back exactly is still submitted,
+once, and recorded as `submitted_unverified`. That readback is not
+configurable per manifest.
 
 The two composer patterns are declared together and are matched after
 `capture-pane -J -e` joins tmux physical wraps and Cyclops removes SGR codes.
@@ -252,10 +248,8 @@ same-id header reaches one terminal sentinel followed immediately by the
 vendor's styled trailer. A duplicate header, duplicate sentinel, transcript
 echo, undeclared trailing row, or collapsed chip is not visible payload.
 
-`clear_keys` is capability data, not a generic cleanup path. It is valid only
-with both extraction patterns. Each entry must be a named non-text key or a
-modified chord; text, editing, and submit key names are rejected. It is empty
-for an unmeasured vendor. Delivery never invokes it.
+`clear_keys` is accepted from older files. Each entry must still be a named
+non-text key or a modified chord, but nothing invokes it.
 
 ## Write down what you measured
 

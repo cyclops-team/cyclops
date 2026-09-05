@@ -5,51 +5,25 @@ job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
 For current behavior, start with this map and the behavior contracts below.
-The approved [Messaging Refactor Charter](archive/MESSAGING_REFACTOR_CHARTER.md) and
-[Cyclops Beta Charter](archive/CYCLOPS_BETA_CHARTER.md) record foundational architecture,
-invariants, and historical beta milestones. [NEXT.md](NEXT.md) is the current
-execution queue. The [Messaging Beta audit](archive/MESSAGING_BETA_AUDIT.md) and
-[final beta acceptance audit](archive/CYCLOPS_BETA_FINAL_AUDIT.md) preserve historical
-completion evidence, architectural decisions, and release gates.
-
-The
-[messaging architecture review](archive/MESSAGING_ARCHITECTURE_REVIEW.md) and its
-[addendum](archive/ADDENDUM_REVIEW.md) are supporting design records. They explain
-the reasoning behind the approved charter, but the charter controls
-implementation when the documents differ. The
-[whole-system architecture review](archive/CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
-is the supporting evidence behind the Cyclops Beta Charter. Its reviewed
-revision and measurements remain historical; the charter records current
-finding dispositions. The
-[CI and test architecture review](archive/CI_TEST_ARCHITECTURE_REVIEW.md) is the
-supporting design record behind the implemented [current CI contract](CI.md),
-not messaging authority. The reusable
-[architecture review method](archive/ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
-not a Cyclops behavior contract.
-
-The completed stabilization run is recorded in
-[STABILIZATION_HISTORY.md](archive/STABILIZATION_HISTORY.md). The
-[reliability roadmap](archive/RELIABILITY_ROADMAP.md) is a frozen historical gate record,
-and [V5.md](archive/V5.md) is a historical design record. Do not use them as current
-implementation authority.
+[NEXT.md](NEXT.md) is the short queue of what is worth doing next. The
+[archive index](archive/README.md) holds the revision-bound charters, audits,
+reviews, and roadmaps that shaped the system; none of them governs current
+behavior, and when one disagrees with the code, the code and the contracts
+here win.
 
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
 working or blocked, accepts messages into durable workspace mailboxes, and
-writes a two-sentence preview and exact claim into the recipient pane when
-safe. The full body remains in the authenticated mailbox. Mailbox facts use
-one append-only workspace journal. Pane state and legacy direct delivery use
-separate append-only session journals.
+writes one doorbell line (a summary beside the exact claim command) into the
+recipient pane. The full body remains in the authenticated mailbox. Mailbox
+facts use one append-only workspace journal. Pane state and each attempt's
+own transitions use separate append-only session journals.
 
 For current messaging, start with [send.md](../guides/send.md),
-[PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox/`, and
-`src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
-the compatibility path used by hook self-tests and old session records, not
-standard `cyclops send`. `src/cyclopsd/src/session_history.rs` is the boundary
-around retained direct-delivery writers, restart settlement, and
-`CompatibilityHistoryAdapter`. `WorkspaceMessaging` owns policy for current
-history and threads. The adapter only discovers and replays retained session
-journals.
+[DELIVERY.md](DELIVERY.md), [PROTOCOL.md](../reference/PROTOCOL.md),
+`src/cyclopsd/src/mailbox/`, `src/cyclopsd/src/messaging.rs`, and
+`src/cyclopsd/src/delivery/`. `src/cyclopsd/src/session_history.rs` only
+discovers and replays session journals across a rename; it writes nothing.
 
 ## Documentation map
 
@@ -61,7 +35,7 @@ contracts, and historical records separate:
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
-| Current execution queue | [NEXT.md](NEXT.md) | Active priorities and execution rules on `main`. |
+| What is next | [NEXT.md](NEXT.md) | The short queue on `main`. |
 | Measured evidence | [findings.md](../../findings.md) | Probe-backed constraints on current code. This is live evidence, not a roadmap or archive. |
 | Archived historical and audit records | [Archive index](archive/README.md) and [changelog](../../CHANGELOG.md) | Revision-bound charters, audits, and design reviews that no longer govern current behavior; the changelog is the immutable release history. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
@@ -84,8 +58,7 @@ flowchart LR
     end
     subgraph daemon["cyclopsd"]
       fus["fusion:<br/>what state is this pane in"]
-      del["mailbox + notification:<br/>accept, claim, reply, wake"]
-      legacy["legacy direct delivery:<br/>gate, paste, verify, submit, ACK"]
+      del["mailbox + doorbell:<br/>accept, gate, paste, Enter, receipt"]
     end
     sock(["NDJSON over<br/>$CYCLOPS_HOME/sock"])
     led[("append-only journals:<br/>workspaces/&lt;id&gt;/messages.ndjson<br/>ledger/&lt;session&gt;.ndjson")]
@@ -113,13 +86,13 @@ are a rule implemented in a crate that should not have known about it.
 
 | Crate | Owns | Does NOT own |
 |---|---|---|
-| `cyclops-proto` | Wire types, mailbox and journal schema, the legacy delivery state machine, the agent state model, the attention rule (what needs a human), scratch paths | Any IO. It does not know tmux exists, and it renders nothing |
+| `cyclops-proto` | Wire types, mailbox and journal schema, the notification state machine, the agent state model, the attention rule (what needs a human), scratch paths | Any IO. It does not know tmux exists, and it renders nothing |
 | `cyclops-manifest` | Manifest TOML schema, compiled rules, region parsing, priority evaluation | Deciding a pane's state (that is fusion), reading panes, hot reload (the daemon's job) |
 | `cyclops-tmux` | **Every tmux invocation in the product.** Control mode, reply correlation, flow control, the zero-polling pane table, layout capture and apply, focus | What an agent is. It has never heard of manifests, deliveries, or the ledger |
 | `cyclops-ledger` | Append, fsync, monotonic seq, strict and lenient torn-tail recovery, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
 | `cyclops-client` | Hello-first daemon connection facts, bounded frames, request correlation, shared timeout defaults and certainty, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, application retry schedules, projection restoration, or journal reads |
-| `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
+| `cyclopsd` | The daemon: fusion, durable mailboxes, the doorbell pipeline, the socket server, sender identity, the adoption registry, pane border chrome, the hooks self-test, and the journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
 | `cyclops-ui` | Pure stream and messaging presentation models plus the concrete terminal renderer for `cyclops watch` | Daemon framing, journal paths, or tmux effects; it consumes `cyclops-client`, `events.backfill`, and a launcher focus capability |
 | `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse, and the body-free collapsed Messages rail projection | Messaging truth or a second unread queue; it renders authenticated daemon snapshot counts and reads the attention rule from proto |
@@ -158,70 +131,35 @@ messaging demo. It builds its own tmux server and home, then cleans both up.
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 Historical release-demo planning: [archived Demo Day checklist](archive/demo-day-checklist.md).
-The pre-mailbox M2 conversation and M3 stream scripts are retained in Git
-history rather than advertised as current runnable journeys.
 
-### Explain current mailbox messaging
+### Explain a message, end to end
 
 Read in this order:
 
-1. [send.md](../guides/send.md) for acceptance, claim, reply, notification, and recovery.
-2. [PROTOCOL.md](../reference/PROTOCOL.md) for `msg.send`, `inbox.list`,
+1. [send.md](../guides/send.md) for acceptance, the doorbell, claim, reply,
+   and recovery as a user sees them.
+2. [DELIVERY.md](DELIVERY.md) for the pipeline, the gate, the raw transport,
+   restart, and the state list.
+3. [PROTOCOL.md](../reference/PROTOCOL.md) for `msg.send`, `inbox.list`,
    `inbox.claim`, `msg.reply`, and `messages.snapshot`.
-3. `src/cyclopsd/src/messaging.rs` for the internal `WorkspaceMessaging`
-   operation boundary, acceptance, claim, requeue, and exact pre-write
-   withdrawal coordination, body-free inbox, snapshot, follow, alarm, and
-   attention-selection reads, the body-free status projection, and durable
-   consequences of ordered typed pane observations.
-4. `src/cyclopsd/src/mailbox/projection.rs` for the durable projection and mutations owned
-   behind that boundary.
-5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in
-   `src/cyclopsd/src/delivery/mod.rs` for the content-free wake.
+4. `src/cyclops-proto/src/notification.rs`, `NotificationState::can_transition_to`.
+   The legal moves are a table you can read in a minute.
+5. `src/cyclopsd/src/messaging.rs` for acceptance, claim, requeue, and
+   withdrawal, and `src/cyclopsd/src/mailbox/projection.rs` for the durable
+   projection behind it.
+6. `src/cyclopsd/src/delivery/`: `worker.rs` takes the head of one
+   recipient's FIFO; in `gate.rs`, `gate` holds until `admit` proves the
+   write may happen, `attempt_delivery` pastes, reads back once, and presses
+   Enter, and `settle_without_receipt` closes the attempt when no receipt
+   arrives; `attempt_raw_delivery` is the raw lane. `notification_adapter.rs`
+   is how every step becomes a journal fact.
 
-The key boundary is durable acceptance before asynchronous notification. The
-recipient reads the body only by claiming the exact message. Standard send
-does not paste that body or return verified and unverified delivery tiers.
-`demos/m1-send.sh` demonstrates that boundary with notification-incapable cat
-panes: both sends are durable, the authenticated body-free projection remains
-usable, and the workspace journal records message metadata while omitting
-bodies from the demo output. The blocked optional wakes are reported as
-`composer_semantic_missing`; they do not undo acceptance or invent delivery.
-
-### Explain a legacy direct-delivery self-test receipt
-
-This compatibility path powers hook self-tests, older session records, and
-internal transport tests. Read in this order:
-
-1. [DELIVERY.md](DELIVERY.md). The legacy compatibility design.
-2. `src/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
-   legal moves are a table you can read in a minute; everything below is a
-   drive through it.
-3. `src/cyclopsd/src/session_history.rs`. The only entry to the retained writer,
-   restart settlement, and session-journal replay.
-4. `src/cyclopsd/src/delivery/`, in call order: `msg_send` -> `worker_for` ->
-   `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`
-   -> `await_ack` -> `receipt_of`.
-5. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight
-   ordered checks, and send-to-receipt.
-
-The one idea to take away is that **verified** and **delivered** are not
-the same claim, and the receipt never blurs them:
-
-- **Tier 1, verified.** The agent's own vendor hook fires and runs
-  `cyclops hook`, which posts `agent.state.report` carrying the message id.
-  Match inside the ACK window: `delivered_verified`, `verified_by: hook`.
-  The agent itself said it received this.
-- **Tier 2, unverified.** No hook, or the hook was late: Cyclops looks at
-  the screen instead. The marker left the composer and the turn started, so
-  the message went in: `delivered_unverified`, `verified_by: screen`. That
-  is inference, and the badge says so with a hollow check.
-- A late hook ACK **upgrades** tier 2 to tier 1. It is the only legal
-  transition out of a delivered state, and it exists so a receipt is never
-  more confident than the evidence and never less.
-
-The retained direct-delivery behavior is covered by focused compatibility and
-self-test regression suites. Do not use the current mailbox demo as evidence
-for a legacy verified or screen-inferred receipt.
+The key boundary is durable acceptance before the asynchronous doorbell. The
+recipient reads the body only by claiming the exact message; the body reaches
+a pane only through `--raw`. `demos/m1-send.sh` demonstrates the acceptance
+boundary with `cat` panes that nothing binds: both sends are durable and the
+authenticated body-free projection is usable, while the doorbells to those
+panes cannot be admitted, which does not undo acceptance or invent delivery.
 
 ### Add support for a new agent CLI
 
@@ -241,15 +179,17 @@ What you have to fill in, and where each part is used:
 - `[agent] process_names` binds the file to a pane by its foreground
   command. If the CLI installs as a versioned symlink, add
   `argv_basenames` too, because the kernel reports the resolved name and
-  the match silently never fires (F21).
+  the match silently never fires (F21). A CLI that runs under `node`,
+  `python`, `bun`, or `deno` is read by the script name behind the
+  interpreter.
 - `[[rule]]` blocks read state off the pane title or the screen, by
   priority. Titles are cheap and screens are evidence of last resort, so a
-  title rule that decides means the screen is never captured.
-- `[injection] verify_pattern` must contain `<message_id>`. That
-  substitution is what proves the composer staged **this** message rather
-  than residue from an earlier one.
-- `[hooks] ack` if the CLI can run hooks. Declare nothing and the agent is
-  a tier-2 agent, which works.
+  title rule that decides means the screen is never captured. A rule with
+  `composer_semantic = "human_input"` is what lets the gate see a person's
+  draft; without one, a doorbell to that CLI never holds for typing.
+- `[injection] submit` is the key that sends the line, usually `Enter`.
+- `[hooks] ack` if the CLI can run hooks. Declare nothing and the doorbell
+  settles on screen evidence, which works.
 
 Prove it with fixtures, not by eye: put real captures in
 `src/cyclops-manifest/tests/fixtures/` and add them to
@@ -261,34 +201,38 @@ Do not add Rust. The schema has grown twice in its life and both times a
 measurement forced it (F19, F21). If you are convinced it needs to grow a
 third time, that is a finding first and a schema change second.
 
-### Debug a legacy direct delivery that is stuck
+### Debug a doorbell that is stuck
 
-[troubleshooting.md](../guides/troubleshooting.md) covers current mailbox
-notification recovery and legacy symptoms. For a legacy direct delivery,
-**the session ledger is the debugger.** Every gate
-decision is a line, and every line carries the cause.
+[troubleshooting.md](../guides/troubleshooting.md) covers the symptoms. For
+the mechanism, **the journals are the debugger.** The workspace journal
+holds every notification transition and the session ledger holds every gate
+decision, and every line carries a cause.
 
 ```bash
+workspace_id=$(cyclops --json messages | jq -r .workspace_id)
+jq -c 'select(.id == "m-b90b2a")' ~/.cyclops/workspaces/$workspace_id/messages.ndjson
 jq -c 'select(.id == "m-b90b2a")' ~/.cyclops/ledger/main.ndjson
 ```
 
 Read the last state line first, then the gate lines above it. The cause
-tells you where to look:
+tells you where to look. These are the causes the daemon writes today:
 
 | Cause | It means | Look at |
 |---|---|---|
-| `no_such_pane`, `pane_dead`, `session_detached` | The target is not there | The pane table: `cyclops status` |
-| `pane_in_mode`, `working` without positive composer proof, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right and, for a working pane, is its composer proven clean? `cyclops read <pane>` |
+| `no_such_pane`, `pane_dead`, `session_detached` | The target is not there; the gate holds | The pane table: `cyclops status` |
+| `pane_in_mode`, `blocked_quota`, `blocked:<rule id>`, `composer_hold` | The gate is holding on purpose: copy-mode, a quota screen, a modal or permission prompt, or a seen draft or unconsumed doorbell | Fusion: is the state right? `cyclops read <pane> --source detection --raw` |
 | `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
-| `paste_failed` | The paste command's reply was lost or failed after tmux may have applied it | Inspect the named pane and composer before resending |
-| `verify_failed` | Paste readback is inconclusive; the payload may have landed | Inspect the manifest's `verify_pattern` and the named pane before resending |
-| `pane_rebound` | The occupant changed before the payload write | Something restarted in that pane; the bounded retry re-enters the gate |
-| `pane_rebound_after_paste` | The pane changed after staged input reached the original occupant | Inspect the original pane before resending; Cyclops never retries this cause |
-| `submit_failed` | Enter may have reached the original occupant before its reply was lost | Inspect the named pane and composer before resending |
-| `ack_timeout` | The submit may have started a turn but no ACK arrived in time | Inspect the named pane and recipient state before resending |
-| `quiesce` | A pre-restart hold parked the delivery pre-paste; it re-enters when the pipeline resumes | Nothing: this is the restart machinery working |
-| `daemon_restart` on `retry_queued` | The chain rode a restart: nothing had reached the pane, so the new run requeued it | Nothing: the delivery is back in the queue |
-| `daemon_restart` on `attention_required` | The restart could not carry the chain: past the paste, or no pane answers to the recipient now | Inspect the recipient pane before resending |
+| `occupant_unprovable`, then `binding_unprovable` | The process table could not prove who holds the terminal; held once, then a durable pre-write block | The process tree of the pane; pin the manifest if binding is ambiguous |
+| `foreground_not_agent` | The agent handed the terminal to a tool | Wait, or look at what the agent is running |
+| `binding_changed`, `write_readiness_changed`, `pane_rebound` | The occupant changed between the gate's proof and the write; nothing was written, the attempt re-enters the gate | Something restarted in that pane |
+| `barrier_held` | Another attempt claimed the composer in the gap; re-read after 50ms | Nothing: two doorbells to one pane serialize |
+| `session_unavailable`, `manifest_unavailable`, `payload_unavailable`, `spool_failed`, `worker_failed` | A pre-write proof failed repeatedly; nothing written; durably blocked and withdrawable | The named thing; `cyclops health` for a worker failure |
+| `paste_command_unwritten` | tmux provably accepted no byte of the paste command; corrected back to a pre-write block | tmux and the control connection |
+| `paste_failed`, `submit_failed`, `pane_rebound_after_paste`, `transport_outcome_unknown` | A physical write failure after the boundary: `attention_required` | Inspect the pane before `cyclops requeue` |
+| `no_receipt`, `receipt_occupant_changed` | Enter was pressed and no receipt arrived, or the occupant changed while waiting; `notified` with no verifier | Nothing, unless the recipient never claims: then the pane |
+| `raw` | A raw write closed as `notified` with no verifier | Nothing: the sender asked for this |
+| `quiesce` | A pre-restart hold parked the attempt pre-paste; it re-enters when the pipeline resumes | Nothing: this is the restart machinery working |
+| `daemon_restart` | The attempt was between the paste and its receipt when the daemon stopped: `attention_required` | Inspect the recipient pane before `cyclops requeue` |
 
 The thing to internalize: **a hold is waiting on an event, never on a
 clock.** So "it is stuck" is always the question "which event never
@@ -298,15 +242,15 @@ once, so a wedged hold is at least visible in the stream.
 
 Two floors to know before you chase a ghost. tmux evaluates format
 subscriptions on a 1Hz tick, so a state that appeared and vanished inside
-one second was never visible to Cyclops at all (F23). And on tier-2 agents
-there is no hook edge, so timing evidence is screen evidence.
+one second was never visible to Cyclops at all (F23). And on a CLI with no
+ack hook there is no hook edge, so timing evidence is screen evidence.
 
 ### Know which invariants not to break
 
-[INVARIANTS.md](INVARIANTS.md). Twelve rules, each with the real-world
+[INVARIANTS.md](INVARIANTS.md). Ten rules, each with the real-world
 damage and the line of code that stops it. If you are touching delivery,
-read rules 1 to 5 before you write anything, and rule 12 before you touch
-anything that decides a pane is ready to be written into.
+read rules 1 to 4 before you write anything, and rule 3 before you touch
+anything that decides whether a doorbell may be written.
 
 ## Decisions, and what was rejected
 
@@ -362,9 +306,9 @@ escape hatch into code.
 
 ### The journals are append-only NDJSON
 
-**Chosen:** one mailbox journal per durable workspace and one compatibility
-journal per session. Each uses one JSON object per line, appended and fsynced,
-never rewritten. Corrections are new lines.
+**Chosen:** one mailbox journal per durable workspace and one session
+journal per watched session. Each uses one JSON object per line, appended
+and fsynced, never rewritten. Corrections are new lines.
 
 **Rejected:** any store that updates a record in place. The pattern was
 taken from cmux's `events.jsonl` rather than invented.
@@ -383,22 +327,20 @@ path alters a complete record. And an audit you can edit is not an audit.
 takes 7.3ms, which is why `msg.history` is a scan and not a database.
 
 **What it costs:** no queries beyond a scan, and paging across the workspace
-journal plus compatibility session files needs an opaque composite cursor
-rather than an offset.
+journal plus the session files needs an opaque composite cursor rather than
+an offset.
 
 ### Zero polling
 
 **Chosen:** state changes arrive as control-mode notifications and
 subscription pushes; reconciliation is triggered by an event or a request.
-The long-lived coordination timers are named one-shots: one 30ms debounce,
-bounded timers inside a live delivery, one event-armed candidate lifecycle
-settle timer per pane, one unclaimed reminder per attempt, optional exact
-force-submit deadlines, and bounded post-action evidence checkpoints. Competing
-force-submit schedulers wait for a resolution-release event when needed; durable
-intent limits competing resolvers, and a final forced reservation elects at
-most one terminal key. The lifecycle worker evaluates each candidate generation
-once per observation and then parks. This is not an inventory of every bounded
-deadline in an explicit command or recovery action.
+The long-lived coordination timers are named one-shots: one 30ms debounce in
+the watcher, the bounded timers inside a live delivery (the post-paste
+readback re-reads, the ACK window, the screen checkpoints, the decline
+spacing, the two bounded re-observations of a hold that announces no event,
+and the single wedged-hold ping), one event-armed candidate lifecycle settle
+per hook edge, and the deadlines a caller asked for. Nothing runs on an
+interval.
 
 **Rejected:** a 1Hz reconcile loop, which is the obvious design and would
 have been simpler.
@@ -422,21 +364,21 @@ poll around it (F23).
 **Rejected:** writing `role • state` into the pane title, which the brief
 originally asked for.
 
-**Why:** two of the four shipped manifests read `#{pane_title}` as a
-sensor, and Claude's spinner rules ARE the title tier. Writing the title
-would blind detection to paint decoration, feed Cyclops's own decoration
-back into its own sensor (F13), and lose the race to any agent that
-publishes its own title anyway (F23, F26). The border already displays the
-title by default, so replacing the border FORMAT replaces the view without
-touching the value underneath.
+**Why:** several shipped manifests read `#{pane_title}` as a sensor, and
+Claude's spinner rules ARE the title tier. Writing the title would blind
+detection to paint decoration, feed Cyclops's own decoration back into its
+own sensor (F13), and lose the race to any agent that publishes its own
+title anyway (F23, F26). The border already displays the title by default,
+so replacing the border FORMAT replaces the view without touching the value
+underneath.
 
 If you are about to add title writing because the brief mentions it: this
 is why it is not there.
 
 ### The one trait with one implementation is deliberate
 
-**Chosen:** delivery reaches a pane through an `Injector` seam (paste,
-submit, capture). `TmuxInjector` is the only implementation.
+**Chosen:** delivery reaches a pane through an `Injector` seam (spool,
+commit, submit, capture). `TmuxInjector` is the only implementation.
 
 **Rejected:** inlining it, which STYLE would otherwise ask for. Two call
 sites do not need a trait.
@@ -448,8 +390,8 @@ contract-grade delivery semantics and no screen scraping at all. It lost
 because it discards the native TUIs the operator watches and one of the
 three protocols did not exist yet, and it was kept as the designated route
 if TUI injection ever becomes untenable. The seam is what makes that a
-per-agent backend swap rather than a rewrite: the gate, the verification
-and the ACK tiers call through it and nothing else.
+per-agent backend swap rather than a rewrite: the gate and the receipt wait
+call through it and nothing else.
 
 So this is the one place where a single implementation earns an
 abstraction, and it is the one place a tidying pass would remove it.
@@ -523,11 +465,10 @@ one who read code signed off on a lying attention indicator twice.
 `STATUS.md` keeps the current backlog, risks, and known floors, and it is
 maintained. Two worth knowing on day one because they look like bugs:
 
-- **A legacy direct-delivery quota park has no requeue verb.** It is terminal
-  in the session record and an operator sends again after the reset. A standard
-  mailbox notification stays held until fresh screen evidence records the
-  reset, then only the administrator's explicit `cyclops requeue <message-id>`
-  starts a new attempt. Neither path retries automatically.
+- **A quota screen is a gate hold, not a park.** The doorbell waits for the
+  pane to change and never retries on a clock. `cyclops requeue` exists only
+  for an attempt that ended in `attention_required`; a held attempt needs
+  nothing from you but the vendor's reset.
 - **`cyclops start` cannot tell two same-shaped arrangements apart** when
   the daemon holds no names for the session. Naming one pane closes it.
   Grid topology alone genuinely cannot answer it.

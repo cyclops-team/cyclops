@@ -37,7 +37,7 @@ config and detection manifests. It ends by telling you whether this shell
 can already find them:
 
 ```
-✔ cyclops 1.0.2 is installed
+✔ cyclops 1.1.0 is installed
   cyclops    /Users/you/.local/bin/cyclops
   cyclopsd   /Users/you/.local/bin/cyclopsd
   home       /Users/you/.cyclops
@@ -180,10 +180,10 @@ an agent. [panes.md](panes.md).
 
 ## 4. Wire the hooks
 
-Standard CLI messaging queues a concise two-sentence preview beside an exact
-claim command. The full body stays in the authenticated mailbox. Hooks report
-authenticated lifecycle edges that help Cyclops distinguish a running turn
-from a clean composer before it stages that notification.
+Standard CLI messaging queues a one-line preview beside an exact claim
+command. The full body stays in the authenticated mailbox. Hooks report
+authenticated lifecycle edges that tell Cyclops when a turn starts and ends,
+and the acknowledgement hook is how a doorbell earns a verified receipt.
 
 ```
 cyclops hooks install claude --agent reviewer   # renders config, prints wiring
@@ -296,7 +296,7 @@ jq -c 'select(.kind == "msg") | {from, to, subject, reply_to}' \
 The immutable body, mailbox mutations, and content-free notification facts
 are append-only. Treat the journal as sensitive owner-only state. Use the CLI
 when caller-scoped body access matters. Session records under
-`$CYCLOPS_HOME/ledger/` cover pane state and legacy direct delivery; they are
+`$CYCLOPS_HOME/ledger/` cover pane state and each attempt's session transitions; they are
 not the canonical mailbox journal.
 
 Reading either journal is free and never writes.

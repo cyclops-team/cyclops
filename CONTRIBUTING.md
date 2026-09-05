@@ -285,7 +285,7 @@ Local green plus red CI is not a flaky-CI story until the logs say so.
 - **Vendor behavior goes in a manifest, not in Rust**
   ([MANIFESTS.md](docs/reference/MANIFESTS.md)).
 - **No polling.** If you are reaching for an interval, you have not found
-  the event yet ([INVARIANTS.md](docs/development/INVARIANTS.md), rule 9).
+  the event yet ([INVARIANTS.md](docs/development/INVARIANTS.md), rule 8).
 - **Record what you measured.** If you learned something about tmux, a
   vendor CLI, or a platform that contradicts what the code assumed, it goes
   in `findings.md` with the probe that proved it. Those entries are worth

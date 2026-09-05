@@ -13,21 +13,25 @@ Cyclops observes and coordinates them.
 - Agent state derived from vendor hooks, pane titles, output, and screen
   evidence.
 - Durable workspace mailboxes with authenticated senders and exact claims.
-- Guarded pane notifications with a separate wake state. Current CLI sends
-  show a two-sentence preview and exact claim while the full body remains in
-  the authenticated mailbox.
+- One doorbell line per message with a separate wake state: a one-line
+  preview and the exact claim command, while the full body remains in the
+  authenticated mailbox.
 - A live stream and full-screen workspace for watching and controlling panes.
 - An append-only workspace message journal plus separate session state ledgers.
 
-Cyclops supports Claude Code, Codex CLI, Cursor Agent, and Antigravity CLI
-through shipped detection manifests. Another terminal CLI needs a manifest,
-not a Cyclops SDK or wrapper.
+Cyclops ships twelve detection manifests. Five are measured against a live
+CLI: Claude Code, Codex CLI, Antigravity CLI, Cursor Agent CLI, and Kimi Code
+CLI. Seven are written from vendor documentation and marked unverified:
+Gemini CLI, Qwen Code, goose, OpenCode, Amp, Crush, and aider. Another
+terminal CLI needs a manifest, not a Cyclops SDK or wrapper.
 
-Support is version-specific and fails closed when current evidence is missing.
-The current Cursor terminal-notification path has fixture coverage but has not
-completed a live current-version validation run because no current Cursor
-binary was available on the evidence host. Socket inbox claims remain usable.
-See [Recover a notification](/guides/recovery).
+Support is version-specific. A manifest measured against one version may
+misread the next; the doorbell still goes through, and a line that could not
+be read back is recorded as unverified rather than retried. An unverified
+manifest carries no composer rule, so it never detects a human draft. The
+Cursor terminal path has fixture coverage but no live current-version run,
+because no current Cursor binary was available on the evidence host. See
+[Recover a notification](/guides/recovery).
 
 ## The two processes
 

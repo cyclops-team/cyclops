@@ -57,10 +57,11 @@ If you explicitly prefer a native tmux client without Cyclops workspace
 chrome, `tmux attach -t main` opens the same session as a standard tmux grid.
 It does not show the Cyclops sidebar, tabs, or Messages pane.
 
-Cursor detection ships, but its current-version terminal-notification path has
-not completed live validation. It fails closed when exact evidence is missing;
-use `cyclops inbox next` or `cyclops inbox claim` over the socket. See
-[Recover a notification](/guides/recovery).
+Cursor detection ships with fixture coverage, but its current-version
+terminal-notification path has not completed live validation because no
+current Cursor binary was available on the evidence host. A Cursor doorbell
+goes through the ordinary gate; `cyclops inbox next` and `cyclops inbox claim`
+over the socket also work. See [Recover a notification](/guides/recovery).
 
 An authenticated claim prints one framed message with immutable `TO`, `FROM`,
 and `SUBJECT` labels, the full durable body, an exact reply command, and a

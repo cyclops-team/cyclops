@@ -1,9 +1,10 @@
 # Hooks
 
 Vendor hooks report authenticated lifecycle edges. Standard mailbox messaging
-uses them with pane detection to decide whether a summary-and-claim notification
-is safe to write. The legacy direct-delivery self-test also uses an acknowledgement
-hook to prove that its injected test payload arrived. A rendered config proves
+uses them with pane detection to tell a running turn from a finished one, and
+the acknowledgement hook is how a doorbell earns a verified receipt. The
+self-test sends one real doorbell and asks whether that hook fired. A
+rendered config proves
 nothing until an edge actually arrives, so Cyclops splits the job into prepare,
 wire, and prove.
 
@@ -59,8 +60,8 @@ Wiring per CLI:
 - **agy**: if `<workspace>/.agents/hooks.json` does not exist, copy the
   rendered artifact there. If it exists, merge only Cyclops' event entries,
   preserving every unrelated key and handler; never overwrite it. agy has no
-  payload-matchable acknowledgement, so its legacy self-test stays
-  screen-verified; these hooks feed liveness and turn detection.
+  payload-matchable acknowledgement, so its doorbells and its self-test
+  settle on screen evidence; these hooks feed liveness and turn detection.
 - **cursor**: if `<workspace>/.cursor/hooks.json` or `~/.cursor/hooks.json`
   does not exist, copy the rendered artifact there. If it exists, merge only
   Cyclops' event entries, preserving every unrelated key and handler; never
@@ -69,7 +70,8 @@ Wiring per CLI:
   way. On the measured Cursor build, `beforeSubmitPrompt` carried the full
   prompt text and could match an exact payload. No current Cursor binary was
   available for the release validation run, so that historical measurement is
-  not a current verified-tier claim. Current unknowns fail closed.
+  not a current verified-tier claim; a Cursor doorbell goes through the same
+  gate as every other measured manifest's.
 - **kimi**: if `~/.kimi-code/config.toml` does not exist, copy the rendered
   artifact there. If it exists, merge only Cyclops' `[[hooks]]` entries,
   preserving every unrelated key and handler; never overwrite it. Restart
@@ -145,7 +147,7 @@ reason; successful and unchanged outcomes leave that field null.
 cyclops hooks verify reviewer
 ```
 
-Prints the pane's legacy acknowledgement tier and the last-seen age of every
+Prints the pane's acknowledgement tier and the last-seen age of every
 hook event.
 `cyclops status` carries the same bit: `hooks unverified` marks an adopted
 pane whose configured hooks have never fired this daemon run. Exit 1 while
@@ -165,8 +167,8 @@ inside the very pane it reports for, verified against the connection's
 kernel peer credentials the same way send identity is. Real hooks pass by
 construction: `cyclops hook` runs as a child of the vendor CLI inside the
 pane. Anything else, the admin shell included, is denied and nothing is
-ingested, so neither the `hooks verified` bit nor a legacy
-`delivered · verified` self-test receipt can be forged by a process that merely
+ingested, so neither the `hooks verified` bit nor a hook-verified
+self-test receipt can be forged by a process that merely
 shares your user id.
 
 The daemon resolves that process to the exact watched session, pane id, and
@@ -180,17 +182,19 @@ occupant cannot inherit hook liveness from the original route.
 cyclops hooks selftest reviewer
 ```
 
-The daemon sends one fyi message through the legacy direct-delivery pipeline
-(subject `[cyclops] hook self-test`, body "Reply not needed.") and reports
-whether the ack hook fired carrying the marker. Costs the recipient one
-trivial turn; the result is also recorded in the ledger. Exit 0 when the
+The daemon sends one real fyi message through the normal mailbox path
+(subject `[cyclops] hook self-test`, body "Reply not needed."). Its doorbell
+goes through the ordinary gate and the message stays in the target's inbox
+until claimed. The command reports whether the ack hook fired carrying that
+doorbell. Costs the recipient one trivial turn; the result is also recorded
+in the journals. Exit 0 when the
 ack hook fired, 1 otherwise (always 1 on a screen-tier CLI like agy: there
 is no ack hook to fire, the delivery state is the whole answer).
 
 ## When hooks never fire
 
-The legacy self-test can still land without an acknowledgement. Its tier-1
-window times out and the result downgrades to screen evidence
-(`✓ delivered · unverified (screen)`). This does not describe standard
-`cyclops send`, which accepts a mailbox message first and reports notification
-state separately.
+The self-test can still land without an acknowledgement. Its ACK window times
+out and the doorbell settles on screen evidence
+(`✓ delivered · unverified (screen)`), which is what every doorbell to that
+pane will do until the hook fires. The message itself was accepted first
+either way; hooks change the receipt, never the acceptance.

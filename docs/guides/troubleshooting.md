@@ -175,22 +175,19 @@ claimed. Run `cyclops messages` to inspect the current mailbox and notification
 state. If the target pane is unknown, start its agent or pin the correct
 manifest. The body remains in the mailbox and is never pasted into the pane.
 
-If `cyclops status` shows runtime idle but also prints `composer Cyclops
-notification staged`, read the whole subrow. It names write readiness, the
-notification and mailbox states, the next action, and the exact attempt id.
-Cyclops must either submit that exact owned notification once, reconcile an
-uncertain submit, expose a recoverable attention item, or allow a proven
-pre-write withdrawal. It must not treat the staged notification as a generic
-human draft or leave it unreported.
+If `cyclops status` shows runtime idle but also prints a composer subrow,
+read the whole subrow. It names the composer, the notification and mailbox
+states, the next action, and the exact attempt id. A doorbell that was
+written and not yet consumed holds the next doorbell to that pane until the
+recipient's turn ends or the line is seen erased; it is never treated as a
+human draft.
 
 If the notification reaches `needs attention`, run `cyclops alarm preview
---older-than 0s` and inspect the exact attempt with `cyclops attention show
-<attempt-id> --diff`. Do not resend or requeue blindly.
+--older-than 0s`, then look at the pane. Do not resend or requeue blindly.
 
 If status reports `wake blocked before write`, inspect the cause. A
-`binding_unprovable` block needs process or route repair. A
-`composer_semantic_missing` block means the matched manifest rule does not say
-whether the composer is clean. A `worker_failed` block means the supervised
+`binding_unprovable` block needs process or route repair. A `worker_failed`
+block means the supervised
 delivery worker exhausted its pre-write restart budget. The other exact causes
 name an unavailable session, manifest, or payload, changed write readiness, or
 a failed paste-buffer spool. None writes to the pane. Claim the message through
@@ -225,7 +222,7 @@ jq -c 'select(.id == "m-<full-uuid-suffix>")' \
 
 That append-only journal owns immutable messages, mailbox mutations,
 notification transitions, and recovery facts. Session ledgers under
-`$CYCLOPS_HOME/ledger/` own pane state and legacy direct delivery. Use the CLI
+`$CYCLOPS_HOME/ledger/` own pane state and each attempt's session transitions. Use the CLI
 instead of raw journal bytes when caller-scoped body visibility matters.
 
 ## "no manifest \"cluade\"; loaded: agy, claude, codex, cursor"
@@ -247,7 +244,7 @@ $ cyclops status
 ```
 
 The id and age in this compatibility example change on every run. This status
-surface owns blocked panes, legacy direct-delivery attention, the unread admin
+surface owns blocked panes, session-record attention, the unread admin
 count, and a bounded body-free sample of notification wakes blocked before any
 write. It prints the full blocked-wake count when the sample is shorter than the
 total. Use `cyclops messages` and `cyclops alarm preview --older-than <age>` for
@@ -261,36 +258,31 @@ turn is active.
 ## A mailbox notification says `needs attention`
 
 The send itself was already accepted. `cyclops messages` names the current
-content-free notification state and attempt id. Inspect that exact attempt:
+content-free notification state, its cause, and the attempt id. The cause is
+one of `paste_failed`, `submit_failed`, `pane_rebound_after_paste`,
+`transport_outcome_unknown`, or `daemon_restart`: a physical write failure, or
+a restart between the paste and its receipt. It means the terminal outcome is
+unknown, not that the line did not land. Look at the pane. If the line is not
+there and the recipient has not claimed, `cyclops requeue <message-id>` starts
+a fresh attempt through the ordinary gate. `cyclops alarm clear` acknowledges
+the alarm and changes nothing else. Retrieve the durable message with
+`cyclops inbox claim <message-id>` at any time. The exact transition rules are
+in the [protocol reference](../reference/PROTOCOL.md#mailbox-and-notification-control).
 
-```bash
-cyclops attention show <attempt-id> --diff
-```
-
-`show` is read-only. If the evidence still matches, `attention complete` or
-`attention discard` performs one guarded action. An uncertain outcome must be
-inspected and must not be repeated. `cyclops messages` names which recovery
-boundary was proven, and reconciliation never sends a second terminal key.
-`cyclops alarm clear` acknowledges the alarm but does not abandon an unfinished
-terminal action. Retrieve the durable message with `cyclops inbox claim
-<message-id>`. Only use `cyclops requeue <message-id>` after resolving the cause
-and confirming that the notification is eligible. The exact transition and
-reconciliation rules are in the
-[protocol reference](../reference/PROTOCOL.md#mailbox-and-notification-control).
-
-## A legacy hook self-test lands unverified
+## A hook self-test lands unverified
 
 ```
 ✓ delivered · unverified (screen)
 ```
 
-This is the legacy direct-delivery self-test result. The injected test payload
-reached screen evidence, but the recipient's acknowledgement hook did not fire.
-It is not a standard mailbox receipt.
+The self-test sent one real doorbell through the mailbox path. It was
+submitted and settled on screen evidence, but the recipient's acknowledgement
+hook did not fire. Every doorbell to that pane will settle the same way until
+the hook fires.
 
 ```
 cyclops hooks verify reviewer    # which edges have ever arrived
-cyclops hooks selftest reviewer  # one no-op delivery, proves the ack fires
+cyclops hooks selftest reviewer  # one real doorbell, proves the ack fires
 ```
 
 The most common cause is Codex CLI in an untrusted directory: it silently

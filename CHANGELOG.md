@@ -28,164 +28,76 @@ versions are unreleased until admin cuts a tag.
 - Modal toggle on Space: keyboard-only navigation in Settings where Space toggles switches and checkboxes instantly.
 - Enlarged composer clear button: expanded the clear composer control into a bracketed button (`[⌫ clear]` / `[⌫]`) with an expanded hit target for easier mouse clicking.
 
-## [Unreleased]
+## [1.1.0] - 2026-09-04
 
-The selected prerelease identity for the audited Rust beta candidate is
-`0.1.0-beta` / `v0.1.0-beta`. The historical `v0.2.0-beta` tag remains attached
-to older source. No new tag or GitHub Release has been created.
-
-### Fixed
-
-- A clean idle Cursor Agent composer could never prove itself write-safe:
-  the manifest's dim-placeholder rule carried `composer_semantic =
-  "ambiguous"`, so every wake to an idle Cursor pane was held on
-  `no_write_safe_composer_evidence` forever — a reviewer → tests handoff
-  sat "checking readiness" for 16+ hours against a visibly idle pane. A
-  new `composer_clean_idle` rule now proves the composer empty AND at
-  rest with an end-anchored escaped match: Cursor paints its `ctrl+c to
-  stop` hint on the composer line for exactly the duration of a turn, so
-  the anchor cannot match a working frame, and mid-turn frames — where
-  Cursor injection is unmeasured — keep failing closed on the ambiguous
-  rule below it. Locked against the live capture in
-  `cursor_clean_idle_composer_esc.txt` (cursor-agent 2026.08.25-3e8eec8).
-- A wake whose composer kept reading `ambiguous` on an idle pane waited
-  in memory as "checking readiness" indefinitely, invisible to `cyclops
-  status` and to the reopen scheduler. The gate now gives continuous idle
-  ambiguity one configurable, one-shot grace
-  (`ambiguous_composer_settle_ms`, default 10 seconds), then records an
-  operator-visible, withdrawable pre-write block. The established
-  `write_readiness_changed` journal cause remains compatible with existing
-  readers; the optional observation carries the exact
-  `composer_semantic_ambiguous` reason. Later complete, write-ready route
-  evidence can reopen the same wake once. Mid-turn ambiguity never
-  escalates because working frames do not reach the idle arm.
-- Detaching or quitting the workspace could leave the theme's ground on the
-  shell underneath when a terminal accepted an OSC 11 background *set* but
-  ignored its reset. Host-palette theming now requires a complete, read-only
-  `[workspace]` `terminal_default_fg` and `terminal_default_bg` pair. Cyclops
-  applies the theme while focused and restores that exact pair through OSC
-  10/11 on exit and focus loss. Without a valid pair it leaves the host
-  palette untouched, and it never reads terminal input to discover colors.
-- The Messages pane's current-session view told sessions apart by pane id
-  alone, so after a tmux server restart the new `main` showed the messages
-  of the `main` that died before it: tmux hands `%0`, `%1`, … out again,
-  and an old row addressed to `%1` matched the new session's pane set.
-  The view now addresses the session by the durable identity the daemon
-  bound to it together with its panes, on the sender, the recipient, and
-  the recipient's current route alike. The earlier session's rows are
-  untouched in the durable history and in the all-sessions view.
-- A workspace that owned two sessions, which is what reopening Cyclops
-  from another terminal produces once it takes over `main` and reopens the
-  last-active session, answered every `%layout-change` with another
-  `resize-window` for every window it owned. tmux answers each of those
-  with a `%layout-change` whether or not the size changed (F82), so the
-  canvas jumped continuously with the workspace and the tmux server each
-  on half a core. The background session's window was being read as
-  "not at its target" because it has no tab in the displayed model.
-  Divergence is now judged only for windows on screen, and a target tmux
-  clamps rather than gives is asked for once more at most.
-- A `[workspace.bindings]` rebinding onto a chord a default already used
-  left both actions on the chord, and which one fired depended on hash
-  order: it worked in one process and did nothing in the next. The
-  rebinding now takes the chord and the default is unbound.
-
-### Added
-
-- Durable workspace mailboxes now separate immutable messages, recipient claims,
-  one-shot wake notifications, and reply threads. `cyclops inbox next` can wait
-  and claim over the socket without touching a terminal composer.
-- `cyclops messages` and the Messages view show one body-free row per message
-  recipient, with mailbox and wake state kept separate. Runtime status now
-  reports composer ownership, write readiness, notification state, mailbox
-  state, and the next action when those facts differ.
-- Workspace administrators can inspect and recover exact notification attempts
-  with alarm preview and clearance, guarded complete or discard, explicit
-  requeue, and provably pre-write notification withdrawal. A fresh same-user
-  shell can perform this work without pretending to be an agent pane.
-- `cyclops health` reports selected binaries, daemon identity, state safety,
-  setup, caches, update scratch, and rollback evidence without changing them.
-  `cyclops cleanup` removes only validated rebuildable asset classes and is a
-  dry run unless `--apply` is present.
-- Installation and update activate a matched CLI and daemon pair. Update proves
-  build identity and journal replay before activation, preserves one validated
-  known-good pair, and supports `cyclops update --rollback`.
-- The workspace's app menu has a `Settings` item in place of `Themes`
-  and `Keybinds`. It opens one card with three sections: the theme
-  picker, unchanged, a `Sound notifs` switch, and the keybinding
-  reference, which was a card of its own. `Tab` walks the sections (or
-  click a section's chip), `↑`/`↓` move in the showing list (or click a
-  row; `PgUp`/`PgDn`, `Home`/`End` and the wheel move too); landing on
-  a row moves the `✓` to it without saving, `Enter` saves what is
-  checked, `Esc` forgets it. The card keeps one size across sections.
-  The Keybinds section scrolls its rows behind a viewport, counts the
-  rows showing, and closes on `Enter` or `Esc`: nothing on it to apply.
-  `Ctrl+B` `?` (`show_keybinds`) opens the card on that section.
-  The switch is saved as `[workspace] sound_notifs` (off by default).
-  Under the switch, the sounds to choose from: every file in
-  `~/.cyclops/sounds/` by name (`bow-ripple` and `glass-ping` ship and
-  are seeded there), then `System alert`; landing on one
-  plays it (a click plays it again), `Enter` saves it as `[workspace]
-  sound` (`"bow-ripple"` by default). The binding name is
-  `show_settings`; a config that binds `show_themes` keeps working.
-- With sound notifications on, the workspace plays a cue when an agent
-  you are not looking at gives you a reason to look: it finished a turn
-  (working to idle), needs a human (attention raised or blocked), or
-  died. Starting to work is silent, and so is the focused pane while the
-  terminal has focus. The cue is `bow-ripple.wav`, shipped in the binary
-  and seeded to `~/.cyclops/sounds/` by `cyclops start` and bare `cyclops`
-  like the themes, played through the platform's stock player; the
-  terminal bell stands in when the file is missing.
+### Removed
+- The legacy direct-payload delivery pipeline: the in-process payload writer
+  and its per-pane workers, restart settlement of direct chains, send-and-wait
+  pinning, doorbell formats 1 to 3, and the per-attempt mailbox capability
+  recheck. Journals that carry them still replay; their states are marked
+  replay only.
+- The ambiguous-composer settle timer (`ambiguous_composer_settle_ms`), the
+  unclaimed reminder (`unclaimed_reminder_ms`), force-submit and its settings
+  (`force_notification_submit`, `force_notification_submit_delay_ms`), the
+  operator `attention show`, `attention complete`, and `attention discard`
+  actions and their wire methods, composer recovery barriers, quota-reset
+  observation, the hook-admission veto, and the pane-width block. A config
+  file that still names a retired key boots with a warning instead of
+  failing.
+- `cyclops ui`; the stream is `cyclops watch`.
 
 ### Changed
+- Delivery is a durable mailbox plus one doorbell line. The gate is three
+  checks: the pane is present, alive, and not in copy-mode; a manifest binds
+  it and its foreground process is the agent; and the composer holds only on
+  a positively observed human draft or a hold an earlier attempt owns.
+  Ambiguous or absent composer evidence no longer holds a doorbell. After the
+  paste the daemon captures once, presses Enter regardless, and records
+  `submitted` or `submitted_unverified`; a receipt comes from the hook, the
+  screen, or neither, and `attention_required` is written only for a
+  physical write failure. Blocked states hold with one admin ping and
+  re-evaluate on the next pane event; quota is a gate hold like the others.
+- `--summary` is optional on `cyclops send` and `cyclops reply`. A missing
+  summary is derived from the subject, never from the body when a subject
+  exists, and the summary rule is one non-empty line of at most 240
+  characters.
+- `hooks.selftest` runs one real message through the mailbox path instead of
+  the removed direct-payload writer.
+- Interpreter-run agents (`node`, `python`, `bun`, `deno`) bind by the script
+  name behind the interpreter; the foreground process group is read through
+  `proc_pidinfo` and `/proc` instead of spawning `ps`.
+- The installer tries a published release archive for the host target first
+  (SHA256-verified, same pair activation) and falls back to the source build
+  with a message; `--source` forces the build.
+- Skill seeding groups targets by path, so every consumer that reads
+  `~/.agents/skills` shares one copy; workspace start and uninstall iterate
+  the consumer catalog instead of two hand-maintained vendor lists.
+- Twelve historical review, audit, charter, and roadmap documents moved under
+  `docs/development/archive/` with a dated index, and the documentation was
+  rewritten to describe the 1.1.0 delivery contract. The doc path checker now
+  scans the public Mintlify pages.
+- `scripts/check.sh --quick` runs formatting, clippy, and the unit tests only.
 
-- `cyclops send` no longer advertises the nonfunctional `--wait` option.
-  Durable message acceptance and occupant-pinned pane waiting remain
-  separate contracts because a pane state edge cannot prove that a
-  specific message or task completed.
-- The from-source install builds faster. The installer now compiles only
-  the two installed binaries, under a new `dist` cargo profile: release
-  optimizations without the thin-LTO link step, whose runtime margin an
-  I/O-bound tmux orchestrator never feels and whose cost every
-  installing machine paid. Developer and CI `--release` builds are
-  unchanged, and `cyclops update` inherits the faster build because it
-  runs the same installer.
+### Added
+- `raw` on `msg.send` and `msg.reply`, and `cyclops send --raw` and
+  `cyclops reply --raw`: paste the whole message into the pane and press
+  Enter with no composer check, recorded as an unverified raw write.
+- Manifests, hook templates, hook wiring, and skill seeding for Gemini CLI,
+  Qwen Code, and goose; manifests and skill seeding for OpenCode, Amp,
+  Crush, and aider. All seven ship as `version_tested = "unverified"`: they
+  bind the pane and recognize startup dialogs and nothing more.
+- A release-binaries workflow that builds and uploads the matched
+  `cyclops`/`cyclopsd` pair for four targets on a `v*` tag, refusing a tag
+  that does not match the workspace version.
+- `scripts/sweep-target.sh` and a contributing note for a shared target
+  directory across worktrees.
 
 ### Fixed
-
-- Doorbell v2 is an attempt-bound claim command. Its shell-comment suffix
-  losslessly encodes the complete 128-bit notification attempt id, while the
-  command itself remains runnable. The format fits two 60-column rows, is
-  recorded at the write boundary, and can be reconstructed exactly during
-  recovery. Legacy doorbell formats remain recoverable and unknown future
-  formats fail closed.
-- Notification workers expose and durably classify their exact in-flight
-  attempt. Repeated identical pre-write failures settle once with a named cause
-  instead of looping, and a worker crash cannot silently lose the recipient FIFO
-  head.
-- Durable routes and replies use endpoint and process-generation identity rather
-  than mutable display labels. Unknown watch filters fail immediately, and a
-  socket claim can break the former receive-tool and terminal-gate cycle.
-- Codex working-state detection now uses the measured ten-frame active pane
-  title when queued terminal input displaces the screen spinner. Static titles
-  keep using the existing narrow screen rule.
-- Installing cyclops before the agent CLIs no longer strands the vendor
-  wiring. The installer's `--wire-hooks` consent lived only in its one
-  run: with no `~/.claude` yet, the hook configs and the agent skill
-  were rightly skipped, and nothing ever came back for them. Only the
-  installer and `cyclops update` pass the flag. Setup now records the
-  consent at `~/.cyclops/vendor-wiring-consented`, and every ordinary
-  boot (`cyclops`, `cyclops start`) finishes the wiring for agent CLIs
-  that appeared since, printing a line only when something was actually
-  written. Deleting the marker withdraws the consent, and
-  `CYCLOPS_NO_VENDOR_HOOKS=1` still declines everything.
-- `cyclops start` now actually refreshes the prepared hook configs, the
-  repair `cyclops hooks install` has promised since receipts existed.
-  The refresh machinery was built and tested but never called: after an
-  update moved the binary, every receipted artifact kept invoking the
-  old path and its hooks failed silently. Setup now re-renders receipted
-  artifacts whose recorded binary is gone, prints what it changed, and
-  still never touches an edited file, an unreceipted file, or a copy
-  merged into vendor config (those are named instead).
+- Uninstall never removed Kimi hooks; both vendor lists now come from the
+  consumer catalog.
+- A hold whose cause announces no event (an unreadable process table, a
+  refused composer claim) re-reads on a bounded one-shot instead of waiting
+  for a pane event that may never come.
 
 ## Historical pre-release development record
 

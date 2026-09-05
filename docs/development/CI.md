@@ -313,6 +313,36 @@ Run the path classifier's contract examples with:
 python3 scripts/ci-paths.py --selftest
 ```
 
+### Daemon test binaries
+
+`src/cyclopsd/tests/` is seven integration binaries, not one per file. Each
+binary links the whole daemon, so the thirty-one files that used to link
+separately are submodules of one `main.rs` per contract, and
+`cargo test -p cyclopsd -- --test-threads=4` overlaps their rigs inside one
+process instead of running one small binary after another:
+
+| Binary | Contract it protects | Modules |
+|---|---|---|
+| `boot_and_sessions` | The daemon boots, adopts, watches, and tears down | `m0`, `session_watch`, `lifecycle`, `pane_lifecycle`, `restart_eye`, `teardown`, `demos_lib` |
+| `identity` | Who is speaking | `identity`, `sender_identity`, `hook_peer_authentication`, `state_permission_contract` |
+| `messaging` | The durable mailbox and what surrounds it | `messaging_coordinator`, `stage1_unread_projection`, `body_privacy`, `m2_history`, `m4_name`, `m5_theme`, `m6_manifests` |
+| `delivery` | The write boundary | `gate`, `wait`, `m2_hooks`, `write_readiness_matrix`, `live_use_receive` |
+| `journeys` | Multi-agent end-to-end scenarios | `three_agent_journey`, `gate3_release_proof` |
+| `evidence` | Measurements; every test is `#[ignore]` | `communication_benchmark`, `concurrent_messaging_perf`, `cold_start_replay_perf`, `idle_observation_perf`, `release_transport_benchmark`, `stage_and_clear_soak` |
+| `scratch_override` | `CYCLOPS_TEST_TMP` selects the scratch root | Its one test mutates a process-global variable, so it stays alone |
+
+A test is addressed by module path, for example
+`cargo test -p cyclopsd --test boot_and_sessions m0::m0_shadow_daemon_end_to_end -- --exact`.
+The `evidence` binary is not linked by `scripts/check.sh`; the scheduled and
+release lanes run it with `--ignored` through `scripts/ci-performance.py` and
+`scripts/ci-reliability.sh`. The shared rig in
+`src/cyclopsd/tests/common/mod.rs` bounds concurrent rigs per process with a
+semaphore, which is why the daemon suite runs under `cargo test` rather than
+nextest's process-per-test model. Test-side waits in that rig wake on the
+daemon's own events (`state`, `session`, `readiness`, `messages.changed`)
+and then re-ask the authority, status or the journal; a wait with no event
+to wake on says so in a comment where it polls.
+
 ### Local quick tier
 
 `./scripts/check.sh --quick` is not a CI lane; no workflow calls it. It is a
@@ -320,31 +350,27 @@ one-to-two-minute local subset for the middle of editing, cheaper than
 `--fast`: formatting, Clippy, and `cargo nextest run --workspace -E
 'kind(lib) | kind(bin)'`, the unit tests compiled into each crate's own
 `kind(lib)`/`kind(bin)` target. Every tmux-backed and daemon-backed
-integration test, including the three retained performance binaries, is a
-separate `kind(test)` target discovered from a crate's `tests/` directory,
-so that one filter excludes all of them without naming each one. Still run
+integration test, including the retained performance binaries and the
+daemon's `evidence` binary, is a separate `kind(test)` target discovered
+from a crate's `tests/` directory, so that one filter excludes all of them
+without naming each one. Still run
 `--fast` or the full gate before a push; `--quick` only shortens the loop
 before that.
 
 ## Scheduled evidence
 
-`.github/workflows/scheduled-evidence.yml` runs after every merge to
-**beta/messaging-rework**, runs nightly once the workflow reaches GitHub's
-default branch, and can be dispatched by lane. GitHub only fires cron workflows
-from the default branch, so the beta integration trigger prevents a dormant
-replacement lane during the rework. The workflow owns the complete Linux and
-macOS matrix, the full fast gate against tmux master, retained performance
-workloads, repeated race evidence, forced-cleanup evidence, soak tests, and
-long-history workloads.
+`.github/workflows/scheduled-evidence.yml` runs nightly from `main` and can
+be dispatched by lane. The workflow owns the complete Linux and macOS matrix,
+the full fast gate against tmux master, retained performance workloads,
+repeated race evidence, forced-cleanup evidence, soak tests, and long-history
+workloads. The file still carries a push trigger for an integration branch
+from before the workflow reached `main`; nothing pushes there now.
 
-While the workflow exists only on the beta branch, merging into
-**beta/messaging-rework** triggers every scheduled lane. GitHub registers
-`workflow_dispatch` only after the workflow reaches the default branch. After
-that final integration, dispatch all lanes manually with:
+Dispatch all lanes manually with:
 
 ```bash
 gh workflow run scheduled-evidence.yml \
-  --ref beta/messaging-rework \
+  --ref main \
   -f lane=all
 ```
 
@@ -458,58 +484,23 @@ a CI control input changes:
 python3 scripts/ci-release-evidence.py --selftest
 ```
 
-GitHub registers `workflow_dispatch` only from the default branch. Until this
-beta workflow reaches `main`, exercise the release lane by creating its
-disposable beta trigger branch at the exact integration commit:
+Run the release lane on the candidate commit with:
 
 ```bash
-integration_ref=refs/heads/beta/messaging-rework
-trigger_ref=refs/heads/beta/test/release-evidence
-release_sha="$(git ls-remote --exit-code origin "$integration_ref" | awk 'NR == 1 { print $1}')"
-test -n "$release_sha"
-if git ls-remote --exit-code origin "$trigger_ref" >/dev/null; then
-  echo "release-evidence trigger branch already exists; inspect that run first" >&2
-  exit 1
-fi
-git push --force-with-lease="${trigger_ref}:" origin "${release_sha}:${trigger_ref}"
-trigger_sha="$(git ls-remote --exit-code origin "$trigger_ref" | awk 'NR == 1 { print $1}')"
-test "$trigger_sha" = "$release_sha"
+gh workflow run release-evidence.yml --ref main
 ```
 
-`git ls-remote` reads the remote ref directly, so this procedure cannot use a
-stale local tracking ref. Identify, watch, and inspect the resulting `release
-evidence` run before removing the trigger branch:
-
-```bash
-release_run="$(gh run list \
-  --branch "${trigger_ref#refs/heads/}" \
-  --event push \
-  --limit 20 \
-  --json databaseId,headBranch,headSha,workflowName \
-  --jq "[.[] | select(.workflowName == \"release evidence\" and .headBranch == \"${trigger_ref#refs/heads/}\" and .headSha == \"$release_sha\")][0].databaseId")"
-if [ -z "$release_run" ] || [ "$release_run" = null ]; then
-  echo "release evidence for $release_sha is not registered yet" >&2
-  exit 1
-fi
-watch_status=0
-gh run watch "$release_run" --exit-status || watch_status=$?
-gh run view "$release_run" --log-failed || true
-remote_trigger="$(git ls-remote --exit-code origin "$trigger_ref" | awk 'NR == 1 { print $1}')"
-test "$remote_trigger" = "$release_sha"
-git push --force-with-lease="${trigger_ref}:${release_sha}" origin ":${trigger_ref}"
-test "$watch_status" = 0
-```
-
-After the workflow reaches the default branch, use the ordinary manual form:
-
-```bash
-gh workflow run release-evidence.yml --ref beta/messaging-rework
-```
+The file also keeps a push trigger for the disposable
+**beta/test/release-evidence** branch from before the workflow reached `main`;
+pushing a commit there still runs the same evidence without publishing.
+Identify, watch, and inspect the resulting `release evidence` run with
+`gh run list --workflow release-evidence.yml` and `gh run watch`.
 
 The final `beta release evidence complete` job becomes green only when every
 release responsibility, including the candidate's tmux-HEAD and bounded
 reliability evidence, succeeds. Operator approval is still required before
-merging **beta/messaging-rework** into **main** or publishing a release.
+publishing a release; the release-binaries workflow below publishes only
+after a `v*` tag is pushed.
 
 ## Release binaries
 

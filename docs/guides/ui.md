@@ -2,7 +2,6 @@
 
 Watch the whole team live. `cyclops watch` turns the terminal into the
 stream: every message and state change as it happens, on the record.
-`cyclops ui` still works too, as a deprecated alias for `cyclops watch`.
 
 ## Basics
 
@@ -40,9 +39,9 @@ message, recipient, and notification attempt it represents, so a live
 update cannot move an action to a neighboring row.
 
 The `mailbox` column describes the durable body state. The `wake` column
-describes only the one-line terminal notification. `claimed` and `staged` can
-coexist when the recipient fetched the body while the exact doorbell still
-awaits reconciliation. Resting rows never contain message bodies.
+describes only the one-line terminal notification. `claimed` and `submitted`
+can coexist when the recipient fetched the body over the socket before the
+doorbell's receipt arrived. Resting rows never contain message bodies.
 
 Messages has four scopes: Work, All, Inbox, and Outbound. Press `s` to
 cycle them. Work is the daemon's answer about what needs this operator,
@@ -74,12 +73,13 @@ Snapshot reads, durable follow pages, and action answers use separate bounded
 lanes.
 
 `cyclops status` remains the compact live-pane view. A pane can be runtime
-idle while a notification is staged, so status prints a factual subrow when
+idle while a doorbell it has not consumed sits in its composer, so status
+prints a factual subrow when
 that distinction matters: composer ownership, write readiness, notification
 state, mailbox state, the next action, and the exact attempt id. This is live
 barrier state, not a replacement for the durable Messages and alarm views.
 Provisional and confirmed working states are labeled separately. Live pane
-refresh has one request-wide budget; an incomplete row fails closed and keeps
+refresh has one request-wide budget; an incomplete row refuses writing and keeps
 its durable message facts. Blocked pre-write wakes are sampled to a fixed row
 limit with the complete count printed below them.
 
@@ -201,8 +201,8 @@ with one attention item, `◉` open with the count beside it.
 
 The stream counts two things: an agent whose state is blocked, and a delivery
 whose normalized state needs a human. Normal `cyclops status` uses the same eye
-vocabulary and the same folded record: its eye counts blocked panes, legacy
-delivery alarms, durable mailbox attention, and held queue heads exactly as the
+vocabulary and the same folded record: its eye counts blocked panes, durable
+mailbox attention, and held queue heads exactly as the
 stream does, and its `waiting on you` rows name the next action for each. The
 stream takes the mailbox half of that record from every `messages.snapshot` its
 refresh gate accepts, stamped by the same `workspace_seq` as the Messages view,
@@ -221,8 +221,8 @@ nothing (your own, through the `admin.notify` verb) is never dropped.
 An agent's item is tracked per pane, so the state a pane reports before you name
 it and the state it reports after are the same item: adopting a pane never
 strands an item nothing can clear. A delivery's item is tracked by exact
-recipient plus message id. A display label is a fallback only for legacy rows
-without durable identity. Only that recipient's transition for that message may
+recipient plus message id. A display label is a fallback only for rows an
+older daemon wrote without durable identity. Only that recipient's transition for that message may
 clear the item, so broadcasts and shared aliases cannot clear one another.
 
 ### Where the count comes from
@@ -235,7 +235,7 @@ The stream count has two sources, and replayed history is not one of them:
 - the live event push after that, one transition at a time.
 
 `--backfill` therefore decides only what you SEE, never what is counted,
-at any value including `0`. A delivery that parked on a quota hours ago
+at any value including `0`. A pane that hit a quota screen hours ago
 opens the eye whether or not its line is in the replayed tail, and a
 pane that was blocked in the replayed tail but is gone now counts for
 nothing: the answer lists the panes that exist, and a pane it does not
@@ -250,17 +250,16 @@ edge that invalidated the view, still never on a timer.
 
 `cyclops status` asks for the pane roster and the open deliveries. Its eye
 answers whether a live pane is blocked or anything durable waits on a human
-(a legacy delivery alarm, a mailbox attempt needing attention, a held queue
-head), and its admin-inbox suffix reports unread human mail. A closed eye
+(a mailbox attempt needing attention, a held queue head), and its
+admin-inbox suffix reports unread human mail. A closed eye
 with a held mailbox queue behind it is no longer possible.
 
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It
 runs both ways: a line already on screen that the daemon's current answer
-no longer counts gets its clearance written under it at startup. Legacy
-direct-delivery quota parks remain terminal. Standard mailbox notifications
-have a separate explicit `cyclops requeue <message-id>` recovery path after the
-daemon records that a quota reset was observed; it never retries on its own.
+no longer counts gets its clearance written under it at startup. An attempt that ended in `attention_required` has an explicit
+`cyclops requeue <message-id>` recovery path after a human has looked at the
+pane.
 
 ### Every count has a line
 

@@ -1,42 +1,40 @@
 ---
 title: "Recover a notification"
-description: "Inspect and resolve a blocked or ambiguous one-shot notification safely."
+description: "Inspect and resolve a blocked or uncertain one-shot doorbell safely."
 ---
 
-`cyclops send` returns after the message is durable. Its two-sentence preview
-and exact claim are a separate one-shot terminal notification. A wake is not a
-claim, and a claim is not task completion. The full message remains available
-through the socket even when the terminal wake is blocked.
+`cyclops send` returns after the message is durable. Its one-line preview and
+exact claim are a separate one-shot doorbell. A wake is not a claim, and a
+claim is not task completion. The full message remains available through the
+socket whether or not the doorbell was written.
 
-## Inspect the exact attempt
+## Read the state
 
 ```bash
 cyclops messages
 cyclops alarm preview --older-than 0s
-cyclops attention show <attempt-id> --diff
 ```
 
-`messages` keeps mailbox and wake state separate. `attention show` is an
-administrator-only, read-only recheck of one attempt. `--diff` may expose a
-direct-fallback payload.
+`messages` keeps mailbox and wake state separate and names each attempt's
+cause. `alarm preview` lists unresolved attempts and their exact ids.
 
-Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
-when the complete durable binding and exact composer bytes still match. It
-submits once while the mailbox is pending. If the exact recipient claimed after
-the write, it clears that doorbell without submitting it. Durable intent blocks
-a second terminal key after an uncertain outcome. Human, trailing, changed, or
-unprovable content remains one visible attention item.
+## An attempt needs attention
 
-If the exact staged notification and its current terminal evidence still match,
-use one guarded action:
+An attempt reaches `attention_required` only for a physical write failure
+after the paste (`paste_failed`, `submit_failed`, `pane_rebound_after_paste`,
+`transport_outcome_unknown`) or because the daemon restarted between the paste
+and its receipt (`daemon_restart`). It means the terminal outcome is unknown,
+not that the line did not land. Look at the pane. If the line is not there and
+the recipient has not claimed, start a fresh attempt:
 
 ```bash
-cyclops attention complete <attempt-id>
-cyclops attention discard <attempt-id>
+cyclops requeue <message-id>
 ```
 
-Do not repeat an uncertain terminal action. Reopen the attempt and inspect its
-current state. Reconciliation never sends a second terminal key.
+Requeue goes through the ordinary gate. Nothing requeues on a timer, and the
+daemon refuses it for any other state. A line that could not be read back was
+still submitted once and reads `submitted_unverified`; a doorbell with no
+receipt reads `notified` with no verifier. Neither needs you.
 
 ## Recover a pre-write block
 
@@ -52,22 +50,31 @@ still proves that no terminal write occurred:
 
 ```bash
 cyclops notification withdraw <attempt-id> --recipient <recipient-key>
+cyclops clear <agent>
 ```
 
 Withdrawal leaves the mailbox message pending and releases that recipient's
-FIFO. After repairing the reported cause, use `cyclops requeue <message-id>`
-only when the current state says requeue is eligible.
+FIFO; `clear <agent>` does it for every unwritten attempt to one agent. After
+repairing the reported cause, the next route or composer event reopens the
+wake, or the recipient claims now.
 
 `cyclops alarm clear` acknowledges an alarm. It does not delete the message or
-abandon an unfinished terminal action. Use `cyclops health` before retrying a
-worker or state-storage failure.
+change the attempt. Use `cyclops health` before retrying a worker or
+state-storage failure.
+
+## When the doorbell cannot work
+
+`cyclops send --raw` pastes the whole message into the pane and presses Enter
+with no composer check. It is recorded as an unverified raw write. Use it only
+when Cyclops's composer reading is wrong for that pane or the recipient is an
+unverified vendor.
 
 ## Read status as separate facts
 
-Runtime, composer ownership, write readiness, notification state, and mailbox
-state answer different questions. An idle pane can still contain a staged
-Cyclops notification. Read the status subrow and follow its exact next action
-instead of treating `idle` as permission to write.
+Runtime, composer, notification state, and mailbox state answer different
+questions. An idle pane can still hold a doorbell the recipient has not
+consumed. Read the status subrow and follow its exact next action instead of
+treating `idle` as permission to write.
 
-The wire states and exact recovery transitions are owned by the
+The wire states and exact transitions are owned by the
 [protocol reference](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/PROTOCOL.md#mailbox-and-notification-control).

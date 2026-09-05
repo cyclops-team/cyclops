@@ -24,12 +24,10 @@ where nothing is ever detected and no state ever changes. The sidebar says
 
 ```bash
 cyclops                   # workspace (TTY required)
-cyclops watch             # stream TUI (formerly `cyclops ui`)
+cyclops watch             # stream TUI
 cyclops watch --json      # machine-readable event stream
 cyclops watch --plain     # line-oriented stream, no screen takeover
 ```
-
-`cyclops ui` still works and prints a deprecation note; use `cyclops watch`.
 
 ## Choose the right entry point
 
@@ -413,18 +411,6 @@ switching sections never resizes it.
   missing or there is no player for it; only a system with no alert
   sound at all falls back to the terminal bell, which many terminals
   ship with the sound turned off.
-- **Delivery** contains the default-on `Force staged submit` switch and its
-  0 to 20 second delay. Select `Delay` and use `←`/`→` to move the slider.
-  This recovery applies only after Cyclops has pasted an exact notification
-  and ordinary verification fails. It does not paste again. At expiry the
-  daemon rechecks the exact attempt and bound pane process, then reserves one
-  key with `inbox.claim` before pressing Enter once. A claim, withdrawal, or
-  replacement that wins before the reservation stops it, as does a successful
-  disable ordered before the reservation. A later claim still retrieves the
-  message, and a later setting change does not retract the reserved key. The
-  warning is literal: because this bypasses composer-content proof, it may
-  submit human input that appeared after the notification was
-  pasted. At 0 seconds the key is attempted immediately.
 
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.
