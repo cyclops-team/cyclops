@@ -67,6 +67,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "15c4ccb5851c02bb",
     "a6368bc6a8d3e602",
     "711ab58a0d31f957",
+    "028b6c534c5f24a1",
 ];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
