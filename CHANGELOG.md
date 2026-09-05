@@ -3,52 +3,7 @@
 All notable changes to Cyclops v2. Format follows Keep a Changelog;
 versions are unreleased until admin cuts a tag.
 
-## [Unreleased]
-
-### Added
-- Thread-aware message ids `cyc-<thread>-<message>`: a root mints both eight-character hex runs; a reply, a `--reply-to` send, or a replacement reuses the parent's `<thread>` run. `MessageId::thread_part()` and `message_part()`; legacy `m-<hex32>` ids still parse and replay.
-- `msg.read`: the operator reads one message, body included, without claiming it. Served only to the admin origin; an agent caller gets `forbidden` (`bodies reach an agent only through a claim`).
-- `msg.send` and `msg.reply` results carry `thread_root`; the CLI receipt names the thread a reply joined (`accepted <id> · thread <root>`).
-- `cyclops thread <id>` is an everyday command and prints a thread index above the grid: the root id and each message's `<message>` part in order.
-- Headless agents: `cyclops name <label> --self` from a process with no pane registers it over the socket (`headless.register`). The daemon binds the label to the nearest agent process in the caller's tree, proven the way a pane is, with no token; from inside a watched pane it is refused with `use_pane`. Delivery is mailbox-only: the attempt closes `queued -> notified` with `transport: mailbox` and the receipt reads `accepted · in mailbox, no pane`. The label is released by the process exit (`kqueue` `EVFILT_PROC` on macOS, `pidfd_open` on Linux), and `headless.clear` takes it back early. Recipient keys gain a third kind, `headless`, displayed as the `headless:` prefix followed by the workspace id and the agent instance id; `*` reaches headless agents too.
-- `cyclops inbox next --wait`: no deadline, for a headless agent reading its mailbox; exits `daemon_gone` when cyclopsd closes the connection. Conflicts with `--timeout`.
-
-### Changed
-- One-way journal upgrade: a workspace journal that carries a headless recipient row or a `transport: mailbox` transition cannot be replayed by an older daemon (strict replay refuses the unknown recipient kind), and an older CLI prints its unreadable-answer copy for a headless key. Upgrade the daemon and the CLI together.
-- `MessageRecipientRoute.pane_id` is optional on the wire (absent for a headless recipient); `cyclops messages` and the UI render such a route by label.
-- The doorbell header names the recipients: `[cyclops from <sender> to <recipients>] <summary> | cyclops inbox claim m-att_...`. Up to three names joined by `, `, then `<first>, <second>, +N`; a broadcast reads `to all`. Format number stays 4.
-- A claim over the socket while the doorbell is `queued`, `gating`, or `blocked_pre_write` withdraws it (cause `claimed_before_write`) and nothing is written to the pane; a claim after Enter still settles the attempt as `notified`.
-- Summaries have no length cap; the rule is one non-empty line. The CLI warns once on stderr above 160 characters.
-
-### Removed
-- `MESSAGE_SUMMARY_MAX_CHARS` and the 240-character summary rejection on the daemon and the CLI.
-
-## [1.0.2] - 2026-09-03
-
-### Added
-- Multi-recipient sending: `cyclops send` supports multiple recipients separated by commas (via positional argument or `--to`).
-- Global `@all` broadcasting: message all adopted agents simultaneously using `@all`, `all`, or `*` via CLI and the TUI `@` button / compose dialog.
-- Auto-derived summaries: `--summary` is now optional on `cyclops send` and `cyclops reply`; two-sentence previews are automatically derived from the message body or subject.
-- Flexible reply locators: `cyclops reply` now accepts attempt tokens (`m-att_...`), canonical IDs, and `--last` or `-` to reply directly to the most recently claimed message.
-- Piped stdin support: `cyclops send` and `cyclops reply` automatically read piped stdin when no body flag is provided, or via `--body-file -`.
-- Quickstart guide: added a streamlined claiming and replying section to `SKILL.md`.
-
-### Fixed
-- Transient write readiness holds: pre-paste readiness checks now return `barrier_held` when a recipient's composer is temporarily busy, holding and retrying until the pane recovers instead of permanently aborting delivery.
-- Claude turn end detection: allowed the idle title sparkle rule (`title_idle_sparkle`) to certify idle when the composer is clean, clearing lingering "working" status and conflicting evidence after turn completion.
-
-## [1.0.1] - 2026-09-03
-
-### Added
-- Mouse drag auto-scrolling: clicking and dragging outside a pane's bounds continues selection and smoothly scrolls the pane viewport into history or tail.
-- Input editing shortcuts: added `Ctrl+Backspace` / `Alt+Backspace` / `Ctrl+W` to delete words, and `Ctrl+U` / `Cmd+A` to clear input buffers in modal dialogs.
-- Pane border status badges: persistent status badges on pane borders showing `○ idle`, `● working`, or `⏳ waiting` (highlighted in yellow/amber when blocked).
-- Unified sidebar filtering: added unified filter pills (`All`, `Active`, `Agents`) at the top of the session tree to easily declutter multiple workspaces.
-- `cyclops flush`: added dedicated command to completely reset session state, prune dead panes, and flush the message ledger for a pristine restart.
-- Modal toggle on Space: keyboard-only navigation in Settings where Space toggles switches and checkboxes instantly.
-- Enlarged composer clear button: expanded the clear composer control into a bracketed button (`[⌫ clear]` / `[⌫]`) with an expanded hit target for easier mouse clicking.
-
-## [1.1.0] - 2026-09-04
+## [1.1.0] - 2026-09-05
 
 ### Removed
 - The legacy direct-payload delivery pipeline: the in-process payload writer
@@ -65,6 +20,7 @@ versions are unreleased until admin cuts a tag.
   file that still names a retired key boots with a warning instead of
   failing.
 - `cyclops ui`; the stream is `cyclops watch`.
+- `MESSAGE_SUMMARY_MAX_CHARS` and the 240-character summary rejection on the daemon and the CLI.
 
 ### Changed
 - Delivery is a durable mailbox plus one doorbell line. The gate is three
@@ -99,6 +55,12 @@ versions are unreleased until admin cuts a tag.
   rewritten to describe the 1.1.0 delivery contract. The doc path checker now
   scans the public Mintlify pages.
 - `scripts/check.sh --quick` runs formatting, clippy, and the unit tests only.
+- One-way journal upgrade: a workspace journal that carries a headless recipient row or a `transport: mailbox` transition cannot be replayed by an older daemon (strict replay refuses the unknown recipient kind), and an older CLI prints its unreadable-answer copy for a headless key. Upgrade the daemon and the CLI together.
+- `MessageRecipientRoute.pane_id` is optional on the wire (absent for a headless recipient); `cyclops messages` and the UI render such a route by label.
+- The doorbell header names the recipients: `[cyclops from <sender> to <recipients>] <summary> | cyclops inbox claim m-att_...`. Up to three names joined by `, `, then `<first>, <second>, +N`; a broadcast reads `to all`. Format number stays 4.
+- A claim over the socket while the doorbell is `queued`, `gating`, or `blocked_pre_write` withdraws it (cause `claimed_before_write`) and nothing is written to the pane; a claim after Enter still settles the attempt as `notified`.
+- Summaries have no length cap; the rule is one non-empty line. The CLI warns once on stderr above 160 characters.
+- Workspace frames are cached: pane manifests rebuild once per decoration, the timeline is built once per queue revision, width, and view, and only re-sliced on scroll. Mean frame at one hundred messages, eighty by forty, fell from 1.94 ms to 1.17 ms.
 
 ### Added
 - `raw` on `msg.send` and `msg.reply`, and `cyclops send --raw` and
@@ -113,6 +75,16 @@ versions are unreleased until admin cuts a tag.
   that does not match the workspace version.
 - `scripts/sweep-target.sh` and a contributing note for a shared target
   directory across worktrees.
+- Thread-aware message ids `cyc-<thread>-<message>`: a root mints both eight-character hex runs; a reply, a `--reply-to` send, or a replacement reuses the parent's `<thread>` run. `MessageId::thread_part()` and `message_part()`; legacy `m-<hex32>` ids still parse and replay.
+- `msg.read`: the operator reads one message, body included, without claiming it. Served only to the admin origin; an agent caller gets `forbidden` (`bodies reach an agent only through a claim`).
+- `msg.send` and `msg.reply` results carry `thread_root`; the CLI receipt names the thread a reply joined (`accepted <id> · thread <root>`).
+- `cyclops thread <id>` is an everyday command and prints a thread index above the grid: the root id and each message's `<message>` part in order.
+- Headless agents: `cyclops name <label> --self` from a process with no pane registers it over the socket (`headless.register`). The daemon binds the label to the nearest agent process in the caller's tree, proven the way a pane is, with no token; from inside a watched pane it is refused with `use_pane`. Delivery is mailbox-only: the attempt closes `queued -> notified` with `transport: mailbox` and the receipt reads `accepted · in mailbox, no pane`. The label is released by the process exit (`kqueue` `EVFILT_PROC` on macOS, `pidfd_open` on Linux), and `headless.clear` takes it back early. Recipient keys gain a third kind, `headless`, displayed as the `headless:` prefix followed by the workspace id and the agent instance id; `*` reaches headless agents too.
+- `cyclops inbox next --wait`: no deadline, for a headless agent reading its mailbox; exits `daemon_gone` when cyclopsd closes the connection. Conflicts with `--timeout`.
+- Declarative vendor wiring: a manifest may carry `[hooks.wiring]` naming the hook file, its shape, and the vendor's event names. Nine shapes cover every documented hook file in the skills.sh catalog, and one writer per shape wires and unwires without disturbing the operator's own entries. Adding a terminal agent is one TOML file and no Rust.
+- Forty more agent CLIs ship as manifests, all `version_tested = "unverified"` and derived from vendor documentation. Fifty-two in total.
+- Skill seeding for thirty-eight skill-only consumers: IDE, desktop, and web products, and CLIs with no shell hook, each into its own documented skills directory when that product is installed.
+- The workspace Messages pane takes focus from a click anywhere in it, selects the row under the pointer, and scrolls on the wheel. Rows are compact by default; `b` and the `body` footer verb show bodies, read through `msg.read` and never by claiming, and the choice persists as `messages_show_bodies`.
 
 ### Fixed
 - Uninstall never removed Kimi hooks; both vendor lists now come from the
@@ -125,6 +97,8 @@ versions are unreleased until admin cuts a tag.
 
 The entries below preserve the implementation chronology. They are historical
 context, not the current release summary or a source of product semantics.
+- Claude Code: a finished turn now ends even when the composer holds a draft. Claude exposes no turn-end hook, so screen evidence ends the turn its `UserPromptSubmit` opened, and the only rule carrying that evidence required a clean composer. One stray keystroke left the pane reading `working` indefinitely and parked every delivery behind a draft that would never clear. MEASURED on Claude Code 2.1.261.
+- The workspace Messages title no longer overwrites the pane's top-right corner at widths twelve and thirteen; title width is measured in display cells.
 
 ### Added (v7)
 
@@ -1386,3 +1360,29 @@ context, not the current release summary or a source of product semantics.
   CLI, seeded from the 2026-08-01 validation campaign.
 - CI: fmt, clippy, tests on ubuntu/macos, advisory tmux-HEAD job.
 - docs/development/GOALS.md: the admin-set quality bar.
+
+## [1.0.2] - 2026-09-03
+
+### Added
+- Multi-recipient sending: `cyclops send` supports multiple recipients separated by commas (via positional argument or `--to`).
+- Global `@all` broadcasting: message all adopted agents simultaneously using `@all`, `all`, or `*` via CLI and the TUI `@` button / compose dialog.
+- Auto-derived summaries: `--summary` is now optional on `cyclops send` and `cyclops reply`; two-sentence previews are automatically derived from the message body or subject.
+- Flexible reply locators: `cyclops reply` now accepts attempt tokens (`m-att_...`), canonical IDs, and `--last` or `-` to reply directly to the most recently claimed message.
+- Piped stdin support: `cyclops send` and `cyclops reply` automatically read piped stdin when no body flag is provided, or via `--body-file -`.
+- Quickstart guide: added a streamlined claiming and replying section to `SKILL.md`.
+
+### Fixed
+- Transient write readiness holds: pre-paste readiness checks now return `barrier_held` when a recipient's composer is temporarily busy, holding and retrying until the pane recovers instead of permanently aborting delivery.
+- Claude turn end detection: allowed the idle title sparkle rule (`title_idle_sparkle`) to certify idle when the composer is clean, clearing lingering "working" status and conflicting evidence after turn completion.
+
+## [1.0.1] - 2026-09-03
+
+### Added
+- Mouse drag auto-scrolling: clicking and dragging outside a pane's bounds continues selection and smoothly scrolls the pane viewport into history or tail.
+- Input editing shortcuts: added `Ctrl+Backspace` / `Alt+Backspace` / `Ctrl+W` to delete words, and `Ctrl+U` / `Cmd+A` to clear input buffers in modal dialogs.
+- Pane border status badges: persistent status badges on pane borders showing `○ idle`, `● working`, or `⏳ waiting` (highlighted in yellow/amber when blocked).
+- Unified sidebar filtering: added unified filter pills (`All`, `Active`, `Agents`) at the top of the session tree to easily declutter multiple workspaces.
+- `cyclops flush`: added dedicated command to completely reset session state, prune dead panes, and flush the message ledger for a pristine restart.
+- Modal toggle on Space: keyboard-only navigation in Settings where Space toggles switches and checkboxes instantly.
+- Enlarged composer clear button: expanded the clear composer control into a bracketed button (`[⌫ clear]` / `[⌫]`) with an expanded hit target for easier mouse clicking.
+
