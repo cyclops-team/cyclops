@@ -14,12 +14,14 @@ The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is at version `1.1.0`. It ships twelve detection manifests. Five are
-measured against a live CLI: Claude Code, Codex CLI, Antigravity CLI, Cursor
-Agent CLI, and Kimi Code CLI. Seven are written from vendor documentation and
-say so with `version_tested = "unverified"`: Gemini CLI, Qwen Code, goose,
-OpenCode, Amp, Crush, and aider. See [STATUS.md](STATUS.md) for the evidence
-behind each and the limits that follow from it.
+Cyclops is at version `1.1.0`. It ships fifty-two detection manifests. Five
+are measured against a live CLI: Claude Code, Codex CLI, Antigravity CLI,
+Cursor Agent CLI, and Kimi Code CLI. The other forty-seven are written from
+vendor documentation and say so with `version_tested = "unverified"`.
+Thirty-eight products that never run in a pane, the IDEs and desktop apps in
+the same catalog, get the Cyclops skill seeded and nothing else. See
+[STATUS.md](STATUS.md) for the evidence behind each and the limits that
+follow from it.
 
 [usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [documentation](#documentation)
 
@@ -49,18 +51,35 @@ half-written in the composer. Cyclops adds the missing boundaries:
   `attention_required`. Nothing is retried on a timer.
 
 The human-draft guard is strong, not absolute. It depends on the manifest
-recognizing typed text, and the seven unverified manifests carry no such
-rule, so a doorbell to one of those panes is effectively a raw write with a
-receipt.
+recognizing typed text, and an unverified manifest carries no such rule, so
+a doorbell to one of those panes is effectively a raw write with a receipt.
 
 ### How fast
 
-A `cyclops send` from the CLI is about 10 ms at the median on the measured
-machine. Most of that is process start and one fsync. Raw `tmux send-keys`
-is cheaper because it proves nothing: no durable record, no sender identity,
-no ordering, no claim, no receipt. The numbers, the harnesses in this
-repository that produce them, and what each lane does and does not include
-are in [docs/reference/BENCHMARKS.md](docs/reference/BENCHMARKS.md).
+Measured on 2026-09-05 by `src/cyclopsd/tests/evidence/communication_benchmark.rs`,
+50 operations per lane, median of three runs, on an Apple M5 Pro with tmux
+3.6a. The rig owns an isolated Cyclops home, daemon, and tmux server.
+
+| Lane | p50 | p95 | What it proves |
+|---|---:|---:|---|
+| Raw `tmux send-keys` | 2.61 ms | 3.03 ms | Nothing. No record, no sender, no ordering, no claim, no receipt |
+| Raw `tmux capture-pane` | 2.50 ms | 2.60 ms | Nothing. One read of the screen |
+| smux tmux-bridge cycle (modeled) | 7.65 ms | 8.26 ms | A read guard, a capture, a literal write, and Enter |
+| `cyclops msg.send` | 3.06 ms | 4.04 ms | The message and one mailbox entry per recipient, appended and fsynced |
+| `cyclops inbox.claim` | 15.12 ms | 17.44 ms | Sender identity, the body, and the claim on the record |
+
+The rows are four different contracts, not a race. The tmux and smux lanes
+each pay one or more process starts and prove nothing durable; the Cyclops
+send lane starts no process and pays an fsync the others never pay.
+
+**The smux row runs no smux code.** It reconstructs that project's
+documented tmux-bridge cycle out of real tmux calls, so it is the price of
+that shape on this machine, not a benchmark of the implementation.
+
+Against 1.0.2 on the same machine, no median moved. The slow end of a claim
+did: p95 went from 21.84 ms to 17.44 ms across non-overlapping samples. The
+full before-and-after, every harness, and what each lane leaves out are in
+[docs/reference/BENCHMARKS.md](docs/reference/BENCHMARKS.md).
 
 ## First five minutes
 
