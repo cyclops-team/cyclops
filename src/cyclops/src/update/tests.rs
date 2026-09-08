@@ -389,9 +389,17 @@ fn replay_fixture_serves_a_greeting_after_an_abandoned_startup_connection() {
     assert_eq!(ready, [b'R']);
 
     let socket = home.join(cyclops_proto::SOCK_NAME);
-    let abandoned = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-    abandoned.shutdown(std::net::Shutdown::Both).unwrap();
-    drop(abandoned);
+    // The stdin gate withholds hello until this official client times out and
+    // closes its first connection. No raw transport bypass or scheduling guess.
+    match crate::client::Client::connect_path(
+        &socket,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(20),
+    ) {
+        Err(crate::client::ClientError::HelloTimeout(_)) => {}
+        Err(error) => panic!("the gated greeting should time out: {error}"),
+        Ok(_) => panic!("the fixture sent a greeting before its gate was released"),
+    }
     drop(child.child_mut().stdin.take());
     let client = crate::client::Client::connect_path(
         &socket,
