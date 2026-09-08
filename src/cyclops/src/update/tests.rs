@@ -294,10 +294,41 @@ fn replay_failure_pair(path: &Path, build: &str, hello: &str, cli: &[u8]) {
     write_new(&path.join("cyclops"), cli, 0o755).unwrap();
     let hello = serde_json::to_string(hello).unwrap();
     let script = format!(
-            "#!/usr/bin/env python3\nimport os, socket, sys, time\nif len(sys.argv) > 1 and sys.argv[1] == '--version':\n    print('cyclopsd 0.1.0 ({build})')\n    sys.exit(0)\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\ntime.sleep(60)\n",
-            cyclops_proto::SOCK_NAME,
-            hello
-        );
+        r#"#!/usr/bin/env python3
+import os, socket, sys
+if len(sys.argv) > 1 and sys.argv[1] == '--version':
+    print('cyclopsd 0.1.0 ({build})')
+    sys.exit(0)
+home = os.environ['CYCLOPS_HOME']
+path = os.path.join(home, '{socket_name}')
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX)
+s.bind(path)
+with open(os.path.join(home, 'probe.pid'), 'w') as f:
+    f.write(str(os.getpid()))
+s.listen(1)
+# Normal replay supplies null stdin. The fixture regression holds a pipe open
+# to queue an abandoned connection before the first accept, without a sleep.
+sys.stdout.buffer.write(b'R')
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+# A startup connection can time out before its worker returns the socket.
+# Serve the next probe after that peer leaves, just as a real daemon does.
+while True:
+    c, _ = s.accept()
+    with c:
+        try:
+            c.sendall(({hello} + '\n').encode())
+            while c.recv(4096):
+                pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+"#,
+        socket_name = cyclops_proto::SOCK_NAME,
+    );
     write_new(&path.join("cyclopsd"), script.as_bytes(), 0o755).unwrap();
 }
 
@@ -323,6 +354,56 @@ fn valid_probe_hello(build: &str) -> String {
         boot_id: "probe-boot".to_string(),
     })
     .unwrap()
+}
+
+#[test]
+fn replay_fixture_serves_a_greeting_after_an_abandoned_startup_connection() {
+    let scratch = Scratch::create().unwrap();
+    let pair = scratch.path().join("pair");
+    let home = scratch.path().join("r");
+    directory(&home);
+    replay_failure_pair(
+        &pair,
+        "build",
+        &valid_probe_hello("build"),
+        b"#!/bin/sh\nexit 1\n",
+    );
+    let mut child = ReplayChild::new(
+        Command::new(pair.join("cyclopsd"))
+            .env("CYCLOPS_HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let output = child.child_mut().stdout.as_mut().unwrap();
+    let mut readiness = libc::pollfd {
+        fd: output.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 2_000) }, 1);
+    let mut ready = [0_u8; 1];
+    output.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [b'R']);
+
+    let socket = home.join(cyclops_proto::SOCK_NAME);
+    let abandoned = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    abandoned.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(abandoned);
+    drop(child.child_mut().stdin.take());
+    let client = crate::client::Client::connect_path(
+        &socket,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("an abandoned probe must not terminate the fixture daemon");
+    assert_eq!(client.hello().build.as_deref(), Some("build"));
+    assert_eq!(client.hello().boot_id, "probe-boot");
+    drop(client);
+    drop(child);
+    assert_replay_probe_reaped(&scratch);
 }
 
 #[test]
