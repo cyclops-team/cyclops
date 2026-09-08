@@ -156,6 +156,30 @@ impl TestClient {
     }
 }
 
+fn assert_contiguous_states(transitions: &[Value]) {
+    let mut prior = json!("working");
+    for event in transitions {
+        assert_eq!(
+            event["data"]["prior"], prior,
+            "state stream lost transition continuity: {transitions:?}"
+        );
+        prior = event["data"]["state"].clone();
+    }
+}
+
+#[test]
+fn state_continuity_accepts_intermediate_edges_but_rejects_missing_or_inconsistent_edges() {
+    let unknown = json!({"data": {"prior": "working", "state": "unknown"}});
+    let idle = json!({"data": {"prior": "unknown", "state": "idle"}});
+    assert_contiguous_states(&[unknown.clone(), idle.clone()]);
+
+    assert!(std::panic::catch_unwind(|| assert_contiguous_states(&[idle])).is_err());
+    let wrong_prior = json!({"data": {"prior": "working", "state": "idle"}});
+    assert!(
+        std::panic::catch_unwind(|| assert_contiguous_states(&[unknown, wrong_prior])).is_err()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn m0_shadow_daemon_end_to_end() {
     if !tmux_available() {
@@ -317,24 +341,27 @@ async fn m0_shadow_daemon_end_to_end() {
         "PS1='IDLEPROMPT '; clear",
         "Enter",
     ]);
-    // A settled output recompute can publish a Working-certainty edge after
-    // subscription. Wait for the transition this step requested.
+    // Sensor observations may publish intermediate states while this command
+    // runs. Check every edge from the observed Working baseline to Idle;
+    // discarding intermediate edges would make Idle's prior look incorrect.
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut transitions = Vec::new();
     let ev = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "no idle title event within 5s");
         let event = watcher_client.next_event(remaining).await;
-        if event["event"] == "state"
-            && event["data"]["pane_id"].as_str() == Some(pane_id.as_str())
-            && event["data"]["state"] == "idle"
+        if event["event"] == "state" && event["data"]["pane_id"].as_str() == Some(pane_id.as_str())
         {
-            break event;
+            transitions.push(event.clone());
+            assert_contiguous_states(&transitions);
+            if event["data"]["state"] == "idle" {
+                break event;
+            }
         }
     };
     assert_eq!(ev["event"], "state");
     assert_eq!(ev["data"]["pane_id"].as_str(), Some(pane_id.as_str()));
     assert_eq!(ev["data"]["state"], "idle");
-    assert_eq!(ev["data"]["prior"], "working");
 
     // pane.read visible sees a marker printed in the pane.
     tmux.run_ok(&["send-keys", "-t", "main", "echo cyclops-M0-marker", "Enter"]);

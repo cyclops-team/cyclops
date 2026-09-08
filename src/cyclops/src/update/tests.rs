@@ -326,6 +326,8 @@ while True:
                 pass
         except (BrokenPipeError, ConnectionResetError):
             pass
+    sys.stdout.buffer.write(b'D')
+    sys.stdout.buffer.flush()
 "#,
         socket_name = cyclops_proto::SOCK_NAME,
     );
@@ -368,25 +370,34 @@ fn replay_fixture_serves_a_greeting_after_an_abandoned_startup_connection() {
         &valid_probe_hello("build"),
         b"#!/bin/sh\nexit 1\n",
     );
+    let stderr_path = scratch.path().join("fixture-stderr.log");
     let mut child = ReplayChild::new(
         Command::new(pair.join("cyclopsd"))
             .env("CYCLOPS_HOME", &home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(File::create(&stderr_path).unwrap())
             .spawn()
             .unwrap(),
     );
-    let output = child.child_mut().stdout.as_mut().unwrap();
-    let mut readiness = libc::pollfd {
-        fd: output.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
+    let expect_event = |child: &mut ReplayChild, expected: u8| {
+        let output = child.child_mut().stdout.as_mut().unwrap();
+        let mut readiness = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut readiness, 1, 2_000) },
+            1,
+            "fixture event {expected:?} did not arrive; stderr {}",
+            std::fs::read_to_string(&stderr_path).unwrap(),
+        );
+        let mut event = [0_u8; 1];
+        output.read_exact(&mut event).unwrap();
+        assert_eq!(event, [expected]);
     };
-    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 2_000) }, 1);
-    let mut ready = [0_u8; 1];
-    output.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [b'R']);
+    expect_event(&mut child, b'R');
 
     let socket = home.join(cyclops_proto::SOCK_NAME);
     // The stdin gate withholds hello until this official client times out and
@@ -401,12 +412,21 @@ fn replay_fixture_serves_a_greeting_after_an_abandoned_startup_connection() {
         Ok(_) => panic!("the fixture sent a greeting before its gate was released"),
     }
     drop(child.child_mut().stdin.take());
+    // Releasing the gate does not prove accept has removed the abandoned peer
+    // from the one-slot backlog. Wait for its retirement before reconnecting.
+    expect_event(&mut child, b'D');
     let client = crate::client::Client::connect_path(
         &socket,
         std::time::Duration::from_secs(2),
         std::time::Duration::from_secs(2),
     )
-    .expect("an abandoned probe must not terminate the fixture daemon");
+    .unwrap_or_else(|error| {
+        panic!(
+            "fixture did not serve the second greeting: {error}; status {:?}; stderr {}",
+            child.child_mut().try_wait().unwrap(),
+            std::fs::read_to_string(&stderr_path).unwrap(),
+        )
+    });
     assert_eq!(client.hello().build.as_deref(), Some("build"));
     assert_eq!(client.hello().boot_id, "probe-boot");
     drop(client);

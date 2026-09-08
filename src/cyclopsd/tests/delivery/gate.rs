@@ -965,7 +965,8 @@ async fn pane_mode_entered_after_admission_withholds_the_paste() {
 }
 
 /// `daemon.quiesce` is quiet over pre-paste notifications: they are
-/// durably queued and the next boot schedules them again.
+/// durably queued and the next boot schedules them again. A known human draft
+/// holds this fixture before paste; a Working state alone does not.
 #[tokio::test(flavor = "multi_thread")]
 async fn quiesce_is_quiet_over_prepaste_notifications() {
     if !tmux_available() {
@@ -974,20 +975,30 @@ async fn quiesce_is_quiet_over_prepaste_notifications() {
     }
     let mut rig = Rig::new(
         "quiesce",
-        BUSY_MANIFEST,
-        &hold_script("BUSY-MARKER"),
+        CAT_MANIFEST,
+        &composer_pane(),
         "receipt_block_ms = 200\n",
     )
     .await;
-    rig.tmux.wait_screen("main", "BUSY-MARKER");
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "held").await;
+    wait_pane_state(&mut rig, "idle").await;
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, "my unfinished draft"]);
+    rig.tmux.wait_screen("main", "my unfinished draft");
 
     let (result, _) = rig
         .send(json!({"to": ["held"], "subject": "s", "body": "b"}))
         .await;
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
-    wait_notification_state(&mut rig, &msg_id, &["gating"]).await;
+    rig.ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == msg_id
+                && event["data"]["action"] == "hold"
+                && event["data"]["cause"] == "composer_hold"
+        })
+        .await;
 
     let resp = rig.ctl.request("daemon.quiesce", json!({})).await;
     assert_eq!(resp["result"]["quiet"], true, "{resp}");
@@ -996,6 +1007,21 @@ async fn quiesce_is_quiet_over_prepaste_notifications() {
             .as_array()
             .is_none_or(Vec::is_empty),
         "{resp}"
+    );
+    assert!(
+        !notification_states(&rig, &msg_id)
+            .iter()
+            .any(|state| matches!(
+                state.as_str(),
+                "staged" | "submitted" | "submitted_unverified" | "notified"
+            )),
+        "quiesce fixture crossed the pane-write boundary"
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(screen.contains("my unfinished draft"));
+    assert!(
+        !screen.contains("[cyclops"),
+        "unexpected pane write: {screen}"
     );
     rig.shutdown().await;
 }
