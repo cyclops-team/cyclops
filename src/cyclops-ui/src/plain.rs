@@ -394,6 +394,7 @@ mod tests {
                     verified_by: None,
                     verify_outcome: None,
                     pre_write_cause: None,
+                    held_by: None,
                     pre_write_block: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,

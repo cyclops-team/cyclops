@@ -275,7 +275,11 @@ fn row_for(
         wake,
         cause: active_attention_cause(&to.notification, wake),
         pre_write_cause: to.notification.pre_write_cause,
-        pre_write_block: to.notification.pre_write_block.clone(),
+        pre_write_block: to
+            .notification
+            .held_by
+            .clone()
+            .or_else(|| to.notification.pre_write_block.clone()),
         wake_block: to.notification.wake_block,
         pane_width_block: to.notification.pane_width_block(),
         current_route: to.current_route.clone(),

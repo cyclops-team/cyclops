@@ -14,10 +14,8 @@
 //! files. `cyclops start` writes them into `$CYCLOPS_HOME/manifests`, which
 //! is where cyclopsd looks when `manifest_dir` is unset.
 //!
-//! Writing never overwrites an existing file. These files are meant to be
-//! edited, and even a known old Cyclops seed is left where the operator can
-//! review it. [`EVER_SHIPPED_FNV64`] records that known-old state without
-//! granting replacement authority.
+//! Operator edits remain in place. A byte-for-byte released seed may refresh
+//! after its identity and bytes are rechecked at publication.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -251,8 +249,8 @@ pub fn dir(home: &Path) -> PathBuf {
 
 /// FNV-1a 64 of every manifest body this project has ever shipped, the
 /// current ones included. A file on disk whose hash is in this list is a
-/// known old Cyclops seed rather than an arbitrary operator edit. Both kinds
-/// of existing file remain untouched.
+/// known old Cyclops seed rather than an arbitrary operator edit. Only the
+/// unedited seed may refresh during setup.
 ///
 /// Measured cost of not having it: all ten manifest bodies in this repo's
 /// history predate the `launch` key, so every home seeded before that key
@@ -274,6 +272,12 @@ pub fn dir(home: &Path) -> PathBuf {
 /// list answers whether this manifest is a known old Cyclops seed, and a
 /// skill body's hash landing here would misclassify an edited manifest.
 const EVER_SHIPPED_FNV64: &[&str] = &[
+    "256d5a1f9399e7c3",
+    "adda0e81e801e6b9",
+    "e8034c67961af57d",
+    "0bee5da83f0e553a",
+    "e9799341bac78843",
+    "7c40272d52519094",
     "000da241c916d3cb",
     "07e6faf978ea2598",
     "0a90724a6ccb9c0a",
@@ -533,14 +537,11 @@ fn seed_decision_at(
     ))
 }
 
-/// Put missing shipped manifests in `<home>/manifests`, keeping every file
-/// that is already there.
+/// Install missing manifests and refresh unedited released seeds.
 ///
 /// Runs on every `cyclops start`, not only the first: a release that adds a
-/// manifest reaches an existing home without a reinstall. An existing file,
-/// including a known old body listed in [`EVER_SHIPPED_FNV64`], remains
-/// byte-for-byte in place. The plan and setup check report that old state so
-/// an operator can review it deliberately.
+/// manifest reaches an existing home without a reinstall. A known old body
+/// listed in [`EVER_SHIPPED_FNV64`] refreshes; operator edits remain intact.
 pub fn seed(home: &Path) -> Seeded {
     let dir = dir(home);
     let mut out = Seeded {
@@ -582,9 +583,35 @@ pub fn seed(home: &Path) -> Seeded {
                 }
             }
             crate::managed_assets::SeedAction::KeepCurrent
-            | crate::managed_assets::SeedAction::PreserveKnownOldSeed
             | crate::managed_assets::SeedAction::PreserveOperatorEdit => {
                 out.kept.push((*name).to_string());
+            }
+            crate::managed_assets::SeedAction::RefreshKnownOldSeed => {
+                let refresh = (|| -> Result<(), String> {
+                    let parent = StateInspector::open_existing(&dir)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("manifest directory disappeared")?;
+                    let leaf = Path::new(name);
+                    let file = parent
+                        .read_file(leaf, PLAN_FILE_BYTES_LIMIT)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("manifest disappeared")?;
+                    if file.truncated || !unedited_seed(&file.bytes) {
+                        return Err("manifest changed after inspection; left untouched".into());
+                    }
+                    parent
+                        .into_managed_asset_root()
+                        .and_then(|authority| {
+                            authority.replace_file_if_unchanged(leaf, &file, body.as_bytes())
+                        })
+                        .map_err(|error| error.to_string())
+                })();
+                match refresh {
+                    Ok(()) => out.written.push((*name).to_string()),
+                    Err(error) => out
+                        .problems
+                        .push(format!("refresh {}: {error}", path.display())),
+                }
             }
             crate::managed_assets::SeedAction::RefuseUnreadableOrUnproven => {
                 out.problems.push(format!(
@@ -838,11 +865,9 @@ mod tests {
         }
     }
 
-    /// A known old seed is an observable setup condition, not permission to
-    /// rewrite the file. A local released body under another shipped name
-    /// gives this regression an always-available known-old value.
+    /// Only a byte-for-byte released seed receives automatic fixes.
     #[test]
-    fn an_existing_known_old_seed_is_preserved_byte_for_byte() {
+    fn an_existing_known_old_seed_receives_the_current_manifest() {
         use std::os::unix::fs::MetadataExt as _;
 
         let home = cyclops_proto::scratch::scratch_dir("cyc-seed-known-old");
@@ -854,12 +879,15 @@ mod tests {
         let before_bytes = std::fs::read(&claude).expect("known-old bytes");
 
         let seeded = seed(&home);
-        assert!(!seeded.written.contains(&"claude.toml".to_string()));
-        assert!(seeded.kept.contains(&"claude.toml".to_string()));
+        assert!(seeded.written.contains(&"claude.toml".to_string()));
+        assert!(!seeded.kept.contains(&"claude.toml".to_string()));
         let after = std::fs::metadata(&claude).expect("known-old metadata after setup");
         assert_eq!(after.dev(), before.dev());
-        assert_eq!(after.ino(), before.ino());
-        assert_eq!(std::fs::read(&claude).unwrap(), before_bytes);
+        assert_ne!(after.ino(), before.ino());
+        assert_eq!(
+            std::fs::read(&claude).unwrap(),
+            shipped("claude.toml").as_bytes()
+        );
         assert!(
             unedited_seed(&before_bytes),
             "the local regression body must stay classified as a known old seed"

@@ -512,6 +512,7 @@ pub(crate) struct NotificationObservation {
     stale: bool,
     disagreement: bool,
     write_ready: bool,
+    composer_held: bool,
     in_mode: bool,
 }
 
@@ -523,35 +524,35 @@ impl NotificationObservation {
             stale: entry.detection.stale,
             disagreement: entry.detection.disagreement,
             write_ready: entry.detection.write_ready,
+            composer_held: entry_composer_is_held(entry),
             in_mode: entry.in_mode,
         }
     }
 
-    /// Whether this cached verdict authorizes the same complete live binding.
-    ///
-    /// Sensor disagreement does not revoke a separately stamped clean-composer
-    /// proof. Staleness, terminal mode, or any process-generation difference
-    /// still refuses the write.
+    /// Whether the same live route may re-enter notification admission.
+    /// Diagnostic uncertainty is not a refusal; the worker will reobserve the
+    /// current composer and reprove the binding before writing.
     pub(crate) fn write_ready_for(&self, live_in_mode: bool, expected: &Binding) -> bool {
         !live_in_mode
-            && self.write_ready
-            && !self.stale
+            && !self.composer_held
+            && !self.state.is_blocked()
+            && self.state != AgentState::Dead
             && !self.in_mode
             && self.binding.as_ref() == Some(expected)
     }
 
-    /// Whether the cached pane state can produce the first durable disposition
+    /// Whether the cached pane state can produce its first disposition
     /// without waiting for another observation.
     ///
-    /// This is a latency hint, never write authority. Disagreement therefore
-    /// waits, while a proven clean composer or visible human draft can decide
-    /// immediately.
+    /// This is a latency hint, never write authority. A known composer hold is
+    /// immediately reportable even when unrelated state sensors disagree.
     pub(crate) fn can_decide_notification_now(&self, live_in_mode: bool) -> bool {
         !live_in_mode
             && !self.in_mode
             && !self.stale
-            && !self.disagreement
-            && (self.write_ready || self.state == AgentState::IdleWithInput)
+            && (self.composer_held
+                || (!self.disagreement
+                    && (self.write_ready || self.state == AgentState::IdleWithInput)))
     }
 }
 
@@ -2380,14 +2381,18 @@ pub(crate) fn clear_hold_owner(
 /// Is the pane's composer held against a doorbell?
 ///
 /// A positively observed human draft holds. So does a hold a delivery
-/// owns: a doorbell staged and not yet consumed, or the turn that consumed
-/// it and has not ended. A turn nobody owns is the agent working on its own
-/// input, and ambiguous or absent composer evidence is not a hold.
+/// owns while its staged input has not been consumed. Receipt releases that
+/// owner even if the resulting turn keeps running. A turn nobody owns is the
+/// agent working on its own input; ambiguous composer evidence is not a hold.
 pub(crate) fn composer_is_held(inner: &Inner, session_idx: usize, pane_id: &str) -> bool {
     let map = inner.detections.lock().expect("detections lock");
     let Some(entry) = map.get(&PaneKey::new(session_idx, pane_id)) else {
         return false;
     };
+    entry_composer_is_held(entry)
+}
+
+fn entry_composer_is_held(entry: &DetEntry) -> bool {
     match entry.hold {
         ComposerHold::Staged | ComposerHold::StagedDuringTurn => return true,
         ComposerHold::TurnStarted { .. } if entry.hold_owner.is_some() => return true,
@@ -4750,15 +4755,17 @@ mod tests {
     }
 
     #[test]
-    fn notification_readiness_keeps_proof_and_receipt_latency_conservative() {
+    fn notification_recovery_uses_the_same_ambiguity_policy_as_admission() {
         let binding = notification_binding(200);
         let mut entry = notification_entry(AgentState::Working, &binding);
         entry.detection.disagreement = true;
+        entry.detection.write_ready = false;
+        entry.detection.composer_semantic = Some(ComposerSemantic::Ambiguous);
         let observation = NotificationObservation::from_entry(&entry);
 
         assert!(
             observation.write_ready_for(false, &binding),
-            "a stamped clean-composer proof survives unrelated sensor disagreement"
+            "diagnostic disagreement and ambiguity cannot block a known recipient"
         );
         assert!(
             !observation.can_decide_notification_now(false),
@@ -4768,7 +4775,7 @@ mod tests {
         entry.detection.disagreement = false;
         entry.detection.stale = true;
         let stale = NotificationObservation::from_entry(&entry);
-        assert!(!stale.write_ready_for(false, &binding));
+        assert!(stale.write_ready_for(false, &binding));
         assert!(!stale.can_decide_notification_now(false));
     }
 
@@ -4782,6 +4789,13 @@ mod tests {
         assert!(observation.can_decide_notification_now(false));
         assert!(!observation.write_ready_for(false, &binding));
         assert!(!observation.can_decide_notification_now(true));
+
+        entry.detection.state = AgentState::Working;
+        entry.detection.composer_semantic = Some(ComposerSemantic::HumanInput);
+        entry.detection.disagreement = true;
+        let working = NotificationObservation::from_entry(&entry);
+        assert!(working.can_decide_notification_now(false));
+        assert!(!working.write_ready_for(false, &binding));
     }
 
     #[test]

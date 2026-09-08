@@ -29,9 +29,9 @@
 #            its BeforeAgent, so no end is declared: the loader refuses a
 #            candidate end without turn_key_fields, the same reason Claude
 #            declares none. AfterAgent is still wired, as liveness telemetry.
-#   screen   MEASURED only for the two startup dialogs below. No idle or
-#            working rule ships, so deliveries to a Gemini pane fail closed
-#            (not write-ready) until someone measures the composer.
+#   screen   MEASURED only for the two startup dialogs below. They block
+#            input while visible. Otherwise an authenticated live binding
+#            can receive notifications despite unknown activity.
 
 [agent]
 id = "gemini"

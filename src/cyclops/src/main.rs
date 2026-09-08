@@ -50,6 +50,7 @@ mod hook;
 mod hookset;
 mod managed_assets;
 mod manifests;
+mod mcp;
 mod render;
 mod setup;
 mod sizing;
@@ -138,6 +139,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Serve session-scoped MCP tools over standard input and output.
+    #[command(hide = true)]
+    Mcp(mcp::McpArgs),
     /// Build or adopt the default tmux session from a preset or saved layout.
     /// Safe to run twice; a session that is already there is left alone.
     #[command(hide = true)]
@@ -267,7 +271,7 @@ enum Cmd {
     /// Reset status by clearing old, terminated, and stale processes and sessions.
     #[command(hide = true)]
     Reset,
-    /// Flush message ledgers, cleanse state, and reset sessions to start clean.
+    /// Retired: use clear for notifications or remove for explicit state removal.
     #[command(hide = true)]
     Flush {
         /// Also prune dead panes and stale sessions (default true).
@@ -1234,11 +1238,8 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 ),
             }
         }
-        Cmd::Flush { prune } => {
-            let style = style_for(cli);
-            let mut client = connect().ok();
-            cmd_flush(client.as_mut(), cli, &style, *prune)
-        }
+        Cmd::Flush { .. } => cmd_flush(cli),
+        Cmd::Mcp(args) => mcp::run(args),
         Cmd::Status
         | Cmd::List(_)
         | Cmd::Ping
@@ -1289,7 +1290,8 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Hooks {
                     cmd: HooksCmd::Selftest { target },
                 } => hookset::run_selftest(&mut c, cli.json, &style, target),
-                Cmd::Flush { .. }
+                Cmd::Mcp(_)
+                | Cmd::Flush { .. }
                 | Cmd::Send(_)
                 | Cmd::Reply(_)
                 | Cmd::Hook { .. }
@@ -3299,70 +3301,16 @@ fn cmd_reset(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
     0
 }
 
-/// Flush message ledgers, clear queues, and reset sessions so workspaces start completely fresh.
-fn cmd_flush(client: Option<&mut Client>, cli: &Cli, style: &Style, prune: bool) -> i32 {
-    let mut pruned_panes = 0;
-    let mut pruned_sessions = 0;
-    let mut active_sessions = 0;
-    let mut active_panes = 0;
-
-    if let Some(c) = client {
-        let params = cyclops_proto::StatusResetParams {
-            kill_dead_panes: prune,
-            prune_stale_sessions: prune,
-            prune_stale_adoptions: prune,
-            flush_messages: true,
-        };
-        if let Ok(Some(r)) = ask::<cyclops_proto::StatusResetResult>(
-            c,
-            "status.reset",
-            serde_json::to_value(&params).expect("status.reset params serialize"),
-            cli.json,
-            None,
-            serde_json::from_value,
-        ) {
-            pruned_panes = r.pruned_panes;
-            pruned_sessions = r.pruned_sessions;
-            active_sessions = r.active_sessions;
-            active_panes = r.active_panes;
-        }
-    }
-
-    let home = cyclops_proto::cyclops_home();
-    let ledger_dir = home.join("ledger");
-    let mut cleared_ledgers = 0;
-    if let Ok(entries) = std::fs::read_dir(&ledger_dir) {
-        for entry in entries.flatten() {
-            if entry.path().extension().and_then(|s| s.to_str()) == Some("ndjson") {
-                cleared_ledgers += 1;
-                let _ = std::fs::write(entry.path(), b"");
-            }
-        }
-    }
-
+fn cmd_flush(cli: &Cli) -> i32 {
     if cli.json {
         println!(
             "{}",
-            serde_json::json!({
-                "flushed": true,
-                "cleared_ledgers": cleared_ledgers,
-                "pruned_panes": pruned_panes,
-                "pruned_sessions": pruned_sessions,
-                "active_sessions": active_sessions,
-                "active_panes": active_panes,
-            })
+            json!({"error": {"code": "unsupported_operation", "message": copy::FLUSH_RETIRED}})
         );
-        return 0;
+    } else {
+        eprintln!("{}", copy::FLUSH_RETIRED);
     }
-
-    println!(
-        "{} Flushed: cleared {} message ledger(s), pruned {} dead pane(s) and {} stale session(s).",
-        style.accent("✔"),
-        cleared_ledgers,
-        pruned_panes,
-        pruned_sessions,
-    );
-    0
+    1
 }
 /// Quiet the pre-write wake queue for one exact agent without erasing any
 /// durable mailbox entry. This is deliberately a convenience over the exact
@@ -4930,6 +4878,7 @@ mod tests {
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,
+                    held_by: None,
                     pre_write_block: None,
                     attention_cleared: None,
                     resolution: None,
@@ -5288,6 +5237,7 @@ mod tests {
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,
+                    held_by: None,
                     pre_write_block: None,
                     attention_cleared: Some(false),
                     resolution: None,
@@ -5342,6 +5292,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            held_by: None,
             pre_write_block: None,
             attention_cleared: None,
             resolution: None,
@@ -5370,6 +5321,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            held_by: None,
             pre_write_block: None,
             attention_cleared: None,
             resolution: None,

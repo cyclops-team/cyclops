@@ -754,7 +754,7 @@ async fn claude_stopfailure_confirms_a_superseded_exact_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_barrier() {
+async fn claude_stopfailure_preserves_visual_working_without_blocking_the_next_notification() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -796,7 +796,7 @@ async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_
         .send(json!({"to": ["keyed"], "subject": "second", "body": "body"}))
         .await;
     let second_id = second["msg_id"].as_str().unwrap().to_string();
-    wait_delivery_state(&mut rig, &second_id, "gating").await;
+    wait_submitted(&mut rig, &second_id).await;
 
     let mismatch = report(
         &rig,
@@ -826,10 +826,9 @@ async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_
         dirty["result"]["detection"]["write_ready"], false,
         "{dirty}"
     );
-    assert_eq!(
-        notification_state(&rig, &second_id).as_deref(),
-        Some("gating")
-    );
+    assert!(notification_states(&rig, &second_id)
+        .iter()
+        .any(|state| state == "submitted"));
 
     send_fixture_key(&rig, &pane, "C-y");
     wait_submitted(&mut rig, &second_id).await;
@@ -878,7 +877,7 @@ async fn claude_interrupt_updates_status_without_fabricating_an_exact_end() {
         .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
         .await;
     let second_id = second["msg_id"].as_str().unwrap().to_string();
-    wait_delivery_state(&mut rig, &second_id, "gating").await;
+    wait_submitted(&mut rig, &second_id).await;
     send_fixture_key(&rig, &pane, "Escape");
     wait_pane_state(&mut rig, "working").await;
     let interrupted = rig
@@ -896,10 +895,9 @@ async fn claude_interrupt_updates_status_without_fabricating_an_exact_end() {
         interrupted["result"]["detection"]["write_ready"], false,
         "visual idle must not fabricate the exact end: {interrupted}"
     );
-    assert_eq!(
-        notification_state(&rig, &second_id).as_deref(),
-        Some("gating")
-    );
+    assert!(notification_states(&rig, &second_id)
+        .iter()
+        .any(|state| state == "submitted"));
 
     let end = report(
         &rig,
@@ -1117,10 +1115,10 @@ async fn an_out_of_order_turn_does_not_strand_the_composer() {
     rig.shutdown().await;
 }
 
-/// A turn end must match every field in the shipped Codex key. Sharing
-/// either the session or the turn is not enough to release the composer.
+/// A turn end must match every field in the shipped Codex key. That lifecycle
+/// evidence is independent of the next notification, which can arrive mid-turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partial_codex_turn_match_keeps_the_composer_held() {
+async fn a_partial_codex_turn_match_keeps_the_lifecycle_active_but_allows_notifications() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1143,13 +1141,7 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
         .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
         .await;
     let second = result["msg_id"].as_str().expect("msg id").to_string();
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "gate"
-                && e["data"]["id"] == second.as_str()
-                && e["data"]["action"] == "hold"
-        })
-        .await;
+    wait_submitted(&mut rig, &second).await;
 
     for payload in [
         json!({"session_id": "other", "turn_id": "t1"}),
@@ -1169,16 +1161,11 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
             "another turn's end cleared the active lifecycle: {read}"
         );
     }
-    assert_eq!(
-        notification_state(&rig, &second).as_deref(),
-        Some("gating"),
-        "a partial turn-key match released the next delivery"
-    );
     assert!(
-        !rig.tmux
+        rig.tmux
             .capture(&pane)
-            .contains(&format!("[cyclops:end {second}]")),
-        "the held delivery reached the composer"
+            .contains(&doorbell_for(&rig, &second)),
+        "a consumed first notification must not hold later notifications until turn end"
     );
 
     let end = report(&rig, "Stop", json!({"session_id": "s1", "turn_id": "t1"})).await;
@@ -1189,11 +1176,10 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
     rig.shutdown().await;
 }
 
-/// A matching end received while detached is lifecycle evidence, not a
-/// write authorization. It is retained until reattach supplies a current
-/// screen capture that proves the composer is clean.
+/// A matching end received while detached is lifecycle evidence, not write
+/// authorization. A queued notification still needs a live recipient route.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
+async fn a_detached_codex_end_does_not_authorize_writing_without_a_live_route() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1212,21 +1198,7 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
     let first = acknowledge_codex_turn(&mut rig, "first", "s1", "t1").await;
     claim(&rig, "keyed", &first);
 
-    let (result, _) = rig
-        .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
-        .await;
-    let second = result["msg_id"].as_str().expect("msg id").to_string();
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "gate"
-                && e["data"]["id"] == second.as_str()
-                && e["data"]["action"] == "hold"
-        })
-        .await;
-
-    // An end from another turn changes neither the active runtime start nor
-    // the exact hold. The following detach therefore exercises stored
-    // matching lifecycle evidence rather than a transient sensor conflict.
+    // An end from another turn cannot clear the active runtime start.
     let mismatch = report(
         &rig,
         "Stop",
@@ -1243,16 +1215,20 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
         .await;
     assert_eq!(read["result"]["detection"]["state"], "working", "{read}");
 
-    // Whatever the second doorbell recorded before the outage stands; the
-    // detached end must add nothing. A write needs a live watcher, and
-    // stored lifecycle evidence is not one.
+    // Disconnect before sending: working is no longer a reason to park the
+    // second notification while the route is live.
     let held_socket = HeldTmuxSocket::disconnect(&rig, "main");
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "session" && e["data"]["attached"] == false
         })
         .await;
+    let (result, _) = rig
+        .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
+        .await;
+    let second = result["msg_id"].as_str().expect("msg id").to_string();
     let before_detached_end = notification_states(&rig, &second);
+    assert!(!before_detached_end.iter().any(|state| state == "writing"));
     let end = report(&rig, "Stop", json!({"session_id": "s1", "turn_id": "t1"})).await;
     assert_eq!(end["applied"], true, "{end}");
     assert_eq!(end["live"], false, "{end}");

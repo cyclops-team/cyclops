@@ -292,38 +292,17 @@ impl MailboxService {
         let mut recipients: Vec<_> = store
             .projection()
             .mailboxes
-            .iter()
-            .filter_map(|(recipient, entries)| {
-                (entries.values().any(|entry| entry.state.is_pending())
-                    || store
-                        .projection()
-                        .claimed_operator_notification(*recipient)
-                        .is_some())
-                .then_some(*recipient)
+            .keys()
+            .filter_map(|recipient| {
+                store
+                    .projection()
+                    .oldest_owed_notification(*recipient)
+                    .is_some()
+                    .then_some(*recipient)
             })
             .collect();
         recipients.sort();
         Ok(recipients)
-    }
-
-    /// The notification queue skips an operator-withdrawn wake while keeping
-    /// its mailbox entry pending and pullable. Every notification scheduler
-    /// path must make that same choice, otherwise a withdrawn head can hide a
-    /// later blocked attempt forever.
-    pub(crate) fn first_actionable_pending_message_id(
-        store: &MessageStore,
-        recipient: RecipientKey,
-    ) -> Option<MessageId> {
-        store
-            .projection()
-            .get_pending(recipient)
-            .iter()
-            .find(|entry| {
-                !store
-                    .projection()
-                    .notification_withdrawn_by_operator(recipient, &entry.message_id)
-            })
-            .map(|entry| entry.message_id.clone())
     }
 
     /// Oldest mailbox entry whose pane doorbell has not reached a terminal
@@ -335,34 +314,7 @@ impl MailboxService {
     ) -> Option<MessageId> {
         store
             .projection()
-            .mailboxes
-            .get(&recipient)?
-            .values()
-            .find(|entry| {
-                if entry.state.is_pending() {
-                    return !store
-                        .projection()
-                        .notification_withdrawn_by_operator(recipient, &entry.message_id);
-                }
-                if !entry.state.is_claimed() {
-                    return false;
-                }
-                store
-                    .projection()
-                    .notification(recipient, &entry.message_id)
-                    .is_some_and(|record| {
-                        matches!(
-                            record.state,
-                            NotificationState::Queued
-                                | NotificationState::Gating
-                                | NotificationState::Writing
-                                | NotificationState::Staged
-                                | NotificationState::Submitting
-                                | NotificationState::Submitted
-                                | NotificationState::SubmittedUnverified
-                        )
-                    })
-            })
+            .oldest_owed_notification(recipient)
             .map(|entry| entry.message_id.clone())
     }
 
@@ -379,17 +331,6 @@ impl MailboxService {
             return Ok(None);
         }
         let mut store = self.store()?;
-        if let Some(record) = store
-            .projection()
-            .claimed_operator_notification(recipient)
-            .cloned()
-        {
-            return Ok(matches!(
-                record.state,
-                NotificationState::Queued | NotificationState::Gating
-            )
-            .then_some(record));
-        }
         let Some(message_id) = Self::first_actionable_notification_message_id(&store, recipient)
         else {
             return Ok(None);
@@ -432,7 +373,8 @@ impl MailboxService {
             return Ok(None);
         }
         let store = self.store()?;
-        let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient) else {
+        let Some(message_id) = Self::first_actionable_notification_message_id(&store, recipient)
+        else {
             return Ok(None);
         };
         let Some(record) = store.projection().notification(recipient, &message_id) else {
@@ -469,7 +411,8 @@ impl MailboxService {
             return Ok(None);
         }
         let mut store = self.store()?;
-        let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient) else {
+        let Some(message_id) = Self::first_actionable_notification_message_id(&store, recipient)
+        else {
             return Ok(None);
         };
         let Some(current) = store

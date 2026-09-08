@@ -286,6 +286,9 @@ pub(crate) async fn notification_worker_loop(
                 }
             }
         }
+        if let Some(messaging) = inner.workspace_messaging() {
+            messaging.notification_run_finished(recipient, &handle.notification);
+        }
     }
 }
 

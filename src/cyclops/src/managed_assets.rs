@@ -2,8 +2,8 @@
 //!
 //! Detection manifests live under the Cyclops home and the agent skill lives
 //! only below an installed consumer. They have one deliberately small rule in
-//! common: Cyclops may create a missing file, but every existing file stays
-//! in place. This module owns that byte-level decision. It neither reads nor
+//! common: Cyclops may create a missing file or refresh its unedited released
+//! seed. Operator edits stay in place. This module owns that decision. It neither reads nor
 //! writes files, and does not turn hooks, themes, sounds, binaries, or
 //! cleanup into a universal asset system.
 
@@ -80,7 +80,7 @@ impl SeededAssetState {
 pub(crate) enum SeedAction {
     Create,
     KeepCurrent,
-    PreserveKnownOldSeed,
+    RefreshKnownOldSeed,
     PreserveOperatorEdit,
     RefuseUnreadableOrUnproven,
 }
@@ -90,7 +90,7 @@ impl SeedAction {
         match self {
             Self::Create => "create",
             Self::KeepCurrent => "keep_current",
-            Self::PreserveKnownOldSeed => "preserve_known_old_seed",
+            Self::RefreshKnownOldSeed => "refresh_known_old_seed",
             Self::PreserveOperatorEdit => "preserve_operator_edit",
             Self::RefuseUnreadableOrUnproven => "manual_review_required",
         }
@@ -120,8 +120,8 @@ impl SeedDecision {
             SeedAction::Create => {
                 "no file exists at this target, so Cyclops may create its shipped seed"
             }
-            SeedAction::PreserveKnownOldSeed => {
-                "the existing bytes match a released Cyclops seed, but automatic replacement is disabled; preserve them and review the update manually"
+            SeedAction::RefreshKnownOldSeed => {
+                "the existing bytes match a released Cyclops seed; refresh only if its inspected identity and bytes remain unchanged"
             }
             SeedAction::KeepCurrent => "the existing bytes match the current shipped seed",
             SeedAction::PreserveOperatorEdit => {
@@ -162,7 +162,7 @@ fn decision_for(observed: SeededAssetState) -> SeedDecision {
     let action = match observed {
         SeededAssetState::Missing => SeedAction::Create,
         SeededAssetState::Shipped(ShippedState::Current) => SeedAction::KeepCurrent,
-        SeededAssetState::Shipped(ShippedState::KnownOld) => SeedAction::PreserveKnownOldSeed,
+        SeededAssetState::Shipped(ShippedState::KnownOld) => SeedAction::RefreshKnownOldSeed,
         SeededAssetState::Shipped(ShippedState::OperatorEdited) => SeedAction::PreserveOperatorEdit,
         SeededAssetState::UnreadableOrUnproven => SeedAction::RefuseUnreadableOrUnproven,
     };
@@ -205,7 +205,7 @@ mod tests {
         );
         assert_eq!(
             seed_decision(Some(b"old"), current, current_or_old).action(),
-            SeedAction::PreserveKnownOldSeed
+            SeedAction::RefreshKnownOldSeed
         );
         assert_eq!(
             seed_decision(Some(current), current, current_or_old).action(),

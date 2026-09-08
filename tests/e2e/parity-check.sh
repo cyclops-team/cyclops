@@ -46,8 +46,6 @@ unset TMUX
 unset TMUX_PANE
 export CYCLOPS_HOME="$ROOT/home"
 mkdir -p "$CYCLOPS_HOME"
-CYC="$REPO/target/debug/cyclops"
-CYCD="$REPO/target/debug/cyclopsd"
 COMPOSER_PATH="$REPO/src/cyclopsd/tests/common/faketui.py"
 OUT="$ROOT/out"
 DAEMON_PID=""
@@ -92,6 +90,12 @@ esac
 for dep in tmux jq; do
   command -v "$dep" >/dev/null || { echo "!! $dep is required" >&2; exit 1; }
 done
+
+# Ask Cargo where it builds, including CARGO_TARGET_DIR and Cargo config.
+# The test must execute this checkout's binaries, not assume a local target.
+BUILD_DIR="$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)/debug"
+CYC="$BUILD_DIR/cyclops"
+CYCD="$BUILD_DIR/cyclopsd"
 
 tmx() { command tmux -u "$@"; }
 
@@ -253,7 +257,7 @@ agent_command() {
 }
 
 pane_write_ready() {
-  "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+  "$CYC" read "$1" --source detection --plain | grep -q 'readiness observation: ready$'
 }
 notification_crossed_submit() {
   local journal
@@ -296,7 +300,7 @@ stop_composer() {
 # screen-reader path, not a reduced view), so the line printed is the line
 # a reader types.
 run() {
-  local built="$REPO/target/debug/" shown="" a
+  local built="$BUILD_DIR/" shown="" a
   for a in "$@"; do
     a="${a//$built/}"
     [ "$a" = "--plain" ] && continue
@@ -627,7 +631,7 @@ echo "#### Rung 3: any terminal agent"
 
 run "$CYC" read reviewer --source detection --plain
 check "detection names the deciding rule" '^reviewer · ○ idle · decided by title_idle · '
-check "and answers write-readiness too"  '^reviewer · ○ idle · decided by title_idle · (write-ready|not write-ready: [a-z_]+)$'
+check "and reports readiness evidence separately"  '^reviewer · ○ idle · decided by title_idle · readiness observation: [a-z_]+$'
 check "and shows the sensor that read it" '^ +title +○ idle +title_idle'
 
 run "$CYC" read reviewer --source detection --raw --plain
@@ -725,7 +729,7 @@ run "$CYC" name "$N1" implementer --plain
 run "$CYC" name "$N2" reviewer --plain
 start_composer reviewer "$N2"
 run "$CYC" read reviewer --source detection --plain
-check "the reviewer composer is write-ready" 'decided by .* · write-ready$'
+check "the reviewer composer has ready evidence" 'decided by .* · readiness observation: ready$'
 
 agent_command implementer "$N1" 'send reviewer --subject "Release notes review" --summary "Review the release notes. Confirm the mailbox contract." --body "Check the mailbox contract." --client-key parity-review --plain'
 check "acceptance is separate from notification" '^accepted cyc-[0-9a-f]{8}-[0-9a-f]{8}$'
@@ -1028,7 +1032,7 @@ duo_start_agent() {
   wait_for "the second rig $label agent" 100 duo_agent_ready "$label"
 }
 duo_pane_write_ready() {
-  duo "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+  duo "$CYC" read "$1" --source detection --plain | grep -q 'readiness observation: ready$'
 }
 duo_notification_crossed_submit() {
   local journal
@@ -1225,7 +1229,7 @@ stock_start_agent() {
   wait_for "the defaults rig $label agent" 100 stock_agent_ready "$label"
 }
 stock_pane_write_ready() {
-  stock "$CYC" read "$1" --source detection --plain | grep -q 'write-ready$'
+  stock "$CYC" read "$1" --source detection --plain | grep -q 'readiness observation: ready$'
 }
 stock_notification_crossed_submit() {
   local journal
@@ -1248,7 +1252,7 @@ stock_start_composer() {
 # Same contract, same $OUT and $ROOT/exit, so check and check_exit work
 # here exactly as they do above.
 stock_run() {
-  local built="$REPO/target/debug/" shown="" a
+  local built="$BUILD_DIR/" shown="" a
   for a in "$@"; do
     a="${a//$built/}"
     [ "$a" = "--plain" ] && continue
@@ -1366,6 +1370,7 @@ fi
 # the docs describe wrongly, which is the one thing here that touches a
 # file the operator wrote.
 if [ "$WITH_INSTALLER" -eq 1 ]; then
+python3 "$REPO/scripts/test-installer-selection.py" || exit 1
 echo
 echo "#### The installer docs/guides/install.md documents"
 
@@ -1417,7 +1422,7 @@ run_installer_in() {
       NO_COLOR=1 \
       "${TOOLCHAIN_KEEP[@]}" \
       "CYCLOPS_TEST_COPY_FAILURE_MARKER=$marker" \
-      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+      sh "$REPO/scripts/install.sh" --source "$@" > "$out" 2>&1
   else
     env -i \
       PATH="$path" \
@@ -1426,7 +1431,7 @@ run_installer_in() {
       TERM=dumb \
       NO_COLOR=1 \
       "${TOOLCHAIN_KEEP[@]}" \
-      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+      sh "$REPO/scripts/install.sh" --source "$@" > "$out" 2>&1
   fi
   printf '%s' "$?" > "$ROOT/exit"
   set -e
@@ -1437,7 +1442,7 @@ run_installer() {
   run_installer_in "$INST" "$path" "$OUT" "" "$@"
 }
 
-printf '\n$ ./scripts/install.sh\n'
+printf '\n$ ./scripts/install.sh --source\n'
 run_installer "$PATH"
 # The build log is noise here; the checks are all on what it says it did.
 grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -22
@@ -1466,7 +1471,7 @@ check_exit "a clean install exits 0" 0
 
 # The profile has exactly one block, not one per run, and the second run
 # says so instead of appending another.
-printf '\n$ ./scripts/install.sh    # again\n'
+printf '\n$ ./scripts/install.sh --source    # again\n'
 run_installer "$PATH"
 grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
 cat "$OUT" | grep 'already has the cyclops block' || true
@@ -1485,7 +1490,7 @@ case "$(uname -s)" in
   *) COPY_FALLBACK_TARGET="$COPY_FALLBACK_HOME/.cache/cyclops/installer/target/dist" ;;
 esac
 mkdir -p "$COPY_FALLBACK_HOME"
-printf '\n$ ./scripts/install.sh --prefix ...    # private candidate copy fallback\n'
+printf '\n$ ./scripts/install.sh --source --prefix ...    # private candidate copy fallback\n'
 run_installer_in "$COPY_FALLBACK_HOME" \
   "$REPO/tests/e2e/fixtures/installer-copy-fails:$PATH" \
   "$COPY_FALLBACK_OUT" \

@@ -47,6 +47,7 @@ evidence = "UNMEASURED"
 [[rule]]
 id = "composer_empty_with_footer"
 state = "idle"
+lifecycle_evidence = false
 priority = 900
 region = "bottom_non_empty_lines(8)"
 # Both clauses must hold: an input row that ends in the `›` glyph (so a

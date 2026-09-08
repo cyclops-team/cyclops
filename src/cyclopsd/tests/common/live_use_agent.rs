@@ -7,6 +7,14 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("bridge-vendor") {
+        let status = Command::new("python3")
+            .args(&args[2..])
+            .status()
+            .expect("run session bridge fixture");
+        assert!(status.success(), "session bridge fixture failed");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("watch") {
         assert_eq!(args.get(2).map(String::as_str), Some("--from"));
         assert_eq!(args.get(3).map(String::as_str), Some("gemini"));

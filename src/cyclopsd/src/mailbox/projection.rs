@@ -440,6 +440,9 @@ pub struct MailboxProjection {
     pub(crate) resolution_action_sequences: HashMap<NotificationAttemptId, u64>,
     /// Workspace sequence of each exact recipient claim.
     pub(crate) claim_sequences: HashMap<(RecipientKey, MessageId), u64>,
+    /// New claims retain an owed wake even if scheduling has not run yet.
+    /// Historical claims without this policy must not acquire new wakes on replay.
+    preserved_claim_notifications: HashSet<(RecipientKey, MessageId)>,
     /// Workspace sequence where each attempt crossed its terminal write boundary.
     pub(crate) notification_write_sequences: HashMap<NotificationAttemptId, u64>,
     /// Complete actions with exact, causally correlated consumption evidence.
@@ -457,6 +460,7 @@ pub(crate) enum PreparedMutation {
         message_id: MessageId,
         recipient: RecipientKey,
         claimant: RecipientKey,
+        preserve_notification: bool,
         notification_update: Option<Box<NotificationProjectionUpdate>>,
     },
     DeliveredDirect {
@@ -682,6 +686,7 @@ impl MailboxProjection {
             resolution_actions_accepted: HashMap::new(),
             resolution_action_sequences: HashMap::new(),
             claim_sequences: HashMap::new(),
+            preserved_claim_notifications: HashSet::new(),
             notification_write_sequences: HashMap::new(),
             resolution_consumptions: HashMap::new(),
             notification_attempts: HashSet::new(),
@@ -1090,6 +1095,7 @@ impl MailboxProjection {
             message_id,
             recipient,
             claimant,
+            preserve_notification,
         } = fact
         else {
             return Err(MailboxError::InvalidFact("expected message_claimed".into()));
@@ -1181,7 +1187,18 @@ impl MailboxProjection {
             .notifications
             .get(&(recipient, message_id.clone()))
             .and_then(|current| {
-                let state = current.state.settled_by_claim(current.transport);
+                let state = if !preserve_notification
+                    && current.transport == NotificationTransport::Doorbell
+                    && matches!(
+                        current.state,
+                        NotificationState::Queued
+                            | NotificationState::Gating
+                            | NotificationState::BlockedPreWrite
+                    ) {
+                    NotificationState::Withdrawn
+                } else {
+                    current.state.settled_by_claim(current.transport)
+                };
                 if state == current.state {
                     return None;
                 }
@@ -1223,6 +1240,7 @@ impl MailboxProjection {
             message_id,
             recipient,
             claimant,
+            preserve_notification,
             notification_update,
         })
     }
@@ -1523,7 +1541,9 @@ impl MailboxProjection {
                         recipient,
                     });
                 }
-                self.require_pending_entry(recipient, &message_id)?;
+                if !self.preserved_claim_notifications.contains(&key) {
+                    self.require_pending_entry(recipient, &message_id)?;
+                }
                 if self.notification_attempts.contains(&attempt_id) {
                     return Err(MailboxError::NotificationAttemptReused(attempt_id));
                 }
@@ -3065,10 +3085,15 @@ impl MailboxProjection {
                 message_id,
                 recipient,
                 claimant,
+                preserve_notification,
                 notification_update,
             } => {
                 self.claim_sequences
                     .insert((recipient, message_id.clone()), line.seq);
+                if preserve_notification {
+                    self.preserved_claim_notifications
+                        .insert((recipient, message_id.clone()));
+                }
                 let entry = self
                     .get_entry_mut(recipient, &message_id)
                     .expect("prepared claim retains its mailbox entry");
@@ -3246,34 +3271,35 @@ impl MailboxProjection {
             .is_some_and(|entry| entry.state.is_pending())
     }
 
-    /// Oldest pre-submit operator notification whose mailbox payload was
-    /// already claimed through the socket. Retrieval does not relinquish this
-    /// notification's FIFO position.
-    pub(crate) fn claimed_operator_notification(
+    /// One FIFO for pane notification work, independent of body retrieval.
+    /// A settled wake never blocks a later message. An unresolved write or
+    /// quota/target hold keeps its place until receipt or explicit resolution.
+    pub(crate) fn oldest_owed_notification(
         &self,
         recipient: RecipientKey,
-    ) -> Option<&NotificationRecord> {
-        self.notifications
-            .values()
-            .filter(|record| {
-                record.recipient == recipient
-                    && record.transport == NotificationTransport::Doorbell
-                    && matches!(
-                        record.state,
-                        NotificationState::Queued
-                            | NotificationState::Gating
-                            | NotificationState::BlockedPreWrite
-                            | NotificationState::QuotaHeld
-                            | NotificationState::QuotaResetObserved
-                            | NotificationState::Writing
-                            | NotificationState::Staged
-                            | NotificationState::Submitting
-                    )
-                    && self
-                        .get_entry(recipient, &record.message_id)
-                        .is_some_and(|entry| entry.state.is_claimed())
-            })
-            .min_by_key(|record| record.started_seq)
+    ) -> Option<&MailboxEntry> {
+        self.mailboxes.get(&recipient)?.values().find(|entry| {
+            if !entry.state.is_pending() && !entry.state.is_claimed() {
+                return false;
+            }
+            match self.notification(recipient, &entry.message_id) {
+                Some(record) => !matches!(
+                    record.state,
+                    NotificationState::Notified
+                        | NotificationState::AttentionRequired
+                        | NotificationState::Withdrawn
+                        | NotificationState::WithdrawnAfterStaging
+                        | NotificationState::WithdrawnByOperator
+                        | NotificationState::Superseded
+                ),
+                None => {
+                    entry.state.is_pending()
+                        || self
+                            .preserved_claim_notifications
+                            .contains(&(recipient, entry.message_id.clone()))
+                }
+            }
+        })
     }
 
     /// Retrieve one recipient's entry for a message.
@@ -3431,6 +3457,7 @@ impl MailboxProjection {
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
                 pre_write_block: None,
+                held_by: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -3476,6 +3503,7 @@ impl MailboxProjection {
             pre_write_cause: record.pre_write_cause,
             pre_write_pane_width: width_block.map(|(observed, _)| observed),
             pre_write_required_pane_width: width_block.map(|(_, required)| required),
+            held_by: None,
             pre_write_block: record
                 .pre_write_observation
                 .as_ref()

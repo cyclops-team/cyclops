@@ -199,11 +199,10 @@ fn status_fact_rows(pane: &PaneStatus, style: &Style) -> Vec<String> {
         ));
     }
     if show_readiness {
-        facts.push(match (&pane.write_block, pane.write_ready) {
-            (_, true) => "write readiness ready".to_string(),
-            (Some(reason), false) => format!("write readiness held: {reason}"),
-            (None, false) => "write readiness held: evidence unavailable".to_string(),
-        });
+        facts.push(copy::readiness_observation(
+            pane.write_ready,
+            pane.write_block.as_deref(),
+        ));
     }
     if let Some(state) = pane.notification_state {
         facts.push(format!("notification {}", notification_words(state)));
@@ -1368,19 +1367,14 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
     if let Some(reason) = det.unknown_reason.as_ref() {
         header.push_str(&format!(" {sep} {}", style.dim(reason.as_str())));
     }
-    // Runtime state and write-readiness are two answers, and the diagnostic
-    // shows both (rule 12). The verdict comes from the one owner of the
-    // rule, never recomputed here, so the surface cannot drift from the
-    // gate's decision.
+    // Keep strict sensor evidence visible without calling ambiguity a
+    // notification hold. Only the notification gate reports that disposition.
     header.push_str(&format!(
         " {sep} {}",
-        match det.write_block.as_deref() {
-            None if det.write_ready => style.dim("write-ready"),
-            // An older daemon stamps neither field. Absent evidence is
-            // not permission, so it reads as refused rather than ready.
-            None => style.dim("not write-ready: unstamped"),
-            Some(reason) => style.dim(&format!("not write-ready: {reason}")),
-        }
+        style.dim(&copy::readiness_observation(
+            det.write_ready,
+            det.write_block.as_deref(),
+        ))
     ));
     // The canonical action, on its own line rather than in the header,
     // because it is a sentence and the header is a row of chips. Status
@@ -1764,6 +1758,26 @@ mod tests {
     }
 
     #[test]
+    fn status_does_not_present_sensor_uncertainty_as_a_notification_hold() {
+        let mut status = fixture();
+        let pane = &mut status.sessions[0].panes[1];
+        pane.write_block = Some("no_write_safe_composer_evidence".into());
+        pane.composer = ComposerState::ComposerAmbiguous;
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("readiness observation: no_write_safe_composer_evidence"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("held"), "{rendered}");
+
+        status.sessions[0].panes[1].composer = ComposerState::HumanDraft;
+        status.sessions[0].panes[1].composer_reason = Some("human_input".into());
+        status.sessions[0].panes[1].write_block = Some("composer_hold".into());
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("composer human draft"), "{rendered}");
+    }
+
+    #[test]
     fn status_does_not_hide_an_owned_notification_behind_runtime_idle() {
         let mut status = fixture();
         let pane = &mut status.sessions[0].panes[1];
@@ -1783,7 +1797,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("write readiness held: composer_hold"),
+            rendered.contains("readiness observation: composer_hold"),
             "{rendered}"
         );
         assert!(
@@ -1901,6 +1915,7 @@ mod tests {
                         ),
                         pre_write_pane_width: None,
                         pre_write_required_pane_width: None,
+                        held_by: None,
                         pre_write_block: None,
                         attention_cleared: None,
                         resolution: None,
@@ -3080,7 +3095,7 @@ mod tests {
             ],
         };
         let got = render_detection("reviewer", &det, &Style::none(), now);
-        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · not write-ready: unstamped\n\
+        let expected = "reviewer · ● working · ⚠ sensors disagree · decided by hook:Stop · readiness observation: unavailable\n\
              \n\
              \x20 hook    ● working  Stop            2s ago\n\
              \x20 title   ● working  spinner         2s ago\n\

@@ -220,12 +220,9 @@ impl NotificationState {
 
     /// Settle notification work after the exact recipient claims the message.
     ///
-    /// A claim before the write boundary withdraws the wake: the recipient
-    /// already holds the body, so the doorbell has nothing left to announce
-    /// and the pane is never touched (cause `claimed_before_write`). A
-    /// doorbell already past Enter is consumed by the claim and settles as
-    /// `notified`; that proves receipt, not task completion. An attempt in
-    /// the middle of its write keeps going and is receipted afterwards.
+    /// Body retrieval and pane notification are independent. A claim leaves
+    /// an unwritten doorbell owed; a claim after Enter settles it as notified.
+    /// Historical direct-payload attempts keep their claim-withdrawal rule.
     pub fn settled_by_claim(self, transport: NotificationTransport) -> Self {
         use NotificationState::*;
 
@@ -234,7 +231,6 @@ impl NotificationState {
                 Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved,
                 NotificationTransport::DirectPayload,
             ) => Withdrawn,
-            (Queued | Gating | BlockedPreWrite, NotificationTransport::Doorbell) => Withdrawn,
             (Submitted | SubmittedUnverified, NotificationTransport::Doorbell) => Notified,
             _ => self,
         }
@@ -1410,13 +1406,13 @@ mod tests {
     }
 
     #[test]
-    fn claim_settlement_withdraws_unwritten_doorbells_and_direct_payloads() {
+    fn claim_settlement_preserves_unwritten_doorbells_but_withdraws_direct_payloads() {
         use NotificationState::*;
 
         for state in [Queued, Gating, BlockedPreWrite] {
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::Doorbell),
-                Withdrawn
+                state
             );
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::DirectPayload),

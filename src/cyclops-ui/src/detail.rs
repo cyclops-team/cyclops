@@ -892,6 +892,13 @@ pub fn render_with_status(
     let mut body: Vec<String> = Vec::new();
 
     match detail.wake() {
+        WakeWord::Gating if detail.pre_write_block.is_some() => {
+            body.push(format!(
+                "wake held: {}",
+                crate::grid::cause_words(detail.pre_write_block.as_deref().unwrap())
+            ));
+            body.push(String::new());
+        }
         WakeWord::BlockedBeforeWrite => {
             if let Some((observed, required)) = detail.pane_width_block {
                 body.push(format!(

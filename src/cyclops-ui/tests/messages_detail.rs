@@ -853,6 +853,7 @@ mod through_the_app {
             settlement: None,
             operator_withdrawn: None,
             attempt_id: alarmed.then(|| attempt(n)),
+            held_by: None,
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
             verified_by: None,
             verify_outcome: None,

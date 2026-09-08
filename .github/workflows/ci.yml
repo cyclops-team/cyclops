@@ -119,6 +119,9 @@ jobs:
       - name: release evidence topology
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: python3 scripts/ci-release-evidence.py --selftest
+      - name: native adapter contracts
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: python3 scripts/native/test_native_adapters.py
       - name: retained performance artifact contract
         if: ${{ needs.classify.outputs.performance_runner == 'true' }}
         run: python3 scripts/ci-performance.py --selftest

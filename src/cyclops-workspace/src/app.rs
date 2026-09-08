@@ -2302,6 +2302,15 @@ fn subscribe_decoration_once(
                 return;
             }
         } else if ev.event != "theme" {
+            // A live hold changes no workspace journal sequence. Refresh its
+            // snapshot projection while retaining the gate in the stream.
+            if ev.event == "gate"
+                && stream_tx
+                    .blocking_send(AppMsg::MessagesChanged(None))
+                    .is_err()
+            {
+                return;
+            }
             let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
             if stream_tx
                 .blocking_send(AppMsg::StreamEntry(Box::new(entry)))

@@ -75,6 +75,7 @@ evidence = "UNMEASURED"
 [[rule]]
 id = "screen_working_esc_pause"
 state = "working"
+lifecycle_evidence = false
 priority = 1100
 region = "bottom_non_empty_lines(8)"
 contains = ["Working", "ESC: pause"]
@@ -86,6 +87,7 @@ evidence = "DOCUMENTED, not measured: docs.openhands.dev CLI pages"
 [[rule]]
 id = "status_ctx_row_idle"
 state = "idle"
+lifecycle_evidence = false
 priority = 900
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*ctx\s+\S+\s+•\s+\$\s*[\d.,]+\s+\(↑\s*\S+\s+↓\s*\S+\s+cache\s+\S+\)']

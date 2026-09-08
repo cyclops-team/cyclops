@@ -1398,79 +1398,79 @@ impl ManagedAssetRoot {
 
     /// Atomically replace an existing managed file.
     pub fn replace_file(&self, descendant: &Path, contents: &[u8]) -> Result<(), StateError> {
+        self.replace_checked(descendant, None, contents)
+    }
+
+    /// Refresh a managed seed only while its inspected identity and bytes
+    /// remain unchanged. This never grants authority over an operator edit.
+    pub fn replace_file_if_unchanged(
+        &self,
+        descendant: &Path,
+        expected: &FileInspection,
+        contents: &[u8],
+    ) -> Result<(), StateError> {
+        self.replace_checked(descendant, Some(expected), contents)
+    }
+
+    fn replace_checked(
+        &self,
+        descendant: &Path,
+        expected: Option<&FileInspection>,
+        contents: &[u8],
+    ) -> Result<(), StateError> {
         let parts = inspection_descendant_parts(descendant)?;
         let display_path = self.path.join(descendant);
         if parts.len() != 1 {
             return Err(unsafe_path(
                 &display_path,
-                "managed asset publication must name one final leaf",
+                "managed publication must name one final leaf",
             ));
         }
         self.validate_publication_parent(&display_path)?;
         let directory = clone_file(&self.directory, &display_path)?;
-
-        let leaf_str = parts
-            .last()
-            .expect("managed asset descendant has one component");
-        let leaf = c_name(&display_path, leaf_str)?;
-
-        let tmp_leaf_str = format!(".{}.tmp.{}", leaf_str.to_string_lossy(), std::process::id());
-        let tmp_leaf = c_name(&display_path, std::ffi::OsStr::new(&tmp_leaf_str))?;
-
-        let flags =
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                tmp_leaf.as_ptr(),
-                flags,
-                FILE_MODE as libc::c_uint,
-            )
+        let metadata = directory
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        let inspector = StateInspector {
+            directory: clone_file(&directory, &display_path)?,
+            path: self.path.clone(),
+            owner: self.owner,
+            root: inspected_from_metadata(self.path.clone(), &metadata, self.owner),
         };
-        if fd < 0 {
-            return Err(path_error(
-                &display_path,
-                std::io::Error::last_os_error(),
-                "could not create temporary file for managed asset replacement",
-            ));
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let result = (|| {
-            repair_descriptor_permissions(&file, &display_path, FILE_MODE)?;
-            validate_regular(&file, &display_path, self.owner)?;
-            file.write_all(contents)
-                .map_err(|source| io_error(&display_path, source))?;
-            file.sync_all()
-                .map_err(|source| io_error(&display_path, source))?;
+        let check = || -> Result<(), StateError> {
             self.validate_publication_parent(&display_path)?;
-            let rename_rc = unsafe {
-                libc::renameat(
-                    directory.as_raw_fd(),
-                    tmp_leaf.as_ptr(),
-                    directory.as_raw_fd(),
-                    leaf.as_ptr(),
-                )
-            };
-            if rename_rc != 0 {
-                return Err(path_error(
-                    &display_path,
-                    std::io::Error::last_os_error(),
-                    "could not atomically replace managed asset file",
-                ));
+            if let Some(expected) = expected {
+                let current = inspector.read_file(descendant, INSPECTION_FILE_BYTES_LIMIT_MAX)?;
+                if expected.truncated
+                    || expected.entry.mode & 0o022 != 0
+                    || current.as_ref() != Some(expected)
+                {
+                    return Err(unsafe_path(
+                        &display_path,
+                        "managed seed changed after inspection",
+                    ));
+                }
             }
-            sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
-                path: display_path.clone(),
-                source,
-            })?;
             Ok(())
-        })();
-
-        if result.is_err() {
-            unsafe {
-                libc::unlinkat(directory.as_raw_fd(), tmp_leaf.as_ptr(), 0);
-            }
-        }
-        result
+        };
+        check()?;
+        let leaf = c_name(&display_path, parts[0])?;
+        let mut temporary = ReplacementTemp::create(&directory, &display_path, self.owner)?;
+        temporary
+            .file
+            .write_all(contents)
+            .map_err(|source| io_error(&temporary.path, source))?;
+        temporary
+            .file
+            .sync_all()
+            .map_err(|source| io_error(&temporary.path, source))?;
+        check()?;
+        temporary.rename_to(&leaf, &display_path, self.owner)?;
+        sync_directory(&directory).map_err(|source| StateError::ReplacementDurabilityUnknown {
+            path: display_path,
+            source,
+        })?;
+        Ok(())
     }
 
     fn validate_publication_parent(&self, display_path: &Path) -> Result<(), StateError> {
@@ -5835,6 +5835,44 @@ mod tests {
             external_directory.metadata().unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn managed_seed_refresh_requires_the_same_leaf_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = base(&temp).join("consumer");
+        fs::create_dir_all(&directory).unwrap();
+        set_mode(&directory, 0o755);
+        let leaf = Path::new("SKILL.md");
+        let path = directory.join(leaf);
+        fs::write(&path, b"old seed").unwrap();
+        set_mode(&path, 0o644);
+        let inspector = StateInspector::open_existing(&directory).unwrap().unwrap();
+        let expected = inspector.read_file(leaf, 64).unwrap().unwrap();
+        let authority = inspector.into_operator_owned_asset_root().unwrap();
+
+        // A same-length user edit is not a seed refresh candidate.
+        fs::write(&path, b"my notes").unwrap();
+        assert!(authority
+            .replace_file_if_unchanged(leaf, &expected, b"new seed")
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"my notes");
+        fs::write(&path, b"old seed").unwrap();
+        let inspector = StateInspector::open_existing(&directory).unwrap().unwrap();
+        let expected = inspector.read_file(leaf, 64).unwrap().unwrap();
+        fs::rename(&path, directory.join("replaced.md")).unwrap();
+        fs::write(&path, b"old seed").unwrap();
+        assert!(authority
+            .replace_file_if_unchanged(leaf, &expected, b"new seed")
+            .is_err());
+
+        let expected = inspector.read_file(leaf, 64).unwrap().unwrap();
+        authority
+            .replace_file_if_unchanged(leaf, &expected, b"new seed")
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new seed");
+        assert_eq!(mode(&directory), 0o755);
+        assert_eq!(entry_names(&directory).len(), 2, "no temporary file leaked");
     }
 
     #[test]

@@ -404,18 +404,6 @@ fn shipped_skill() -> Vec<u8> {
         .expect("read shipped skill")
 }
 
-fn released_skill_at(commit: &str) -> Option<Vec<u8>> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let object = format!("{commit}:skills/cyclops/SKILL.md");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &object])
-        .output()
-        .ok()?;
-    output.status.success().then_some(output.stdout)
-}
-
 /// Consumer tools own their skill trees. Cyclops may add only the final
 /// `SKILL.md` below a parent the tool already created and made private.
 fn create_private_skill_parent(skill: &Path) {
@@ -1091,11 +1079,9 @@ fn setup_preserves_edits_at_every_canonical_skill_path() {
 }
 
 #[test]
-fn setup_preserves_known_old_skill_bytes_for_manual_review() {
-    let Some(previous) = released_skill_at("a9ba6634f87e14246969fef3c89e704314a1e234") else {
-        return;
-    };
-    assert_eq!(fnv64(&previous), "7ebc1453af11b931");
+fn setup_refreshes_released_skills_without_a_manual_delete() {
+    let previous = include_bytes!("fixtures/skill-1.1.0.md");
+    assert_eq!(fnv64(previous), "ab33e7f75239b918");
 
     let home = scratch_home("ws-skills-known-old");
     let user = scratch_home("ws-skills-known-old-user");
@@ -1109,7 +1095,7 @@ fn setup_preserves_known_old_skill_bytes_for_manual_review() {
     ];
     for path in &paths {
         create_private_skill_parent(path);
-        fs::write(path, &previous).expect("write known old skill");
+        fs::write(path, previous).expect("write known old skill");
     }
     let before: Vec<_> = paths
         .iter()
@@ -1133,7 +1119,7 @@ fn setup_preserves_known_old_skill_bytes_for_manual_review() {
             .find(|asset| asset["consumer"] == consumer)
             .unwrap_or_else(|| panic!("missing {consumer} from {plan}"));
         assert_eq!(asset["observed_state"], "outdated", "{asset}");
-        assert_eq!(asset["action"], "preserve_known_old_seed", "{asset}");
+        assert_eq!(asset["action"], "refresh_known_old_seed", "{asset}");
     }
 
     let setup = cyclops_in_user_home(
@@ -1143,23 +1129,23 @@ fn setup_preserves_known_old_skill_bytes_for_manual_review() {
         &["start", "--setup-only", "--wire-hooks"],
     );
     assert!(setup.status.success(), "{setup:?}");
-    for (path, bytes, identity) in &before {
+    for (path, _bytes, identity) in &before {
         assert_eq!(
             fs::read(path).unwrap(),
-            *bytes,
-            "setup changed {}",
+            include_bytes!("../../../skills/cyclops/SKILL.md"),
+            "setup did not refresh {}",
             path.display()
         );
-        assert_eq!(
+        assert_ne!(
             file_identity(path),
             *identity,
-            "setup replaced {}",
+            "setup did not atomically replace {}",
             path.display()
         );
     }
 
     let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
-    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    assert!(check.status.success(), "{check:?}");
     let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
     for consumer in ["claude", "codex", "agy"] {
         let consumer = report["consumers"]
@@ -1168,7 +1154,7 @@ fn setup_preserves_known_old_skill_bytes_for_manual_review() {
             .iter()
             .find(|row| row["id"] == consumer)
             .unwrap_or_else(|| panic!("missing {consumer} from {report}"));
-        assert_eq!(consumer["skill"]["state"], "outdated", "{consumer}");
+        assert_eq!(consumer["skill"]["state"], "current", "{consumer}");
     }
 
     let _ = fs::remove_dir_all(&home);
@@ -1394,7 +1380,7 @@ fn setup_plan_preserves_manifest_create_current_outdated_and_edit_decisions() {
     let assets = plan["assets"].as_array().expect("plan assets");
     for (name, observed, action) in [
         ("claude.toml", "current", "keep_current"),
-        ("codex.toml", "outdated", "preserve_known_old_seed"),
+        ("codex.toml", "outdated", "refresh_known_old_seed"),
         ("cursor.toml", "operator_edited", "preserve_operator_edit"),
         ("agy.toml", "missing", "create"),
     ] {
@@ -1431,8 +1417,8 @@ fn setup_plan_preserves_manifest_create_current_outdated_and_edit_decisions() {
         shipped_manifest("claude.toml")
     );
     assert_eq!(
-        fs::read(manifests.join("codex.toml")).expect("read preserved outdated manifest"),
-        shipped_manifest("claude.toml")
+        fs::read(manifests.join("codex.toml")).expect("read refreshed manifest"),
+        shipped_manifest("codex.toml")
     );
     assert_eq!(
         fs::read(manifests.join("cursor.toml")).expect("read preserved manifest"),
@@ -1443,6 +1429,10 @@ fn setup_plan_preserves_manifest_create_current_outdated_and_edit_decisions() {
         shipped_manifest("agy.toml")
     );
     for (path, bytes, identity) in &existing_before {
+        if path.file_name().is_some_and(|name| name == "codex.toml") {
+            assert_ne!(file_identity(path), *identity, "old seed was not replaced");
+            continue;
+        }
         assert_eq!(
             fs::read(path).unwrap(),
             *bytes,
@@ -1457,6 +1447,10 @@ fn setup_plan_preserves_manifest_create_current_outdated_and_edit_decisions() {
         );
     }
 
+    let existing_before: Vec<_> = existing
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap(), file_identity(path)))
+        .collect();
     let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
     assert_eq!(check.status.code(), Some(1), "{check:?}");
     let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");

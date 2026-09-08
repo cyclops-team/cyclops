@@ -7,13 +7,13 @@ and how to type into it. No code, no plugin, no wrapper around the CLI.
 The shipped manifests are compiled into the `cyclops` binary and land in
 `~/.cyclops/manifests` on your first `cyclops start`. Five are measured
 against a live CLI: `claude.toml`, `codex.toml`, `agy.toml`, `cursor.toml`,
-`kimi.toml`. The rest are written from vendor documentation alone and say so
-with `version_tested = "unverified"`. An unverified file binds the pane,
-declares the hook events the vendor documents, and carries no measured
-composer rule, so a doorbell to that pane never detects a human draft: it is
-written and submitted like a raw write with a receipt, until someone
-measures the composer and edits the file. Each header names its sources and
-what was and was not observed. Their source is
+`kimi.toml`. The other 47 use `version_tested = "unverified"`: they are
+documentation-based bindings, except Gemini also has measured startup-modal
+protection. Nine documented activity hints remain advisory and cannot confirm
+a turn lifecycle. These files have no measured human-draft rule. Cyclops can
+still attempt a normal doorbell to a proven live binding, but cannot protect
+a draft it cannot identify or claim a receipt it did not observe. Each header
+names its sources and what was and was not observed. Their source is
 [`resources/manifests/`](../../resources/manifests/); the full list by tier
 is in [install.md](../guides/install.md). The next one is three steps away,
 and if the vendor documents a shell hook file, a `[hooks.wiring]` table in
@@ -28,7 +28,7 @@ to wire it: no Rust names the vendor.
 
 ```
 $ cyclops read reviewer --source detection
-reviewer · ○ idle · decided by title_idle · write-ready
+reviewer · ○ idle · decided by title_idle · readiness observation: ready
 
   title   ○ idle  title_idle      just now
   screen  ○ idle  composer_empty  just now
@@ -37,10 +37,10 @@ reviewer · ○ idle · decided by title_idle · write-ready
 `decided by` names the rule that produced the verdict. A wrong reading is
 one rule to fix.
 
-`write-ready` is a second answer to a different question: was the composer
+`readiness observation: ready` answers a different question: was the composer
 positively proven empty by this capture. Only a screen rule can answer it,
 because only the screen can see the composer. A manifest with no idle screen
-rule reads `not write-ready: no_write_safe_composer_evidence` however
+rule reads `readiness observation: no_write_safe_composer_evidence` however
 confidently its title rule says idle. Delivery does not gate on it: a
 doorbell holds only on a positively observed human draft (a rule with
 `composer_semantic = "human_input"`) or a named block, so a manifest with no
@@ -53,7 +53,7 @@ you are staring at contradicts the verdict it is supposed to explain.
 
 ```
 $ cyclops read reviewer --source detection --raw
-reviewer · ○ idle · decided by title_idle · write-ready
+reviewer · ○ idle · decided by title_idle · readiness observation: ready
 
   title   ○ idle  title_idle      just now
   screen  ○ idle  composer_empty  just now
@@ -66,8 +66,9 @@ Cyclops looks for manifests in `manifest_dir` from your config, then
 `~/.cyclops/manifests`, then `./manifests` relative to where you started the
 daemon. First directory that exists wins; it is not a search path. With no
 `manifest_dir` set, that means the directory `cyclops start` filled, which
-is where your own file goes too. A later `cyclops start` writes only the
-shipped files it does not find, so nothing you put there is touched.
+is where your own file goes too. A later `cyclops start` installs missing
+files and refreshes byte-for-byte known released seeds. Operator edits stay
+in place and require review; setup never silently replaces them.
 
 A file that fails to parse takes the whole directory with it: the daemon
 logs the reason and runs with no manifests at all, so every pane reads

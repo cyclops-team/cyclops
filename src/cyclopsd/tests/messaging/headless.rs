@@ -21,6 +21,242 @@ use common::*;
 use cyclops_proto::LedgerLine;
 use serde_json::{json, Value};
 
+/// The vendor owns its children until the orphan regression deliberately
+/// ends it. Each bridge then exits on its control connection's EOF.
+struct BridgeVendor {
+    child: Child,
+}
+
+impl Drop for BridgeVendor {
+    fn drop(&mut self) {
+        if let Some(mut stdin) = self.child.stdin.take() {
+            let _ = writeln!(stdin, "exit");
+        }
+        let _ = self.child.wait();
+    }
+}
+
+struct BridgeControl(std::io::BufReader<std::os::unix::net::UnixStream>);
+
+impl BridgeControl {
+    fn read(&mut self) -> Value {
+        use std::io::BufRead as _;
+        let mut response = String::new();
+        self.0
+            .read_line(&mut response)
+            .expect("bridge response before deadline");
+        serde_json::from_str(&response).expect("bridge response JSON")
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        writeln!(
+            self.0.get_mut(),
+            "{}",
+            json!({"method": method, "params": params})
+        )
+        .unwrap();
+        self.read()
+    }
+}
+
+impl Drop for BridgeControl {
+    fn drop(&mut self) {
+        let _ = self.0.get_mut().shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn assert_bridge_cannot_reset_operator_state(
+    rig: &Rig,
+    bridge: &mut BridgeControl,
+    registered: &Value,
+    message_id: &str,
+) {
+    let workspace = registered["result"]["recipient"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let journal = rig
+        .home
+        .join("workspaces")
+        .join(workspace)
+        .join("messages.ndjson");
+    let before_journal = std::fs::read(&journal).unwrap();
+    let before_registry = std::fs::read(rig.home.join("registry.json")).unwrap();
+    assert!(!before_journal.is_empty());
+    for params in [json!({}), json!({"flush_messages": true})] {
+        let response = bridge.request("status.reset", params);
+        assert_eq!(
+            response["error"]["code"], "denied",
+            "a registered bridge is authenticated but is not the operator: {response}"
+        );
+    }
+    // Other in-flight journal facts may append; none of the pre-existing bytes
+    // may disappear or change because an agent requested operator cleanup.
+    assert!(std::fs::read(journal).unwrap().starts_with(&before_journal));
+    assert_eq!(
+        std::fs::read(rig.home.join("registry.json")).unwrap(),
+        before_registry
+    );
+    let identity = bridge.request("agent.identity", json!({}));
+    assert_eq!(
+        identity["result"]["recipient"],
+        registered["result"]["recipient"]
+    );
+    let retained = bridge.request("inbox.claim", json!({"message_id": message_id}));
+    assert_eq!(retained["result"]["message"]["body"], "for one only");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_bridges_are_distinct_and_orphans_never_become_administrators() {
+    use std::process::Stdio;
+    use tokio::net::UnixListener;
+
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let bin = named_bin("bridges");
+    let pane_cmd = format!("{}/cycagent {}", bin.display(), faketui_path());
+    let mut rig = Rig::new("bridges", NAMED_MANIFEST, &pane_cmd, "").await;
+    let admin_identity = rig.ctl.request("agent.identity", json!({})).await;
+    assert_eq!(
+        admin_identity["error"]["code"], "denied",
+        "{admin_identity}"
+    );
+    let root = fixture_dir(&rig.home);
+    let _controls = HomeGuard(root.clone());
+    let first_path = root.join("first.sock");
+    let second_path = root.join("second.sock");
+    let first_listener = UnixListener::bind(&first_path).unwrap();
+    let second_listener = UnixListener::bind(&second_path).unwrap();
+    let mut vendor = BridgeVendor {
+        child: Command::new(agent_binary())
+            .arg("bridge-vendor")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/headless_bridge.py"))
+            .arg(rig.daemon.socket_path())
+            .arg(&first_path)
+            .arg(&second_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    };
+    let first = tokio::time::timeout(Duration::from_secs(10), first_listener.accept())
+        .await
+        .unwrap()
+        .unwrap()
+        .0
+        .into_std()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), second_listener.accept())
+        .await
+        .unwrap()
+        .unwrap()
+        .0
+        .into_std()
+        .unwrap();
+    for stream in [&first, &second] {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+    }
+    let mut first = BridgeControl(std::io::BufReader::new(first));
+    let mut second = BridgeControl(std::io::BufReader::new(second));
+    let one = first.read();
+    let two = second.read();
+    assert!(one["error"].is_null(), "{one}");
+    assert!(two["error"].is_null(), "{two}");
+    assert_eq!(one["result"]["scope"], "bridge");
+    assert_ne!(one["result"]["recipient"], two["result"]["recipient"]);
+    assert_ne!(one["result"]["pid"], two["result"]["pid"]);
+    let repeated = first.request(
+        "headless.bridge.register",
+        json!({"label": "bridge-one", "scope": "vendor"}),
+    );
+    assert_eq!(repeated["result"]["recipient"], one["result"]["recipient"]);
+    assert_eq!(
+        repeated["result"]["scope"], "bridge",
+        "the dedicated method cannot widen its scope"
+    );
+
+    let receipt = admin_send(
+        &rig,
+        json!({"to": ["bridge-one"], "subject": "private", "body": "for one only"}),
+    )
+    .await
+    .unwrap();
+    let id = message_id(&receipt);
+    let foreign = second.request("inbox.claim", json!({"message_id": id}));
+    assert!(
+        !foreign["error"].is_null(),
+        "sibling must not claim: {foreign}"
+    );
+    let claimed = first.request("inbox.claim", json!({"message_id": id}));
+    assert_eq!(
+        claimed["result"]["message"]["body"], "for one only",
+        "{claimed}"
+    );
+    let admin_read = first.request("msg.read", json!({"message_id": id}));
+    assert_eq!(admin_read["error"]["code"], "forbidden", "{admin_read}");
+    assert_bridge_cannot_reset_operator_state(&rig, &mut first, &one, &id);
+    for (bridge, expected) in [(&mut first, &one), (&mut second, &two)] {
+        let snapshot = bridge.request("agent.identity", json!({}));
+        assert_eq!(
+            snapshot["result"]["recipient"],
+            expected["result"]["recipient"]
+        );
+    }
+
+    // The bridges retain live socket connections after their vendor exits.
+    // No vendor ancestor must mean denied here, never the ordinary admin shell.
+    writeln!(vendor.child.stdin.as_mut().unwrap(), "orphan").unwrap();
+    assert!(vendor.child.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = rig
+            .ctl
+            .request("messages.snapshot", json!({"recent_settled": 5}))
+            .await;
+        let row = snapshot["result"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["message_id"] == id)
+            .unwrap();
+        if row["recipients"][0]["available"] == false {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "orphan route remains available: {row}"
+        );
+        rig.ev
+            .wake_on(
+                deadline.saturating_duration_since(Instant::now()),
+                |event| event["event"] == "messages.route_changed",
+            )
+            .await;
+    }
+    for bridge in [&mut first, &mut second] {
+        let denied = bridge.request("inbox.list", json!({}));
+        assert_eq!(
+            denied["error"]["code"], "denied",
+            "orphan elevated: {denied}"
+        );
+        assert_eq!(bridge.request("fixture.exit", json!({}))["exiting"], true);
+    }
+    drop(first);
+    drop(second);
+    drop(first_listener);
+    drop(second_listener);
+    std::fs::remove_file(first_path).unwrap();
+    std::fs::remove_file(second_path).unwrap();
+    rig.shutdown().await;
+}
+
 /// This file's own manifest, with names nothing else on a machine is
 /// called: `cycagent` is the fixture agent, `cycvendor` a shell wearing an
 /// agent's name, and the python socket client is deliberately neither.

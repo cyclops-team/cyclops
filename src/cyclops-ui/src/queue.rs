@@ -244,9 +244,8 @@ pub struct QueueRow {
     pub wake: WakeWord,
     pub cause: Option<NotificationAttentionCause>,
     pub pre_write_cause: Option<NotificationPreWriteCause>,
-    /// The named write block behind a pre-write hold, when the daemon
-    /// recorded one (for example `hook_admission_unproven`). More exact
-    /// than the enum cause, so readers prefer it.
+    /// The daemon's current live hold, or the recorded pre-write block when
+    /// no live hold exists. More exact than the enum cause.
     pub pre_write_block: Option<String>,
     /// Exact durable reason this wake has no live scheduler owner.
     pub wake_block: Option<MessageWakeBlock>,

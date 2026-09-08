@@ -21,8 +21,8 @@
 #            behind an interpreter, pin the pane:
 #            cyclops name %N <label> --manifest amp.
 #   title    UNMEASURED.
-#   screen   UNMEASURED. No idle or working rule ships, so deliveries fail
-#            closed (not write-ready) until someone measures the composer.
+#   screen   UNMEASURED. No idle or working rule ships. Notifications still
+#            use the authenticated binding; unknown activity is not a veto.
 
 [agent]
 id = "amp"

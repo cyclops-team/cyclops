@@ -347,6 +347,9 @@ fn health_accepts_cargo_modes_beneath_a_private_build_cache() {
     let baseline = parse(&run_health(&home, &user, &runtime_temp, ""));
     let cache = PathBuf::from(baseline["build_cache"]["path"].as_str().unwrap());
     fs::create_dir_all(&cache).unwrap();
+    // The shared cache parent is readable, so update-scratch cleanup refuses
+    // it. The independently inspected Cargo cache itself is still private.
+    fs::set_permissions(cache.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(cache.join(".lease"), b"").unwrap();
     fs::set_permissions(cache.join(".lease"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -365,6 +368,10 @@ fn health_accepts_cargo_modes_beneath_a_private_build_cache() {
 
     let report = parse(&run_health(&home, &user, &runtime_temp, ""));
     assert_eq!(report["build_cache"]["safe"], true, "{report}");
+    assert!(report["build_cache"]["error"].is_null(), "{report}");
+    assert!(report["update_scratch"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("unsupported_temp_root")));
     assert!(report["build_cache"]["entries"].as_u64().unwrap() > 0);
     assert!(
         report["build_cache"]["candidates"][0]["bytes"]
@@ -373,6 +380,20 @@ fn health_accepts_cargo_modes_beneath_a_private_build_cache() {
             > 0
     );
     assert!(!report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue["code"] == "unsafe_build_cache"));
+
+    // An unrelated scratch-root error must not hide a genuine cache defect:
+    // the cleanup lease must remain owner-only even inside a private cache.
+    fs::set_permissions(cache.join(".lease"), fs::Permissions::from_mode(0o666)).unwrap();
+    let unsafe_cache = parse(&run_health(&home, &user, &runtime_temp, ""));
+    assert_eq!(unsafe_cache["build_cache"]["safe"], false);
+    assert!(unsafe_cache["build_cache"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("asset lease")));
+    assert!(unsafe_cache["issues"]
         .as_array()
         .unwrap()
         .iter()
@@ -411,8 +432,12 @@ fn health_recursively_refuses_a_link_inside_the_build_cache() {
 #[test]
 fn health_reports_each_update_scratch_marker_and_lease() {
     let (_temp, home, user, runtime_temp) = scratch("cyclops-health-scratch-marker");
+    let baseline = parse(&run_health(&home, &user, &runtime_temp, ""));
+    let updates = PathBuf::from(baseline["update_scratch"]["path"].as_str().unwrap());
+    fs::create_dir_all(&updates).unwrap();
+    fs::set_permissions(&updates, fs::Permissions::from_mode(0o700)).unwrap();
     let nonce = "0123456789abcdef0123456789abcdef";
-    let scratch = runtime_temp.join(format!("cyclops-update.{nonce}"));
+    let scratch = updates.join(format!("cyclops-update.{nonce}"));
     fs::create_dir(&scratch).unwrap();
     fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(scratch.join(".lease"), b"").unwrap();

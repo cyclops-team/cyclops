@@ -1,6 +1,65 @@
 use super::pair_store::*;
 use super::*;
 
+#[test]
+fn source_update_cannot_download_a_release_instead_of_the_cloned_commit() {
+    let commit = "a84d44b8f5476c10ecf849d46370d2cb0238dab9";
+    let command = source_installer(Path::new("checkout"), commit);
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, ["checkout/scripts/install.sh", "--source"]);
+    let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+    assert_eq!(environment[std::ffi::OsStr::new("CYCLOPS_VERSION")], None);
+    assert_eq!(
+        environment[std::ffi::OsStr::new("CYCLOPS_EXPECTED_BUILD")],
+        Some(std::ffi::OsStr::new(commit))
+    );
+}
+
+#[test]
+fn copy_fallback_installer_home_fits_the_update_replay_socket() {
+    let cache = build_cache_parent(&cyclops_proto::cyclops_home());
+    let root = update_scratch_root();
+    let relative = root.strip_prefix(&cache).unwrap();
+    let actual_installer_cache =
+        Path::new("/private/tmp/cyclops-parity.OI48kX/copy-fallback/Library/Caches/Cyclops");
+    let scratch = actual_installer_cache.join(relative).join(format!(
+        "{SCRATCH_PREFIX}{}",
+        "a".repeat(SCRATCH_NAME_NONCE_BYTES)
+    ));
+    assert!(
+        validate_replay_socket_path(&scratch).is_ok(),
+        "{}",
+        scratch.display()
+    );
+}
+
+#[test]
+fn replay_socket_length_is_checked_before_creating_an_update_workspace() {
+    let normal = Path::new("/Users/operator/Library/Caches/Cyclops").join(format!(
+        "{SCRATCH_PREFIX}{}",
+        "a".repeat(SCRATCH_NAME_NONCE_BYTES)
+    ));
+    assert!(validate_replay_socket_path(&normal).is_ok());
+    let parity = Path::new("/private/tmp/cyc-parity-999999/inst/Library/Caches/Cyclops").join(
+        format!("{SCRATCH_PREFIX}{}", "a".repeat(SCRATCH_NAME_NONCE_BYTES)),
+    );
+    assert!(validate_replay_socket_path(&parity).is_ok());
+    assert_eq!(
+        update_scratch_root(),
+        build_cache_parent(&cyclops_proto::cyclops_home())
+    );
+    let long = PathBuf::from(format!("/Users/{}/Library/Caches/Cyclops", "a".repeat(64))).join(
+        format!("{SCRATCH_PREFIX}{}", "a".repeat(SCRATCH_NAME_NONCE_BYTES)),
+    );
+    assert!(validate_replay_socket_path(&long)
+        .unwrap_err()
+        .contains("too long"));
+    let exactly_fits = PathBuf::from(format!("/{}", "a".repeat(95)));
+    assert!(validate_replay_socket_path(&exactly_fits).is_ok());
+    let too_long = PathBuf::from(format!("/{}", "a".repeat(96)));
+    assert!(validate_replay_socket_path(&too_long).is_err());
+}
+
 fn directory(path: &Path) {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700).recursive(true);
@@ -590,6 +649,14 @@ fn update_scratch_is_random_owner_only_marked_and_leased() {
     let first = Scratch::create().unwrap();
     let second = Scratch::create().unwrap();
     assert_ne!(first.path(), second.path());
+    assert_eq!(first.marker.len(), 32);
+    assert_eq!(
+        first.path().file_name().unwrap().to_str().unwrap(),
+        format!(
+            "{SCRATCH_PREFIX}{}",
+            &first.marker[..SCRATCH_NAME_NONCE_BYTES]
+        )
+    );
     let metadata = std::fs::symlink_metadata(first.path()).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     assert_eq!(
@@ -1650,6 +1717,50 @@ fn currency_is_a_prefix_match_on_the_short_sha() {
     // A .dirty ref never reaches this compare, but if one did the
     // suffix keeps it from matching.
     assert!(!is_current("e610afc.dirty", remote));
+}
+
+#[test]
+fn remote_identity_peels_annotated_tags_without_overriding_a_same_named_branch() {
+    let scratch = Scratch::create().unwrap();
+    let repo = scratch.path().join("repo");
+    directory(&repo);
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=Installer fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "--quiet"]);
+    git(&["commit", "--allow-empty", "--quiet", "-m", "first"]);
+    git(&["tag", "--annotate", "v-fixture", "-m", "release"]);
+    git(&["tag", "lightweight-fixture"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    let repo_url = repo.to_str().unwrap();
+    assert_eq!(ls_remote(repo_url, "v-fixture").unwrap(), first);
+    assert_eq!(ls_remote(repo_url, "lightweight-fixture").unwrap(), first);
+    assert_eq!(ls_remote(repo_url, "HEAD").unwrap(), first);
+
+    git(&["commit", "--allow-empty", "--quiet", "-m", "second"]);
+    git(&["branch", "v-fixture"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    // `git clone --branch` prefers the branch when a tag has the same name.
+    assert_eq!(ls_remote(repo_url, "v-fixture").unwrap(), second);
+    assert_eq!(ls_remote(repo_url, "refs/tags/v-fixture").unwrap(), first);
 }
 
 #[test]

@@ -504,15 +504,19 @@ after a `v*` tag is pushed.
 
 ## Release binaries
 
-`.github/workflows/release-binaries.yml` is a separate, later workflow: it
-does not decide whether a candidate is safe to release, only packages and
-publishes one already tagged. A pushed `v*` tag triggers it. It never
-shares a job name with `release-evidence.yml` and neither reads the other's
-output.
+`.github/workflows/release-binaries.yml` packages and publishes a tagged
+candidate only after its evidence passes. A pushed `v*` tag triggers it;
+`check-evidence` resolves the tag to its full commit SHA and queries this
+repository's release-evidence runs. Only a completed, successful run for
+that exact SHA counts. A green PR, a scheduled run, or evidence from an older
+commit cannot authorize publication. If evidence is missing, run the release
+lane on that commit and rerun the failed packaging workflow. Neither step
+creates or moves a tag.
 
 `check-version` fails the run before anything builds if the tag does not
-match the `version` in the workspace's `Cargo.toml`. `build` then compiles
-the matched `cyclops`/`cyclopsd` pair with `cargo build --profile dist` for
+match the `version` in the workspace's `Cargo.toml`. Both version and evidence
+checks must succeed before `build` compiles the matched `cyclops`/`cyclopsd`
+pair with `cargo build --locked --profile dist` for
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
 and `aarch64-unknown-linux-gnu`, on a native GitHub-hosted runner for three
 of the four; `x86_64-apple-darwin` cross-compiles from the arm64 macOS
@@ -526,6 +530,13 @@ first if the tag has none yet.
 own comments and [install.md](../guides/install.md) for the pair-activation
 contract a downloaded pair goes through, which is the same one a source
 build goes through.
+
+Installer parity explicitly uses `--source` to exercise the checked-out
+candidate, not the latest published binaries. The staged first-handoff
+performance workload does the same, so its Cargo timing cannot accidentally
+measure a release download. `scripts/test-installer-selection.py` exercises
+release pins, resolved-latest fallback, explicit source refs, and local source
+selection using stub fetch/build commands; it never installs anything.
 
 ## Final comparison record
 

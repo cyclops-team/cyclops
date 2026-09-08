@@ -131,16 +131,20 @@ its receipt, never as a clean delivery.
 
 The rest of the contract, as the gate applies it:
 
-- A positively observed human draft holds. So does a hold a delivery owns:
-  a doorbell staged and not yet consumed, or the turn it started that has
-  not ended. The hold outlives the frame it was raised on; it releases when
-  the draft is seen erased or the turn ends, never on elapsed time.
+- A positively observed human draft holds until it is seen erased or submitted,
+  never merely because time passed. A notification owns the composer only
+  while its staged input is unresolved; a consumption receipt releases that
+  reservation immediately, not when the agent finishes the resulting turn.
 - A modal, permission prompt, exhausted quota, dead pane, or pane in
   copy-mode holds on its name. Quota is a gate hold like the others: it
   waits for the pane to change and never retries on a clock.
 - Anything else proceeds: an idle agent, a working agent, a composer no
   rule can read, a manifest with no composer rule at all. A working agent
   gets its doorbell during the turn; vendors queue the line.
+- Socket claims retrieve bodies without withdrawing owed pane notifications.
+  The same rule applies before scheduling, while gating, and during a pre-write
+  hold. A notified but unclaimed body does not block the next pane doorbell.
+  Historical claims replay their original settlement and acquire no new wakes.
 - Enter is pressed exactly once. A swallowed Enter, a missing receipt, or a
   receipt that never arrives ends the attempt as `notified` with no
   verifier, and the next doorbell for that recipient goes through the gate
@@ -170,6 +174,11 @@ The rest of the contract, as the gate applies it:
   `a_raw_send_pastes_the_whole_message_and_records_an_unverified_write`;
   `src/cyclopsd/src/delivery/tests.rs`,
   `a_raw_send_pastes_the_whole_message_and_records_transport_raw`;
+  `a_consumed_doorbell_releases_its_hold_while_the_agent_keeps_working` and
+  `a_socket_claim_before_the_write_is_not_a_pane_consumption_receipt`;
+  `src/cyclopsd/src/mailbox/tests.rs`,
+  `a_notified_unclaimed_message_does_not_block_the_next_doorbell` and
+  `replay_keeps_historical_claim_settlement_without_resurrecting_old_wakes`;
   `src/cyclops-proto/src/state.rs`,
   `a_pane_that_was_holding_text_refuses_a_clean_frame` and
   `the_hold_releases_only_on_a_completed_turn`.
@@ -239,6 +248,13 @@ on a caller resolves to that label only by descending from that exact
 process generation, and the label is released when the process exits.
 There is no token: a bearer credential would sit in `ps e` and shell
 history, and would have no retirement edge.
+
+A session-owned MCP bridge uses `headless.bridge.register` to bind its own
+connecting process instead of sharing an app-wide vendor root. The daemon
+still proves and records that exact vendor ancestor. A surviving bridge
+whose vendor exits is denied, not treated as an operator shell. Two bridge
+processes beneath one app have separate identities; two chats sharing one
+bridge do not. See [native app integration](../guides/native-apps.md).
 
 `agent.state.report` needs one more thing, because being in the pane is
 weaker than it sounds. An adopted pane keeps its label, its adoption and

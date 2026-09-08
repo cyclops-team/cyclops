@@ -60,6 +60,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             path,
             "src/",
             "tests/testrig/",
+            "scripts/native/",
         ) or path in {"tests/e2e/parity_agent.rs", "scripts/check.sh"}
         result["docs"] |= control or markdown or path == "scripts/check-doc-paths.py"
         result["parity"] |= control or markdown or cargo or under(
@@ -81,7 +82,16 @@ def classify(paths: list[str]) -> dict[str, bool]:
             "website/static/install.sh",
             "src/cyclops/src/skillseed.rs",
             "src/cyclops/src/hookset.rs",
+            "src/cyclops/src/update/",
+            "src/cyclops-state/",
         ) or path in {
+            "src/cyclops/src/consumer.rs",
+            "src/cyclops/src/wiring.rs",
+            "src/cyclops/src/managed_assets.rs",
+            "src/cyclops/src/cleanup.rs",
+            "src/cyclops/src/state_remove.rs",
+            "src/cyclops/src/daemon.rs",
+            "scripts/test-installer-selection.py",
             "docs/guides/install.md",
             "tests/e2e/parity-check.sh",
             "tests/e2e/parity_agent.rs",
@@ -142,6 +152,16 @@ def selftest() -> None:
     assert classify(["tests/e2e/parity-check.sh"])["installer"]
     assert classify(["tests/e2e/parity_agent.rs"])["installer"]
     assert classify(["tests/e2e/lib/lib.sh"])["installer"]
+    for installer_owner in (
+        "src/cyclops/src/update/mod.rs",
+        "src/cyclops/src/update/pair_store.rs",
+        "src/cyclops/src/consumer.rs",
+        "src/cyclops/src/wiring.rs",
+        "src/cyclops/src/cleanup.rs",
+        "src/cyclops/src/state_remove.rs",
+        "src/cyclops-state/src/lib.rs",
+    ):
+        assert classify([installer_owner])["installer"], installer_owner
     daemon = classify(["src/cyclopsd/src/messaging.rs"])
     assert daemon["rust"] and daemon["tmux"] and daemon["parity"]
     assert not daemon["platform"]
@@ -170,6 +190,8 @@ def selftest() -> None:
     headless = classify(["scripts/check-headless.sh"])
     assert all(selected for lane, selected in headless.items() if lane != "performance_runner")
     assert not headless["performance_runner"]
+    assert classify(["scripts/native/antigravity_sidecar_probe.py"])["rust"]
+    assert classify(["scripts/native/test_native_adapters.py"])["rust"]
 
 
 def main() -> int:

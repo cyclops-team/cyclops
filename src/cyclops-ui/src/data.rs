@@ -63,7 +63,7 @@ pub enum UiMsg {
     /// A content-free edge. It wakes the snapshot reducer and never enters
     /// the stream record.
     MessagesChanged(MessagesChangedData),
-    /// Session or pane routing changed outside the workspace journal.
+    /// Routing or a live notification hold changed outside the workspace journal.
     MessagesRouteChanged,
     /// One authenticated messages snapshot, replacing the queue whole.
     Messages {
@@ -591,14 +591,16 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
         },
         "theme" => Ok(tx.send(UiMsg::ThemeChanged).await.is_ok()),
         "messages.route_changed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()),
-        "session" | "pane-removed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()
-            && tx
-                .send(UiMsg::Entry(Box::new(Entry::from_event(
-                    &ev,
-                    crate::stream::now_ms(),
-                ))))
-                .await
-                .is_ok()),
+        "session" | "pane-removed" | "gate" => {
+            Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()
+                && tx
+                    .send(UiMsg::Entry(Box::new(Entry::from_event(
+                        &ev,
+                        crate::stream::now_ms(),
+                    ))))
+                    .await
+                    .is_ok())
+        }
         _ => Ok(tx
             .send(UiMsg::Entry(Box::new(Entry::from_event(
                 &ev,
@@ -909,8 +911,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_and_pane_events_also_invalidate_route_availability() {
-        for event in ["session", "pane-removed"] {
+    async fn route_and_gate_events_refresh_live_message_diagnostics() {
+        for event in ["session", "pane-removed", "gate"] {
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             assert!(forward_event(
                 &tx,

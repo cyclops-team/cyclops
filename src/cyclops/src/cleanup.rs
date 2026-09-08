@@ -299,7 +299,7 @@ thread_local! {
 
 pub(crate) fn run(json_output: bool, classes: &[AssetClass], apply: bool) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let temp_root = platform_temp_root();
+    let temp_root = crate::update::update_scratch_root();
     let cache = crate::update::build_cache(&home);
     let report = execute_cleanup_at(&home, &temp_root, &cache, classes, apply);
     if json_output {
@@ -362,8 +362,51 @@ fn cleanup_boundary(_: CleanupBoundary) {}
 
 /// Inspect cleanup-managed operational assets without locking or changing them.
 pub(crate) fn inspect_operational_assets(home: &Path) -> OperationalAssetInventory {
-    let temp_root = platform_temp_root();
+    let temp_root = crate::update::update_scratch_root();
     let cache = crate::update::build_cache(home);
+    inspect_operational_assets_at(temp_root, cache)
+}
+
+fn inspect_operational_assets_at(temp_root: PathBuf, cache: PathBuf) -> OperationalAssetInventory {
+    let mut inventory = inspect_update_inventory(temp_root, &cache);
+    // Build caches and update scratch have independent lifecycles. An absent
+    // or unreadable update directory must not hide an existing build cache.
+    if !inventory.candidates.iter().any(|item| item.path == cache) {
+        match StateInspector::open_existing(&cache) {
+            Ok(Some(inspector)) => inventory.candidates.push(inspect_operational_candidate(
+                &inspector,
+                inspector.root(),
+                AssetClass::BuildCache,
+                None,
+            )),
+            Ok(None) => {}
+            Err(error) => inventory.candidates.push(OperationalAssetCandidate {
+                class: AssetClass::BuildCache,
+                path: cache,
+                safe: false,
+                truncated: false,
+                entries: 0,
+                bytes: 0,
+                marker: "not_required",
+                lease: "unproven",
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    inventory
+}
+
+fn inspect_update_inventory(temp_root: PathBuf, cache: &Path) -> OperationalAssetInventory {
+    if matches!(std::fs::symlink_metadata(&temp_root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return OperationalAssetInventory {
+            temp_root,
+            root_safe: true,
+            truncated: false,
+            candidates: Vec::new(),
+            error: None,
+        };
+    }
     let temp = match open_private_temp_root(&temp_root) {
         Ok(temp) => temp,
         Err(error) => {
@@ -402,7 +445,7 @@ pub(crate) fn inspect_operational_assets(home: &Path) -> OperationalAssetInvento
         if entry.path == cache
             || cleanup_tombstone(&entry.path).is_some_and(|tombstone| {
                 tombstone.class == AssetClass::BuildCache
-                    && tombstone.cache_key.as_deref() == cache_key(&cache)
+                    && tombstone.cache_key.as_deref() == cache_key(cache)
             })
         {
             candidates.push(inspect_operational_candidate(
@@ -446,17 +489,6 @@ pub(crate) fn inspect_operational_assets(home: &Path) -> OperationalAssetInvento
                 lease: "unproven",
                 error: Some("update scratch name has no exact 32-hex nonce".into()),
             });
-        }
-    }
-    if cache.parent() != Some(&temp_root) && cache.exists() {
-        if let Ok(Some(inspector)) = StateInspector::open_existing(&cache) {
-            let entry = inspector.root().clone();
-            candidates.push(inspect_operational_candidate(
-                &inspector,
-                &entry,
-                AssetClass::BuildCache,
-                None,
-            ));
         }
     }
     OperationalAssetInventory {
@@ -590,61 +622,35 @@ fn collect_at(
         issues: Vec::new(),
     };
 
-    let temp = match open_private_temp_root(temp_root) {
-        Ok(temp) => temp,
-        Err(reason) => {
-            report.issues.push(reason.clone());
-            for class in classes {
-                report.candidates.push(CandidateReport::new(
-                    class,
-                    class_placeholder(class, temp_root, cache),
-                    CandidateState::Unsupported,
-                    reason.clone(),
-                ));
-            }
-            return report;
-        }
-    };
-    report.temp_root_state = "private_owner_root";
-
-    let snapshot = match temp.inspect_root(limits()) {
-        Ok(snapshot) if !snapshot.truncated => snapshot,
-        Ok(_) => {
-            let reason = "temporary-root inventory reached its fixed limit".to_string();
-            report.issues.push(reason.clone());
-            for class in classes {
-                report.candidates.push(CandidateReport::new(
-                    class,
-                    class_placeholder(class, temp_root, cache),
-                    CandidateState::Unsupported,
-                    reason.clone(),
-                ));
-            }
-            return report;
-        }
-        Err(error) => {
-            let reason = format!("temporary-root inventory is unavailable: {error}");
-            report.issues.push(reason.clone());
-            for class in classes {
-                report.candidates.push(CandidateReport::new(
-                    class,
-                    class_placeholder(class, temp_root, cache),
-                    CandidateState::Unsupported,
-                    reason.clone(),
-                ));
-            }
-            return report;
-        }
+    // Updates and retained Cargo output have different parents. An absent or
+    // unsafe update root must not prevent inspecting the independent cache.
+    let update_root = cleanup_parent_inventory(temp_root);
+    report.temp_root_state = match &update_root {
+        Ok(Some(_)) => "private_owner_root",
+        Ok(None) => "absent",
+        Err(_) => "unsupported",
     };
 
     for class in classes {
         match class {
-            AssetClass::BuildCache => {
-                inspect_build_cache(&temp, &snapshot.entries, cache, apply, &mut report)
-            }
-            AssetClass::UpdateScratch => {
-                inspect_update_scratch(&temp, &snapshot.entries, temp_root, apply, &mut report)
-            }
+            AssetClass::BuildCache => inspect_build_cache(cache, apply, &mut report),
+            AssetClass::UpdateScratch => match &update_root {
+                Ok(Some((temp, entries))) => {
+                    inspect_update_scratch(temp, entries, temp_root, apply, &mut report)
+                }
+                Ok(None) => report.candidates.push(CandidateReport::new(
+                    class,
+                    class_placeholder(class, temp_root, cache),
+                    CandidateState::Absent,
+                    "no update workspace root is present",
+                )),
+                Err(reason) => report.candidates.push(CandidateReport::new(
+                    class,
+                    class_placeholder(class, temp_root, cache),
+                    CandidateState::Unsupported,
+                    reason.clone(),
+                )),
+            },
         }
     }
 
@@ -1066,28 +1072,21 @@ fn excluded_classes() -> Vec<ExcludedClass> {
 fn class_placeholder(class: AssetClass, temp_root: &Path, cache: &Path) -> PathBuf {
     match class {
         AssetClass::BuildCache => cache.to_path_buf(),
-        AssetClass::UpdateScratch => temp_root.join("cycu.<32-hex>"),
+        AssetClass::UpdateScratch => temp_root.join("cycu.<16-hex>"),
     }
-}
-
-fn platform_temp_root() -> PathBuf {
-    let raw = std::env::temp_dir();
-    #[cfg(target_os = "macos")]
-    {
-        if raw == Path::new("/tmp") {
-            return PathBuf::from("/private/tmp");
-        }
-        if let Ok(rest) = raw.strip_prefix("/var") {
-            return PathBuf::from("/private/var").join(rest);
-        }
-    }
-    raw
 }
 
 fn open_private_temp_root(path: &Path) -> Result<StateInspector, String> {
+    open_optional_private_root(path)?
+        .ok_or_else(|| "unsupported_temp_root: temporary root is absent".to_string())
+}
+
+fn open_optional_private_root(path: &Path) -> Result<Option<StateInspector>, String> {
     let inspector = StateInspector::open_existing(path)
-        .map_err(|error| format!("unsupported_temp_root: {error}"))?
-        .ok_or_else(|| "unsupported_temp_root: temporary root is absent".to_string())?;
+        .map_err(|error| format!("unsupported_temp_root: {error}"))?;
+    let Some(inspector) = inspector else {
+        return Ok(None);
+    };
     let root = inspector.root();
     if root.kind != InspectedKind::Directory || root.mode != 0o700 || !root.safe() {
         return Err(
@@ -1101,18 +1100,32 @@ fn open_private_temp_root(path: &Path) -> Result<StateInspector, String> {
     {
         return Err("unsupported_temp_root: temporary-root identity changed".to_string());
     }
-    Ok(inspector)
+    Ok(Some(inspector))
 }
 
-fn inspect_build_cache(
-    temp: &StateInspector,
-    entries: &[InspectedEntry],
-    cache: &Path,
-    apply: bool,
-    report: &mut CleanupReport,
-) {
-    if cache.parent() != Some(temp.path()) {
-        if !cache.exists() {
+fn cleanup_parent_inventory(
+    path: &Path,
+) -> Result<Option<(StateInspector, Vec<InspectedEntry>)>, String> {
+    let Some(inspector) = open_optional_private_root(path)? else {
+        return Ok(None);
+    };
+    let snapshot = inspector
+        .inspect_root(limits())
+        .map_err(|error| format!("cleanup-root inventory is unavailable: {error}"))?;
+    if snapshot.truncated {
+        return Err("cleanup-root inventory reached its fixed limit".to_string());
+    }
+    Ok(Some((inspector, snapshot.entries)))
+}
+
+fn inspect_build_cache(cache: &Path, apply: bool, report: &mut CleanupReport) {
+    let parent = cache
+        .parent()
+        .ok_or_else(|| "build cache has no parent".to_string())
+        .and_then(cleanup_parent_inventory);
+    let (temp, entries) = match parent {
+        Ok(Some(inventory)) => inventory,
+        Ok(None) => {
             report.candidates.push(CandidateReport::new(
                 AssetClass::BuildCache,
                 cache.to_path_buf(),
@@ -1121,29 +1134,16 @@ fn inspect_build_cache(
             ));
             return;
         }
-        let inspector = match StateInspector::open_existing(cache) {
-            Ok(Some(insp)) => insp,
-            _ => {
-                report.candidates.push(CandidateReport::new(
-                    AssetClass::BuildCache,
-                    cache.to_path_buf(),
-                    CandidateState::Unsupported,
-                    "build-cache root is not inspectable",
-                ));
-                return;
-            }
-        };
-        let entry = inspector.root().clone();
-        inspect_candidate(
-            &inspector,
-            &entry,
-            AssetClass::BuildCache,
-            None,
-            apply,
-            report,
-        );
-        return;
-    }
+        Err(reason) => {
+            report.candidates.push(CandidateReport::new(
+                AssetClass::BuildCache,
+                cache.to_path_buf(),
+                CandidateState::Unsupported,
+                reason,
+            ));
+            return;
+        }
+    };
     let mut matched = false;
     for entry in entries.iter().filter(|entry| {
         entry.path == cache
@@ -1153,7 +1153,7 @@ fn inspect_build_cache(
             })
     }) {
         matched = true;
-        inspect_candidate(temp, entry, AssetClass::BuildCache, None, apply, report);
+        inspect_candidate(&temp, entry, AssetClass::BuildCache, None, apply, report);
     }
     if !matched {
         report.candidates.push(CandidateReport::new(
@@ -1195,7 +1195,7 @@ fn inspect_update_scratch(
     if !matched {
         report.candidates.push(CandidateReport::new(
             AssetClass::UpdateScratch,
-            temp_root.join("cycu.<32-hex>"),
+            temp_root.join("cycu.<16-hex>"),
             CandidateState::Absent,
             "no marked update scratch is present",
         ));
@@ -1207,12 +1207,15 @@ fn update_nonce(path: &Path) -> Option<&str> {
     let nonce = name
         .strip_prefix(UPDATE_PREFIX)
         .or_else(|| name.strip_prefix(LEGACY_UPDATE_PREFIX))?;
-    (nonce.len() == NONCE_BYTES
+    valid_update_nonce(nonce).then_some(nonce)
+}
+
+fn valid_update_nonce(nonce: &str) -> bool {
+    (nonce.len() == NONCE_BYTES || nonce.len() == crate::update::SCRATCH_NAME_NONCE_BYTES)
         && nonce
             .as_bytes()
             .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
-    .then_some(nonce)
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 fn cleanup_tombstone(path: &Path) -> Option<CleanupTombstone> {
@@ -1238,11 +1241,7 @@ fn cleanup_tombstone(path: &Path) -> Option<CleanupTombstone> {
     let (nonce, identity) = rest.split_once('.')?;
     let (device, inode) = identity.split_once('.')?;
     let (device, inode) = parse_cleanup_identity(device, inode)?;
-    if nonce.len() != NONCE_BYTES
-        || !nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !valid_update_nonce(nonce) {
         return None;
     }
     Some(CleanupTombstone {
@@ -1539,10 +1538,16 @@ fn validate_update_marker_if_present(
             "update owner marker is not one owner-only single-link regular file".to_string(),
         ));
     }
-    if marker.truncated || marker.bytes != expected.as_bytes() {
+    let full_nonce = std::str::from_utf8(&marker.bytes).ok();
+    if marker.truncated
+        || !valid_update_nonce(expected)
+        || !full_nonce.is_some_and(|nonce| {
+            nonce.len() == NONCE_BYTES && valid_update_nonce(nonce) && nonce.starts_with(expected)
+        })
+    {
         return Err((
             CandidateState::Unmarked,
-            "update owner marker does not exactly match its directory nonce".to_string(),
+            "update owner marker is not a full nonce matching its directory prefix".to_string(),
         ));
     }
     Ok(true)
@@ -2104,6 +2109,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn absent_update_directory_does_not_hide_the_build_cache_or_fail_health() {
+        let root = private_temp();
+        let cache = build_cache(root.path());
+        let updates = root.path().join("updates");
+        let inventory = inspect_operational_assets_at(updates, cache.clone());
+        assert!(inventory.error.is_none(), "{:?}", inventory.error);
+        assert!(inventory.root_safe);
+        assert!(!inventory.truncated);
+        assert_eq!(inventory.candidates.len(), 1);
+        assert_eq!(inventory.candidates[0].path, cache);
+        assert_eq!(inventory.candidates[0].class, AssetClass::BuildCache);
+    }
+
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
     }
@@ -2200,6 +2219,28 @@ mod tests {
         }
         assert!(json.contains("state_journals_and_messages"));
         assert!(plain.contains("state_journals_and_messages"));
+    }
+
+    #[test]
+    fn missing_update_root_does_not_block_independent_build_cache_cleanup() {
+        let parent = private_temp();
+        let cache = build_cache(parent.path());
+        let updates = parent.path().join("updates");
+        let report = collect_at(
+            &updates,
+            &cache,
+            &[AssetClass::BuildCache, AssetClass::UpdateScratch],
+            true,
+        );
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(report.temp_root_state, "absent");
+        assert_eq!(report.candidates[0].state, CandidateState::Removed);
+        assert_eq!(report.candidates[1].state, CandidateState::Absent);
+        assert!(!cache.exists());
+        assert!(
+            !updates.exists(),
+            "a cleanup preview or apply must not create an absent cache root"
+        );
     }
 
     #[test]
@@ -2659,6 +2700,63 @@ mod tests {
         );
         assert!(!missing_lease.safe);
         assert_eq!(missing_lease.lease, "unproven");
+    }
+
+    #[test]
+    fn short_update_names_require_full_matching_markers_and_survive_cleanup_interruption() {
+        let temp = private_temp();
+        let full = "0123456789abcdef0123456789abcdef";
+        let short = &full[..crate::update::SCRATCH_NAME_NONCE_BYTES];
+        let old = update_scratch(temp.path(), full);
+        let scratch = temp.path().join(format!("{UPDATE_PREFIX}{short}"));
+        fs::rename(old, &scratch).unwrap();
+        assert_eq!(update_nonce(&scratch), Some(short));
+        assert_eq!(
+            update_nonce(Path::new("cycu.0123456789abcdef0123456789abcdef")),
+            Some(full)
+        );
+        assert_eq!(update_nonce(Path::new("cycu.01234567")), None);
+        for bad_marker in [short, "fedcba98765432100123456789abcdef"] {
+            fs::write(scratch.join(SCRATCH_MARKER), bad_marker).unwrap();
+            let invalid = operational_candidate(
+                temp.path(),
+                &scratch,
+                AssetClass::UpdateScratch,
+                Some(short),
+            );
+            assert!(!invalid.safe, "{bad_marker}");
+        }
+        fs::write(scratch.join(SCRATCH_MARKER), full).unwrap();
+        assert!(
+            operational_candidate(
+                temp.path(),
+                &scratch,
+                AssetClass::UpdateScratch,
+                Some(short)
+            )
+            .safe
+        );
+        let inspector = StateInspector::open_existing(temp.path()).unwrap().unwrap();
+        let entry = inspector
+            .inspect_root(limits())
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.path == scratch)
+            .unwrap();
+        let name = cleanup_tombstone_name(AssetClass::UpdateScratch, Some(short), &entry).unwrap();
+        let isolated = inspector
+            .isolate_direct_child_directory(&entry, std::ffi::OsStr::new(&name))
+            .unwrap();
+        let report = collect_at(
+            temp.path(),
+            &temp.path().join("absent"),
+            &[AssetClass::UpdateScratch],
+            true,
+        );
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(report.candidates[0].state, CandidateState::Removed);
+        assert!(!isolated.path.exists());
     }
 
     #[test]

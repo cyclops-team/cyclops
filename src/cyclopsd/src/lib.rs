@@ -705,6 +705,15 @@ impl DaemonWorkspaceMessagingEffects {
 }
 
 impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
+    fn notification_hold(&self, attempt: NotificationAttemptId) -> Option<String> {
+        self.inner
+            .upgrade()?
+            .engine
+            .notification_handle(attempt)?
+            .snapshot()
+            .4
+    }
+
     fn subscribe_messages_changed(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
@@ -1980,12 +1989,15 @@ fn publish_mailbox_directory(
         };
         agents.push(mailbox::MailboxIdentity { key, label });
     }
-    for adoption in inner
+    let headless = inner
         .registry
         .lock()
         .expect("registry lock")
-        .headless_adoptions()
-    {
+        .headless_adoptions();
+    for adoption in headless {
+        if !headless::registration_is_live(inner, &adoption) {
+            continue;
+        }
         agents.push(mailbox::MailboxIdentity {
             key: adoption.recipient,
             label: adoption.label,
