@@ -118,6 +118,15 @@ are applied by `cyclops start` when it builds a workspace.
 
 ## Where to start reading
 
+### Connect a native coding app
+
+[Native app integration](../guides/native-apps.md) distinguishes MCP tool
+access from actual wake support. `src/cyclops/src/mcp.rs` is the bounded
+stdio adapter; `src/cyclops/src/mcp/channel.rs` is the opt-in Claude Code
+Channels reader. `src/cyclopsd/src/headless.rs` owns session-bridge identity
+and retirement. The Antigravity sidecar script is a transport probe, not a
+shipped authenticated conversation router.
+
 ### Build and run it
 
 [install.md](../guides/install.md), then `cargo build`. To see durable mailbox

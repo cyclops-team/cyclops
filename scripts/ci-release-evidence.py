@@ -9,12 +9,50 @@ bounded race, cleanup, soak, and long-history run at the candidate's SHA.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
 
 
 DEFAULT_WORKFLOW = Path(".github/workflows/release-evidence.yml")
+PUBLISH_WORKFLOW = Path(".github/workflows/release-binaries.yml")
+
+
+def candidate_evidence(runs: object, candidate: str) -> str:
+    """Require a completed release-evidence run for the exact tagged commit.
+
+    The caller obtains this response from this repository's workflow-specific
+    GitHub API endpoint. A green PR, older SHA, or queued run is not release evidence.
+    """
+    if not re.fullmatch(r"[a-f0-9]{40}", candidate):
+        raise ValueError("candidate must be a full 40-character commit SHA")
+    if not isinstance(runs, dict) or not isinstance(runs.get("workflow_runs"), list):
+        raise ValueError("GitHub did not return a workflow-runs response")
+    for run in runs["workflow_runs"]:
+        if (
+            isinstance(run, dict)
+            and run.get("head_sha") == candidate
+            and run.get("path") == str(DEFAULT_WORKFLOW)
+            and run.get("event") in {"workflow_dispatch", "push"}
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "success"
+            and isinstance(run.get("html_url"), str)
+        ):
+            return run["html_url"]
+    raise ValueError(f"no successful release evidence for exact candidate {candidate}; run release-evidence.yml at this commit before publishing")
+
+
+def validate_publishing(workflow: str) -> None:
+    jobs = job_blocks(workflow)
+    evidence = jobs.get("check-evidence", "")
+    require_text(evidence, "actions: read", "release evidence lookup lacks Actions permission")
+    require_text(evidence, "actions/workflows/release-evidence.yml/runs", "publication does not query release evidence")
+    require_text(evidence, 'git rev-parse HEAD', "publication does not resolve the tagged commit")
+    require_text(evidence, '--candidate "$candidate"', "publication does not verify the exact candidate")
+    require_text(evidence, "shell: bash", "evidence validation needs pipefail so tee cannot hide a refusal")
+    require_text(jobs.get("build", ""), "needs: [check-version, check-evidence]", "release builds must wait for candidate evidence")
+    require_text(jobs.get("publish", ""), "needs: [check-version, check-evidence, build]", "release publishing must wait for candidate evidence")
 
 
 def job_blocks(workflow: str) -> dict[str, str]:
@@ -113,6 +151,45 @@ def selftest(workflow: str) -> None:
     """Show that the aggregate rejects missing evidence or failure handling."""
 
     validate(workflow)
+    publishing = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+    validate_publishing(publishing)
+    candidate = "a" * 40
+    verified = {
+        "head_sha": candidate,
+        "path": str(DEFAULT_WORKFLOW),
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/example/cyclops/actions/runs/123",
+    }
+    assert candidate_evidence({"workflow_runs": [verified]}, candidate) == verified["html_url"]
+    for field, value in (
+        ("head_sha", "b" * 40),
+        ("path", ".github/workflows/ci.yml"),
+        ("event", "pull_request"),
+        ("status", "in_progress"),
+        ("conclusion", "failure"),
+        ("conclusion", "cancelled"),
+        ("conclusion", "skipped"),
+    ):
+        try:
+            candidate_evidence({"workflow_runs": [{**verified, field: value}]}, candidate)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"publication accepted {field}={value}")
+    try:
+        validate_publishing(publishing.replace("needs: [check-version, check-evidence, build]", "needs: [check-version, build]"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("publication accepted a missing evidence dependency")
+    try:
+        validate_publishing(publishing.replace("shell: bash", "shell: sh"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("publication accepted a pipeline without pipefail")
     for dependency in ("tmux-head", "reliability"):
         missing_dependency = workflow.replace(f"      - {dependency}\n", "", 1)
         try:
@@ -148,15 +225,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workflow", type=Path, default=DEFAULT_WORKFLOW)
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--candidate", help="exact tagged commit to authorize for packaging")
+    parser.add_argument("--runs-file", type=Path, help="GitHub workflow-specific runs API response")
     args = parser.parse_args()
 
     try:
+        if args.candidate or args.runs_file:
+            if not args.candidate or not args.runs_file:
+                raise ValueError("--candidate and --runs-file are required together")
+            url = candidate_evidence(json.loads(args.runs_file.read_text()), args.candidate)
+            print(f"Release evidence for {args.candidate}: {url}")
+            return 0
         workflow = args.workflow.read_text(encoding="utf-8")
         if args.selftest:
             selftest(workflow)
             print("Release evidence workflow self-test passed")
         else:
             validate(workflow)
+            validate_publishing(PUBLISH_WORKFLOW.read_text(encoding="utf-8"))
             print("Release evidence workflow contract passed")
     except (OSError, ValueError, AssertionError) as error:
         print(f"release evidence workflow contract failed: {error}", file=sys.stderr)

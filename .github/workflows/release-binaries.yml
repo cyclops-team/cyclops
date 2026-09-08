@@ -4,8 +4,9 @@ name: release binaries
 # uploads them to the GitHub Release for the pushed tag. Distinct from
 # release-evidence.yml: that workflow proves a beta candidate is safe to
 # release and never publishes anything; this one only packages and
-# publishes the binaries once a version has already been tagged. Neither
-# reads or writes the other's job names or artifacts.
+# publishes the binaries once a version has already been tagged AND the exact
+# tagged commit has passed release evidence. A green run on an older commit
+# cannot authorize publication of a newer one.
 #
 # Native GitHub-hosted runners exist for three of the four targets; the
 # fourth (x86_64-apple-darwin) is cross-compiled from the arm64 macOS
@@ -50,9 +51,29 @@ jobs:
           fi
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
 
+  check-evidence:
+    name: tagged commit has release evidence
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require successful evidence for this exact commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          candidate="$(git rev-parse HEAD)"
+          gh api --method GET "/repos/$GITHUB_REPOSITORY/actions/workflows/release-evidence.yml/runs" \
+            -f head_sha="$candidate" -f status=completed -f per_page=100 \
+            > "$RUNNER_TEMP/release-evidence.json"
+          python3 scripts/ci-release-evidence.py --candidate "$candidate" \
+            --runs-file "$RUNNER_TEMP/release-evidence.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
   build:
     name: build ${{ matrix.target }}
-    needs: check-version
+    needs: [check-version, check-evidence]
     strategy:
       fail-fast: false
       matrix:
@@ -78,7 +99,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build the matched pair
-        run: cargo build --profile dist --target ${{ matrix.target }} -p cyclops -p cyclopsd
+        run: cargo build --locked --profile dist --target ${{ matrix.target }} -p cyclops -p cyclopsd
       - name: Package cyclops, cyclopsd, and their checksums
         env:
           VERSION: ${{ needs.check-version.outputs.version }}
@@ -102,7 +123,7 @@ jobs:
 
   publish:
     name: upload release assets
-    needs: [check-version, build]
+    needs: [check-version, check-evidence, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

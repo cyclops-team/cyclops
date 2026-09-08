@@ -14,14 +14,16 @@ The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is at version `1.1.0`. It ships fifty-two detection manifests. Five
+This checkout is the `1.2.0` release candidate. It ships fifty-two detection manifests. Five
 are measured against a live CLI: Claude Code, Codex CLI, Antigravity CLI,
 Cursor Agent CLI, and Kimi Code CLI. The other forty-seven are written from
 vendor documentation and say so with `version_tested = "unverified"`.
 Thirty-eight products that never run in a pane, the IDEs and desktop apps in
 the same catalog, get the Cyclops skill seeded and nothing else. See
 [STATUS.md](STATUS.md) for the evidence behind each and the limits that
-follow from it.
+follow from it. Native hosts can opt into the
+[MCP bridge and supported notification connectors](docs/guides/native-apps.md);
+tool access alone is not native chat activation.
 
 [usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [documentation](#documentation)
 

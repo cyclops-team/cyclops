@@ -752,11 +752,10 @@ region = "pane_title"
 regex = ['^']
 "#;
 
-/// A claim over the socket while the gate holds withdraws the doorbell:
-/// the attempt settles as `withdrawn` with cause `claimed_before_write`,
-/// the recipient's FIFO moves on, and nothing is ever pasted into the pane.
+/// A socket claim reads the body while the independently owed pane wake
+/// keeps its FIFO position and waits for the actual modal to clear.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_socket_claim_while_the_gate_holds_withdraws_the_doorbell_and_writes_nothing() {
+async fn a_socket_claim_while_the_gate_holds_preserves_the_doorbell_and_fifo() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -813,8 +812,7 @@ async fn a_socket_claim_while_the_gate_holds_withdraws_the_doorbell_and_writes_n
     assert_eq!(claimed["result"]["disposition"], "claimed", "{claimed}");
     assert_eq!(claimed["result"]["message"]["body"], "first body");
 
-    // The claim settled the attempt: withdrawn, because it was claimed
-    // before the write. The settlement is projected from the claim fact.
+    // Retrieval changes the mailbox, not the owed pane notification.
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     let notification = &snapshot["result"]["rows"]
         .as_array()
@@ -822,35 +820,42 @@ async fn a_socket_claim_while_the_gate_holds_withdraws_the_doorbell_and_writes_n
         .iter()
         .find(|row| row["message_id"] == first_id)
         .expect("claimed message remains visible")["recipients"][0]["notification"];
-    assert_eq!(notification["state"], "not_started", "{notification}");
-    assert_eq!(notification["settlement"], "withdrawn_by_claim");
-    assert_eq!(notification["pre_write_cause"], "claimed_before_write");
+    assert_eq!(notification["state"], "gating", "{notification}");
+    assert!(notification["settlement"].is_null(), "{notification}");
+    assert!(notification["pre_write_cause"].is_null(), "{notification}");
 
-    // Clear the modal. The withdrawn attempt has no worker left; the next
-    // message proves the pipeline moved past it.
+    // Both notifications must reach the pane after the modal clears.
     rig.tmux
         .run_ok(&["send-keys", "-t", &pane, "/usr/bin/clear", "Enter"]);
     let second =
         send_workspace_message(&rig, "claim-before-write-second", "Second", "second body").await;
     let second_id = second["msg_id"].as_str().unwrap().to_string();
     // The loop pane has no hook, so its receipt may read back unverified.
+    crate::body_privacy::wait_for_notification_submitted(&mut rig, &first_id).await;
     crate::body_privacy::wait_for_notification_submitted(&mut rig, &second_id).await;
 
-    // Nothing of the first message ever reached the pane.
     let history = joined_pane_history(&rig, &pane);
     assert!(
-        !history.contains(&held_doorbell),
-        "the withdrawn doorbell was written: {history}"
+        history.contains(&held_doorbell),
+        "the claimed message lost its doorbell: {history}"
     );
     assert!(!history.contains("first body"));
+    assert!(
+        history.find(&held_doorbell).unwrap()
+            < history
+                .find(&compact_doorbell(&rig, &second_id))
+                .expect("second doorbell"),
+        "notifications were not FIFO: {history}"
+    );
     assert!(history.contains(&compact_doorbell(&rig, &second_id)));
     assert_eq!(
         notification_state_count(&rig, &first_id, NotificationState::Writing),
-        0
+        1
     );
     assert_eq!(
-        notification_state_count(&rig, &first_id, NotificationState::Submitted),
-        0
+        notification_state_count(&rig, &first_id, NotificationState::Submitted)
+            + notification_state_count(&rig, &first_id, NotificationState::SubmittedUnverified),
+        1
     );
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
     rig.daemon.shutdown().await;
@@ -1235,6 +1240,22 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
     wait_for_human_composer_evidence(&mut rig, &pane).await;
 
     let pair = send_waiting_pair(&rig, "draft").await;
+    assert_eq!(
+        pair.first_receipt["held_by"], "held_for_existing_draft",
+        "a known draft must be visible on the initial acceptance receipt"
+    );
+
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let held = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"] == pair.first)
+        .unwrap();
+    assert_eq!(
+        held["recipients"][0]["notification"]["held_by"],
+        "held_for_existing_draft"
+    );
 
     rig.ev
         .wait_event(Duration::from_secs(8), |event| {
@@ -1258,6 +1279,14 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
     assert!(!released.contains(&pair.second));
     assert_only_oldest_attempt_exists(&rig, &pair);
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let released = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"] == pair.first)
+        .unwrap();
+    assert!(released["recipients"][0]["notification"]["held_by"].is_null());
     assert_eq!(
         notification_state_count(&rig, &pair.first, NotificationState::Submitted),
         1

@@ -15,6 +15,8 @@ pub use cyclops_proto::NOT_RUNNING;
 /// `cyclops daemon status` with nothing to report on.
 pub const DAEMON_DOWN: &str = "○ cyclopsd is not running · start it with: cyclops start";
 
+pub const FLUSH_RETIRED: &str = "flush no longer erases journals. Use cyclops clear <agent> to withdraw queued notifications, or cyclops remove --all to preview complete state removal.";
+
 #[cfg(not(feature = "full-ui"))]
 pub const WORKSPACE_NOT_INCLUDED: &str = "the full-screen workspace is not included in this build. Run cyclops --help for headless commands, or install a full Cyclops build.";
 
@@ -51,6 +53,16 @@ pub const SETUP_HOME_UNAVAILABLE: &str = "HOME is not set, so setup paths cannot
 /// Explain why a notification cannot fit without changing its recorded cause.
 pub fn pane_too_narrow(observed: u32, required: u32) -> String {
     format!("pane too narrow ({observed}, requires {required})")
+}
+
+/// Sensor evidence is diagnostic, not the notification gate's disposition.
+pub fn readiness_observation(ready: bool, reason: Option<&str>) -> String {
+    let observation = if ready {
+        "ready"
+    } else {
+        reason.unwrap_or("unavailable")
+    };
+    format!("readiness observation: {observation}")
 }
 
 pub fn alarm_clear_confirmation(count: usize, older_than: &str) -> String {
@@ -118,7 +130,7 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "Operations",
         &[
             "setup", "hooks", "theme", "daemon", "update", "cleanup", "data", "remove", "reset",
-            "flush",
+            "flush", "mcp",
         ],
     ),
     (

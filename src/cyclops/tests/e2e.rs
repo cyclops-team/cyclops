@@ -17,6 +17,21 @@ const GEMINI_ENDPOINT: &str =
 const TEST_SUMMARY: &str = "Test message. Inspect the result.";
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[test]
+fn retired_flush_refuses_without_connecting_or_erasing_history() {
+    let home = scratch_home("flush-refused");
+    fs::create_dir(home.join("ledger")).unwrap();
+    let journal = home.join("ledger/main.ndjson");
+    fs::write(&journal, b"{\"acknowledged\":true}\n").unwrap();
+    let before = fs::read(&journal).unwrap();
+    let out = run_cyclops(&home, &["--json", "flush"]);
+    assert!(!out.status.success());
+    let response: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "unsupported_operation");
+    assert_eq!(fs::read(journal).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
+}
+
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
 /// on macOS, which is why the root is not the OS temp dir (F24). That the

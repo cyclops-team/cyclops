@@ -71,7 +71,9 @@ flowchart TD
    checkpoints proves it more weakly (`verified_by: screen`). Neither within
    `SCREEN_ACK_DEADLINE` (5s), or the occupant changing while waiting, ends
    the attempt as `notified` with no verifier and releases the composer
-   hold. A claim by the exact recipient after Enter is also a receipt.
+   hold. A correlated hook or screen receipt releases the same hold immediately,
+   even when the agent keeps working. A claim by the exact recipient after the
+   write boundary can also prove consumption once Enter has been submitted.
 
 `attention_required` is written only for a physical write failure after the
 boundary: `paste_failed`, `submit_failed`, `pane_rebound_after_paste`, or a
@@ -95,8 +97,8 @@ replayed automatically.
 
 The composer check is `fusion::composer_is_held`. A positively observed
 human draft holds: a manifest rule with `composer_semantic = "human_input"`
-matched the capture. So does a hold a delivery owns: a doorbell staged and
-not yet consumed, or the turn it started that has not ended. That is the
+matched the capture. So does a hold a delivery owns while its doorbell is
+staged and not yet consumed. The agent's remaining turn is not a hold. That is the
 whole list. An unreadable composer, an ambiguous rule, a manifest with no
 composer rule, a working agent, and a pane whose hooks never fired all
 proceed. The cost of proceeding is one line the journal marks
@@ -145,14 +147,32 @@ the readback joins the wrapped rows before comparing. `admin` has no pane
 route, so an admin message is accepted and stays in the admin inbox with no
 attempt.
 
-A socket claim before the write boundary withdraws the doorbell. An attempt
-still `queued`, `gating`, or `blocked_pre_write` settles as `withdrawn` with
-cause `claimed_before_write` under the same store lock as the claim, the
-worker's next pre-write check (`entry_allows_notification`) finds the entry
-claimed and stops, and no pane bytes are written; the recipient's FIFO moves
-to its next pending message. A claim after Enter settles the attempt as
-`notified`. Journals an older daemon wrote, where the write followed the
-claim, replay through the withdrawn state.
+A socket claim, including `inbox next`, retrieves the body without cancelling
+the independent pane doorbell. An attempt still `queued`, `gating`, or
+`blocked_pre_write` keeps its identity and FIFO position after the claim.
+This also holds when the claim arrives before scheduling creates the attempt.
+Once a doorbell is notified, its unclaimed body does not block the next pane
+notification. Mailbox FIFO and notification FIFO have different completion
+events.
+
+A claim before the write is not a pane-consumption receipt. Repeating that
+already-completed claim after submission is still retrieval, not fresh receipt
+evidence. A new exact recipient claim after the write can settle a submitted
+attempt as `notified`. New claim
+facts for pane recipients carry `preserve_notification: true`; headless
+recipients owe no pane notification. Historical claims without that field
+retain their original withdrawal on replay. Upgrading never resurrects an old
+claim-withdrawn wake.
+
+Recovery uses the same eligibility rule as initial admission: working, stale
+activity evidence, and ambiguous composer evidence do not veto an otherwise
+known route. A positive draft, named modal/quota condition, or wrong target
+still holds. The worker reobserves the route before writing.
+
+A known pre-write hold is visible immediately on the send/reply receipt and
+Messages snapshot as `held_by`; it does not wait for the later administrator
+alert. This is an exact-attempt live diagnostic, not a new journal state. Gate
+events refresh the display, and releasing the hold removes the reason.
 
 ## The raw transport
 
@@ -247,7 +267,7 @@ Every transition is a content-free workspace journal fact.
 | `attention_required` | A physical write failure or a daemon restart; inspect the pane |
 | `withdrawn_by_operator` | An administrator withdrew it before the write |
 | `superseded` | The message was replaced before the write |
-| `withdrawn` | A claim settled a pre-write attempt; only a replayed direct-payload attempt reaches it now |
+| `withdrawn` | A claim settled an attempt with no pane obligation, or a historical pre-write claim was replayed |
 
 Replay only, no longer written since 1.1.0, kept so old journals load:
 `quota_held`, `quota_reset_observed`, `staged`, `submitting`, and

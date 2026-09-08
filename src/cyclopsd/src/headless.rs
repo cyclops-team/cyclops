@@ -9,6 +9,10 @@
 //! later caller descending from it resolves to the label exactly the way a
 //! pane's helpers resolve to the pane (INVARIANTS rule 5).
 //!
+//! Session bridges instead bind their own connecting process, with that
+//! same vendor ancestry proof retained separately. One native app can then
+//! launch distinct participants without giving a request a sender field.
+//!
 //! Delivery to a headless recipient is mailbox-only: no terminal exists,
 //! so the attempt moves `queued -> notified` with `transport: mailbox` and
 //! the agent reads over the socket (`inbox next --wait`).
@@ -36,6 +40,18 @@ pub(crate) struct HeadlessRegisterParams {
     pub(crate) label: String,
     #[serde(default)]
     pub(crate) manifest: Option<String>,
+    /// A session-owned MCP process needs its own mailbox rather than the
+    /// app-wide vendor root. The daemon still proves that vendor ancestry.
+    #[serde(default)]
+    pub(crate) scope: HeadlessScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HeadlessScope {
+    #[default]
+    Vendor,
+    Bridge,
 }
 
 /// `headless.clear` params. With no label the caller clears its own
@@ -148,6 +164,15 @@ pub(crate) async fn register(
         }
     }
     let manifest = params.manifest.clone().or_else(|| detected.clone());
+    let vendor_instance = process_instance(root)
+        .ok_or_else(|| denied("the vendor process has no valid process identity".to_string()))?;
+    let vendor_root = matches!(params.scope, HeadlessScope::Bridge).then_some(vendor_instance);
+    let root = if vendor_root.is_some() {
+        ProcId::of(pid)
+            .ok_or_else(|| denied("the bridge process exited during registration".to_string()))?
+    } else {
+        root
+    };
     let root_instance = process_instance(root)
         .ok_or_else(|| denied("the agent process has no valid process identity".to_string()))?;
     let os_boot_id = crate::livesession::current_os_boot_id()
@@ -184,6 +209,7 @@ pub(crate) async fn register(
                 root: root_instance,
                 os_boot_id,
                 manifest: manifest.clone(),
+                vendor_root,
             })
             .map_err(|error| internal(format!("cannot record the registration: {error}")))?;
         drop(registry);
@@ -202,13 +228,19 @@ pub(crate) async fn register(
 
     if fresh {
         arm_exit_watcher(inner, recipient, root_instance);
+        if let Some(vendor) = vendor_root.filter(|vendor| *vendor != root_instance) {
+            watch_exit(inner, recipient, vendor, false);
+        }
     }
     // Armed, then re-read: a root that exited between the walk and the
     // watch never answers to its label.
-    if !root.still_live() {
-        retire(inner, recipient);
+    if !root.still_live() || vendor_root.is_some_and(|vendor| !proc_id(vendor).still_live()) {
+        if !root.still_live() {
+            retire(inner, recipient);
+        }
         return Err(denied(
-            "the agent process exited during registration; nothing is registered".to_string(),
+            "the agent process exited during registration; no delivery route is available"
+                .to_string(),
         ));
     }
     Ok(json!({
@@ -219,7 +251,68 @@ pub(crate) async fn register(
         "detects_as": detected,
         "headless": true,
         "pid": root.pid,
+        "scope": if vendor_root.is_some() { "bridge" } else { "vendor" },
     }))
+}
+
+/// A bridge is authority only while it remains below the vendor process
+/// that launched it. A surviving orphan must not inherit the operator role.
+pub(crate) fn registration_is_live(inner: &Inner, adoption: &HeadlessAdoption) -> bool {
+    let root = proc_id(adoption.root);
+    if !root.still_live() {
+        return false;
+    }
+    let Some(vendor) = adoption.vendor_root else {
+        return true;
+    };
+    let expected = proc_id(vendor);
+    matches!(
+        identity::headless_root(root.pid, &[], |process| {
+            crate::fusion::is_vendor_now(inner, process)
+        }),
+        HeadlessRoot::Vendor(found) if found == expected
+    ) && root.still_live()
+}
+
+/// A session bridge counts as its agent only at its registered process
+/// generation. Keep an orphan denying while its process lives, rather than
+/// letting the ordinary no-vendor shell rule turn it into an administrator.
+pub(crate) fn bridge_vendorship(inner: &Inner, pid: i32) -> identity::Vendorship {
+    let Some(root) = ProcId::of(pid).and_then(process_instance) else {
+        return identity::Vendorship::Unprovable;
+    };
+    let adoption = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .headless_for_root(root)
+        .cloned();
+    match adoption {
+        Some(adoption)
+            if adoption.vendor_root.is_some() && registration_is_live(inner, &adoption) =>
+        {
+            identity::Vendorship::Vendor
+        }
+        _ => identity::Vendorship::Unprovable,
+    }
+}
+
+/// A bounded identity proof for native tools, independent of inbox size.
+pub(crate) fn agent_identity(inner: &Arc<Inner>, peer: Peer) -> Result<Value, WireError> {
+    let Some((_, caller)) = crate::server::workspace_messaging_caller_if_available(inner, peer)?
+    else {
+        return Err(WireError {
+            code: "mailbox_unavailable".into(),
+            message: "durable workspace identity is not connected".into(),
+            data: None,
+        });
+    };
+    if caller.key.is_admin() {
+        return Err(denied(
+            "this connection is the operator, not an agent".into(),
+        ));
+    }
+    Ok(json!({"recipient": caller.key, "label": caller.label}))
 }
 
 /// Release a headless label: the caller's own, or one named by the operator.
@@ -323,13 +416,29 @@ pub(crate) fn arm_exit_watcher(
     recipient: RecipientKey,
     root: ProcessInstanceId,
 ) {
+    watch_exit(inner, recipient, root, true);
+}
+
+fn watch_exit(
+    inner: &Arc<Inner>,
+    recipient: RecipientKey,
+    root: ProcessInstanceId,
+    retire_on_exit: bool,
+) {
     match exit_watch::arm(root.pid()) {
         Ok(watch) => {
             let daemon = Arc::clone(inner);
             let handle = tokio::spawn(async move {
                 watch.wait().await;
                 debug!(pid = root.pid(), %recipient, "headless root exited");
-                retire(&daemon, recipient);
+                if retire_on_exit {
+                    retire(&daemon, recipient);
+                } else {
+                    // Keep the live bridge's denying identity, but remove
+                    // its delivery route when the owning app exits.
+                    crate::refresh_mailbox_and_schedule(&daemon);
+                    daemon.emit("messages.route_changed", json!({}), None);
+                }
             });
             inner
                 .extra_tasks
@@ -348,7 +457,11 @@ pub(crate) fn arm_exit_watcher(
             // ESRCH: the process is already gone. Anything else: nothing to
             // wait on, so the lazy path applies.
             debug!(pid = root.pid(), %error, "cannot watch the headless root; retiring");
-            retire(inner, recipient);
+            if retire_on_exit {
+                retire(inner, recipient);
+            } else {
+                crate::refresh_mailbox_and_schedule(inner);
+            }
         }
     }
 }
@@ -375,6 +488,12 @@ pub(crate) fn reverify_at_boot(inner: &Arc<Inner>) {
         .headless_adoptions();
     for adoption in survivors {
         arm_exit_watcher(inner, adoption.recipient, adoption.root);
+        if let Some(vendor) = adoption
+            .vendor_root
+            .filter(|vendor| *vendor != adoption.root)
+        {
+            watch_exit(inner, adoption.recipient, vendor, false);
+        }
     }
 }
 

@@ -355,8 +355,11 @@ impl MessageStore {
             .notification(entry.recipient, &message_id)
             .filter(|record| {
                 record.transport == NotificationTransport::Doorbell
-                    && (record.state == NotificationState::Submitted
-                        || record.state == NotificationState::SubmittedUnverified
+                    && ((entry.state.is_pending()
+                        && matches!(
+                            record.state,
+                            NotificationState::Submitted | NotificationState::SubmittedUnverified
+                        ))
                         || (record.state == NotificationState::Notified
                             && prior_claim_seq == Some(record.updated_seq)))
             })
@@ -389,18 +392,12 @@ impl MessageStore {
             }
         }
 
-        let withdrawn_attempt = self
-            .projection
-            .notification(entry.recipient, &message_id)
-            .filter(|record| {
-                record.state.settled_by_claim(record.transport) == NotificationState::Withdrawn
-            })
-            .map(|record| record.attempt_id);
         let fact = MailboxFact::MessageClaimed {
             record_version: CANONICAL_RECORD_VERSION,
             message_id: message_id.clone(),
             recipient: entry.recipient,
             claimant,
+            preserve_notification: entry.recipient.pane_id().is_some(),
         };
         let line = LedgerLine {
             seq: self.writer.next_seq(),
@@ -425,6 +422,11 @@ impl MessageStore {
             .get_entry(claimant, &message_id)
             .cloned()
             .expect("prepared claim retains its mailbox entry");
+        let withdrawn_attempt = self
+            .projection
+            .notification(entry.recipient, &message_id)
+            .filter(|record| record.state == NotificationState::Withdrawn)
+            .map(|record| record.attempt_id);
         Ok(ClaimOutcome::Claimed {
             entry: updated,
             message,

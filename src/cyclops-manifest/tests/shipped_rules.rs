@@ -85,11 +85,10 @@ fn shipped_composer_semantics_match_measured_rules_only() {
 }
 
 /// Manifests written from vendor documentation alone say so, and claim
-/// nothing a live capture has not proven: no rule reads idle or working (so
-/// none can confirm or end a turn), no composer meaning, no clear keys, and
-/// delivery stays gated on an idle verdict that no shipped rule of theirs can
-/// produce. Promoting one means a measured fixture, a real `version_tested`,
-/// and leaving this list.
+/// no measured composer meaning or automatic clear keys. Documented activity
+/// hints are advisory; missing activity evidence does not veto notification
+/// delivery to an authenticated live binding. Promoting a behavioral rule
+/// means a measured fixture and a real `version_tested`.
 #[test]
 fn documentation_only_manifests_claim_no_measured_behavior() {
     let all = shipped();
@@ -143,6 +142,31 @@ fn documentation_only_manifests_claim_no_measured_behavior() {
     }
     for id in measured {
         assert_ne!(all[id].agent.version_tested, "unverified", "{id}");
+    }
+}
+
+/// Documented screen hints can explain a pane, but cannot prove that a
+/// vendor turn started or ended without a live behavioral capture. The
+/// measured Gemini startup dialogs are modal protection, not turn evidence.
+#[test]
+fn unverified_activity_hints_are_advisory_only() {
+    for (id, manifest) in shipped() {
+        if manifest.agent.version_tested != "unverified" {
+            continue;
+        }
+        for rule in &manifest.rules {
+            if matches!(
+                rule.state,
+                AgentState::Idle | AgentState::IdleWithInput | AgentState::Working
+            ) {
+                assert!(
+                    !rule.lifecycle_evidence,
+                    "{id}/{} has no measured turn-lifecycle evidence",
+                    rule.id
+                );
+                assert!(!rule.active_start_terminal, "{id}/{}", rule.id);
+            }
+        }
     }
 }
 

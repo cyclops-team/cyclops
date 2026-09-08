@@ -353,9 +353,8 @@ pub(crate) fn advance(
     // tmux accepting the key says nothing about what the vendor did with
     // it, and a swallowed Enter leaves the payload staged.
     //
-    // Only the FIRST resolution promotes. The unverified-to-verified
-    // upgrade is the same consumption arriving twice, and re-marking it
-    // would push the mark past a turn-end edge that has already arrived.
+    // Release only this attempt's composer reservation. A consumption receipt
+    // never reserves the composer for the remainder of the vendor's turn.
     // A resolution with no verifier proved nothing about the composer and
     // settles no hold; its caller releases the barrier outright.
     let first_receipt = from == DeliveryState::Submitted
@@ -364,9 +363,8 @@ pub(crate) fn advance(
             step.next,
             DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
         );
-    // A late upgrade carries the correlated edge a screen-only receipt
-    // did not have. If that receipt left the hold waiting, this is the
-    // evidence it was waiting for, so it settles here too.
+    // A late correlated receipt can also release an unresolved reservation;
+    // exact owner matching makes this harmless after an earlier release.
     let late_correlated =
         from == DeliveryState::DeliveredUnverified && step.next == DeliveryState::DeliveredVerified;
     if first_receipt || late_correlated {
@@ -1764,22 +1762,14 @@ pub(crate) fn record_notification_notified(
     }
 }
 
-/// What a receipt says about the turn that consumed our payload.
-///
-/// A hook acknowledgement can name both the exact payload and a TurnKey.
-/// That key binds the hold to one turn, which releases only when the same
-/// key reports an end and the screen is clean. Arrival timestamps never
-/// substitute for that match.
-///
-/// A hook acknowledgement without a TurnKey, or a screen receipt, proves
-/// consumption but selects the screen lifecycle. Its timestamp is retained
-/// for diagnosis only.
+/// Consumption releases only this attempt's input reservation. The agent's
+/// resulting turn can keep running while another doorbell arrives.
 pub(crate) fn settle_hold_on_receipt(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
     verified_by: Option<VerifiedBy>,
-    turn_edge_ms: Option<u64>,
-    turn: Option<crate::turnkey::TurnKey>,
+    _turn_edge_ms: Option<u64>,
+    _turn: Option<crate::turnkey::TurnKey>,
 ) {
     // A receipt only ever settles ITS OWN barrier: see `set_hold_owned`.
     // A delivery that never claimed one has none to settle. Its receipt
@@ -1794,54 +1784,9 @@ pub(crate) fn settle_hold_on_receipt(
     else {
         return;
     };
-    if verified_by == Some(VerifiedBy::Hook) {
-        let since_ms = turn_edge_ms.unwrap_or_else(unix_ms);
-        match turn {
-            // The vendor named the turn that took this payload, so the
-            // hold binds to it and joins the exact lifecycle: only that
-            // turn's own end can end it.
-            Some(turn) => {
-                let _ = fusion::bind_turn(
-                    inner,
-                    handle.session_idx,
-                    &handle.pane_id,
-                    &owner,
-                    turn,
-                    since_ms,
-                );
-            }
-            // A vendor that names no turns still acknowledges. The hold
-            // stays on the screen lifecycle and carries the observed edge
-            // only for diagnosis. Only a hold still waiting takes it.
-            None => {
-                fusion::set_hold_owned(
-                    inner,
-                    handle.session_idx,
-                    &handle.pane_id,
-                    &owner,
-                    |hold| {
-                        hold.is_waiting()
-                            .then_some(cyclops_proto::ComposerHold::TurnStarted { since_ms })
-                    },
-                );
-            }
-        }
-        return;
+    if verified_by.is_some() {
+        fusion::clear_hold_owner(inner, handle.session_idx, &handle.pane_id, &owner);
     }
-    // A screen receipt names no turn, so it promotes this hold to the
-    // screen lane. Consumption is proven, and the submit time is retained
-    // for diagnosis. Reading the lane from the manifest instead would
-    // leave a keyed vendor whose
-    // hook was never installed holding a barrier forever, waiting on an
-    // exact end that nobody is going to send. A matching ACK arriving
-    // late can still upgrade this same owner to the exact lane.
-    latch_turn_started(
-        inner,
-        handle.session_idx,
-        &handle.pane_id,
-        &owner,
-        handle.submitted_at_ms.load(Ordering::SeqCst),
-    );
 }
 
 /// Reconcile an authenticated claim with a doorbell whose submit succeeded.
@@ -1885,26 +1830,6 @@ pub(crate) fn settle_notification_claim(
         return true;
     }
     false
-}
-
-pub(crate) fn latch_turn_started(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    owner: &str,
-    since_ms: u64,
-) -> bool {
-    // An existing mark is never replaced. It records the first observed
-    // turn or the submit boundary for the screen lifecycle; it does not
-    // correlate a turn end. Only a manifest-declared TurnKey can do that.
-    // `StagedDuringTurn` counts as waiting: a turn already running
-    // cannot consume a person's draft, but this payload is one Cyclops
-    // wrote and submitted itself, and the receipt names the turn that
-    // took it.
-    fusion::set_hold_owned(inner, session_idx, pane_id, owner, |hold| {
-        hold.is_waiting()
-            .then_some(cyclops_proto::ComposerHold::TurnStarted { since_ms })
-    })
 }
 
 /// Block until an event that could change the gate verdict for this pane:

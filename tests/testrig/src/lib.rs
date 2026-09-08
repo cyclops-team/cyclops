@@ -220,9 +220,17 @@ impl TmuxServer {
 
     /// Make this isolated server unavailable while retaining its cleanup
     /// owner. A server-lifecycle test can then start the same address again;
-    /// dropping this fixture still removes any socket the loss left behind.
+    /// remove the old socket before a new client can reach the dying server.
+    /// This is address isolation, not a claim that the kernel has reaped tmux.
     pub fn simulate_server_loss(&self) {
-        self.run_ok(&["kill-server"]);
+        let path = self
+            .socket_path()
+            .expect("simulated loss requires a live owned server");
+        cleanup_server(self);
+        assert!(
+            !path.exists(),
+            "simulated loss left the old socket at {path:?}"
+        );
     }
 
     /// Visible screen of one pane, plain text.

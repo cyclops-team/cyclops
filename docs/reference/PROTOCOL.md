@@ -14,6 +14,10 @@ error, the daemon returns `frame_too_large` and states that the request outcome
 is unknown; otherwise it closes the connection. Clients recover uncertain
 outcomes from authoritative state instead of guessing or retrying blindly.
 
+Request bytes may arrive in several reads. A subscribed connection retains
+an incomplete request while it sends events, including when a read splits a
+UTF-8 character. Only a complete newline-terminated frame reaches dispatch.
+
 Examples show current protocol shapes. Additive optional fields may be omitted
 when they are not relevant to the behavior being explained.
 Message ids are abbreviated for readability. Newly minted ids are
@@ -249,13 +253,19 @@ visible without making normal status output grow with the journal.
 
 ### status.reset
 
-`status.reset` accepts optional boolean parameters:
+`status.reset` requires the authenticated workspace administrator. It accepts
+optional boolean parameters:
 
 | Field | Type | Default | What it controls |
 |---|---|---|---|
 | `kill_dead_panes` | bool | `true` | Close panes whose processes have exited (`dead: true`) |
 | `prune_stale_sessions` | bool | `true` | Retire unattached non-persistent runtime sessions |
 | `prune_stale_adoptions` | bool | `true` | Forget orphan adoptions for panes that no longer exist |
+
+The retained `flush_messages` field defaults to `false`. A true value is
+rejected with `bad_request` before any runtime mutation. Reset never truncates
+a journal or deletes mailbox history. Use notification withdrawal to quiet
+the queue, or the explicit complete-state removal operation to erase records.
 
 It cleanses runtime state so status is not flooded by old or terminated processes, refreshes live observations, and returns:
 
@@ -453,8 +463,9 @@ sender-scoped `client_key` resolves to an existing exact request. Each
 `queued`; `notification_state` is the authoritative asynchronous wake state.
 `position`, when present, is the number of older pending entries in that
 recipient's FIFO. `pane` names the tmux pane the recipient resolved to, and
-`held_by` is the normalized token for a head held at the gate (`blocked`,
-never a manifest rule id).
+`held_by` is the normalized token for this exact live head held at the gate
+(`held_for_existing_draft`, `blocked`, never a manifest rule id). It is a
+current diagnostic, not a journaled state or proof of submission.
 
 Default CLI send and reply validate this acceptance envelope independently of
 the closed receipt enums: `msg_id` must be a valid message id, `seq` must be a
@@ -479,17 +490,19 @@ reason for a durable `blocked_pre_write` attempt. The causes a 1.1.0 daemon
 writes are `session_unavailable`, `manifest_unavailable`,
 `payload_unavailable`, `write_readiness_changed`, `spool_failed`,
 `paste_command_unwritten`, `binding_unprovable`, and `worker_failed`.
-`msg.send` subscribes to `messages.changed` before scheduling an immediately
+`msg.send` subscribes to message and gate events before scheduling an immediately
 decidable head, then reads the exact durable recipient, message, and attempt
-projection. The event is only an invalidation; the projection supplies the
-receipt. The shared observation deadline changes no state. A message queued
+projection. Events only invalidate the read; the projection supplies durable
+receipt fields and the exact live attempt supplies `held_by`. A known draft
+returns its hold reason immediately, without waiting for the response deadline
+or the later administrator alert. The shared observation deadline changes no state. A message queued
 behind an older head reports `not_started` and its position, with neither
 the head's `wake_block` nor its `pre_write_cause`.
 
 The CLI's `--require-wake` flag sets the additive `require_wake` request field.
 For an immediately decidable FIFO head, the same bounded response observation
 continues past `writing` until the exact attempt reaches `submitted` or
-`notified`, reaches a terminal refusal, or hits the existing `receipt_block_ms`
+`notified`, reports a known live hold or terminal refusal, or hits the existing `receipt_block_ms`
 cap. It does not poll and never waits for agent work or message completion.
 Exit 0 requires every mailbox receipt to carry `notification_state:
 "submitted"` or `"notified"`. Any other notification state, `pre_write_cause`,
@@ -681,6 +694,12 @@ attempt. Rows read from a journal an older daemon wrote may carry
 1.1.0 daemon never writes them, and a client must not infer authority from
 them or from `needs_action`.
 
+Each notification may also carry `held_by`, the current live hold for its exact
+attempt. This optional body-free diagnostic clears when the hold releases; it
+is not replayed from the journal and is not covered by `workspace_seq`. Clients
+refresh on gate events as well as `messages.changed`, accepting a same-sequence
+snapshot for live diagnostic changes. No human draft text is exposed.
+
 The answer also carries `mailbox_attention`: the same durable mailbox rows
 `status` serves, read from the same projection and stamped by this snapshot's
 `workspace_seq`, so a stream that refreshes on `messages.changed` moves its
@@ -706,11 +725,11 @@ journal an older daemon wrote. A replacement process or session cannot inherit
 the old recipient's availability. Bodies, terminal captures, notification
 bindings, and diffs never appear in the result.
 
-For a live mailbox surface, subscribe to `messages.changed` on the stream
+For a live mailbox surface, subscribe to `messages.changed` and `gate` on the stream
 connection before requesting this snapshot on a second connection. The event
-and snapshot both carry a workspace sequence. An event at or below the
+and snapshot for durable changes carry a workspace sequence. An event at or below the
 snapshot sequence is already represented. A higher sequence requires one
-new snapshot.
+new snapshot. Gate events invalidate live `held_by` independently of that sequence.
 
 `msg.reply` takes `message_id`, `body`, and optional `summary`, `client_key`,
 and `raw`. `summary` and `raw` follow the `msg.send` rules above. The daemon
@@ -858,7 +877,34 @@ answers to. A control character is refused too, because it cannot survive
 onto a tmux command line and the border would then wear a different name
 than the record.
 
-### headless.register and headless.clear
+### headless.register, headless.bridge.register, and headless.clear
+
+`agent.identity` takes no parameters and returns only the authenticated
+agent's `recipient` key and `label`. It refuses an administrator connection.
+Native adapters use this bounded proof instead of reading the entire
+message snapshot merely to learn who they are.
+
+`headless.bridge.register` accepts the same `label` and optional `manifest`
+as `headless.register`, but always binds the connecting process generation
+rather than the app-wide vendor process. `headless.register` also accepts
+optional `scope: "bridge"`; its default remains `scope: "vendor"`.
+Native adapters use the dedicated method so an older daemon refuses it
+instead of ignoring the new scope. The result includes `scope`.
+
+The bridge still needs a proven vendor ancestor and cannot register from
+a watched pane. Two separately launched bridge processes below the same
+vendor get distinct mailbox identities. A host sharing one MCP process
+between conversations shares one participant; a supplied conversation ID
+cannot override socket identity. The bridge's vendor generation is recorded
+and reverified. When that vendor exits, the bridge loses its delivery route
+and requests are denied, not promoted to administrator. Its denying identity
+remains until the bridge exits, including across a daemon restart on the
+same OS boot.
+
+Bridge registry rows are stored separately from legacy headless rows.
+An older daemon ignores them instead of treating an unfamiliar bridge
+process as an operator. The MCP adapter refuses an older daemon that lacks
+the dedicated registration and identity methods.
 
 An agent that runs in no tmux pane registers itself over the socket. Nothing
 in the request names a process: the daemon walks the caller's process tree,

@@ -236,6 +236,7 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
         return;
     }
     let mut reader = BufReader::new(read_half);
+    let mut partial_frame = Vec::new();
     let mut sub: Option<(broadcast::Receiver<Event>, Vec<String>)> = None;
     let mut stop = inner.stop.clone();
 
@@ -246,9 +247,9 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 match &mut sub {
                     Some((rx, _)) => tokio::select! {
                         ev = rx.recv() => Pumped::Ev(ev),
-                        line = read_frame(&mut reader) => Pumped::Line(line),
+                        line = read_frame(&mut reader, &mut partial_frame) => Pumped::Line(line),
                     },
-                    None => Pumped::Line(read_frame(&mut reader).await),
+                    None => Pumped::Line(read_frame(&mut reader, &mut partial_frame).await),
                 }
             } => pumped,
         };
@@ -440,6 +441,13 @@ pub(crate) async fn dispatch(
             )
         }
         "status.reset" => {
+            let (_, caller) = match workspace_messaging_caller(inner, peer) {
+                Ok(caller) => caller,
+                Err(error) => return (wire_error_response(id, error), None),
+            };
+            if !caller.key.is_admin() {
+                return (wire_error_response(id, mailbox_admin_required()), None);
+            }
             let params: cyclops_proto::StatusResetParams = match req.params {
                 Value::Null => cyclops_proto::StatusResetParams::default(),
                 given => match decode_params(&id, given, "status.reset params") {
@@ -447,6 +455,12 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 },
             };
+            if params.flush_messages {
+                return (
+                    Response::err(id, "bad_request", "status.reset cannot erase journals; use cyclops clear <agent> to withdraw notifications, or cyclops remove --all for explicit state removal"),
+                    None,
+                );
+            }
             let result = status_reset(inner, params).await;
             (
                 Response::ok(
@@ -526,8 +540,19 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
-        "headless.register" => (headless_register(inner, id, req.params, peer).await, None),
+        "headless.register" => (
+            headless_register(inner, id, req.params, peer, false).await,
+            None,
+        ),
+        "headless.bridge.register" => (
+            headless_register(inner, id, req.params, peer, true).await,
+            None,
+        ),
         "headless.clear" => (headless_clear(inner, id, req.params, peer), None),
+        "agent.identity" => (
+            from_result(id, crate::headless::agent_identity(inner, peer)),
+            None,
+        ),
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
         "msg.reply" => (msg_reply(inner, id, req.params, peer).await, None),
         "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
@@ -849,12 +874,21 @@ pub(crate) fn daemon_peer(peer: Peer) -> Result<(u32, i32), WireError> {
 /// `cyclops name <label> --self` from a process with no pane. The label
 /// binds to the nearest agent in the caller's process tree; the request
 /// names nothing (rule 5).
-async fn headless_register(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
-    let params: crate::headless::HeadlessRegisterParams =
+async fn headless_register(
+    inner: &Arc<Inner>,
+    id: Value,
+    params: Value,
+    peer: Peer,
+    bridge: bool,
+) -> Response {
+    let mut params: crate::headless::HeadlessRegisterParams =
         match decode_params(&id, params, "headless.register params") {
             Ok(params) => params,
             Err(response) => return response,
         };
+    if bridge {
+        params.scope = crate::headless::HeadlessScope::Bridge;
+    }
     from_result(id, crate::headless::register(inner, peer, params).await)
 }
 
@@ -1183,7 +1217,14 @@ fn resolve_mailbox_identity(
         .map(|(idx, pane)| (idx.to_string(), None, pane.root))
         .collect();
     let origin = identity::resolve_peer_origin_observed(uid, pid, &observed, |process| {
-        crate::fusion::is_vendor_now(inner, process)
+        if panes
+            .iter()
+            .any(|pane| pane.bridge && pane.root.pid == process)
+        {
+            crate::headless::bridge_vendorship(inner, process)
+        } else {
+            crate::fusion::is_vendor_now(inner, process)
+        }
     });
     let caller = match origin {
         identity::PeerOrigin::Admin => admin,
@@ -1422,6 +1463,7 @@ struct ReportPane {
     pane_id: String,
     label: Option<String>,
     root: identity::ProcId,
+    bridge: bool,
 }
 
 /// The watched pane roots alone, for a walk that must refuse anything
@@ -1464,6 +1506,7 @@ fn report_panes(inner: &Inner) -> Vec<ReportPane> {
             pane_id: pane.row.pane_id.clone(),
             label,
             root,
+            bridge: false,
         });
     }
     let headless = inner
@@ -1484,6 +1527,7 @@ fn report_panes(inner: &Inner) -> Vec<ReportPane> {
             pane_id: String::new(),
             label: Some(adoption.label),
             root,
+            bridge: adoption.vendor_root.is_some(),
         });
     }
     if !dead.is_empty() {
@@ -1822,25 +1866,7 @@ pub(crate) async fn status_reset(
         detections.retain(|key, _| live_pane_ids.contains(&key.pane_id));
     }
 
-    // 6. Flush message ledgers if requested
-    let mut flushed_messages = 0;
-    if params.flush_messages {
-        let ledger_dir = inner.state_root.path().join("ledger");
-        if let Ok(entries) = std::fs::read_dir(&ledger_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().and_then(|s| s.to_str()) == Some("ndjson") {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.len() > 0 {
-                            flushed_messages += 1;
-                            let _ = std::fs::write(entry.path(), b"");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 7. Refresh observations
+    // 6. Refresh observations. Runtime cleanup never erases a journal.
     let _ = crate::refresh_status_observations(inner).await;
 
     let (active_sessions, active_panes) = {
@@ -1863,7 +1889,7 @@ pub(crate) async fn status_reset(
         pruned_adoptions,
         active_panes,
         active_sessions,
-        flushed_messages,
+        flushed_messages: 0,
     }
 }
 
@@ -2311,8 +2337,12 @@ fn response_frame(response: &Response) -> Option<Vec<u8>> {
 
 /// Read one newline-terminated frame without allocating beyond the shared
 /// JSON-object envelope. The delimiter is consumed but is not counted.
-async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<String>> {
-    let mut bytes = Vec::new();
+/// The connection owns consumed bytes so a subscription event can cancel
+/// this read without dropping the prefix of an incomplete request.
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -2340,12 +2370,14 @@ async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<
             }
             bytes.extend_from_slice(&available[..delimiter]);
             reader.consume(delimiter + 1);
-            return String::from_utf8(bytes).map(Some).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "client frame was not UTF-8",
-                )
-            });
+            return String::from_utf8(std::mem::take(bytes))
+                .map(Some)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "client frame was not UTF-8",
+                    )
+                });
         }
         if matches!(
             FrameContract::classify_json_bytes(bytes.len().saturating_add(available.len())),
@@ -2395,6 +2427,83 @@ async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn subscription_event_does_not_discard_a_partial_request() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let mut reader = BufReader::new(server);
+        let mut partial_frame = Vec::new();
+        let request = "{\"id\":\"snow☃\",\"method\":\"status\"}";
+        let split = request.find('☃').unwrap() + 1;
+        client
+            .write_all(&request.as_bytes()[..split])
+            .await
+            .unwrap();
+
+        // The request read consumes its available prefix, then an event wins
+        // the same select used by handle_conn while the suffix is still absent.
+        tokio::select! {
+            biased;
+            result = read_frame(&mut reader, &mut partial_frame) => panic!("incomplete request completed: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        client
+            .write_all(&request.as_bytes()[split..])
+            .await
+            .unwrap();
+        client.write_all(b"\n").await.unwrap();
+        assert_eq!(
+            read_frame(&mut reader, &mut partial_frame)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(request)
+        );
+        client.write_all(b"{}\n").await.unwrap();
+        assert_eq!(
+            read_frame(&mut reader, &mut partial_frame)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reset_refuses_truncation_and_preserves_the_journal() {
+        let (inner, path) = inner_with_mailbox("reset-preserves-journal");
+        let relative = Path::new("ledger/reset.ndjson");
+        let mut file = inner.state_root.open_append(relative).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"acknowledged\":true}\n").unwrap();
+        file.sync_data().unwrap();
+        let before = std::fs::read(inner.state_root.path().join(relative)).unwrap();
+        let response = ask_inner(&inner, "status.reset", json!({"flush_messages": true})).await;
+        assert_eq!(
+            response.error.expect("truncation must be refused").code,
+            "bad_request"
+        );
+        assert_eq!(
+            std::fs::read(inner.state_root.path().join(relative)).unwrap(),
+            before
+        );
+        drop(inner);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_reset_requires_an_authenticated_operator() {
+        let (inner, path) = inner_with_mailbox("reset-requires-operator");
+        let (response, _) = dispatch(&inner, req("status.reset"), None).await;
+        assert_eq!(
+            response
+                .error
+                .expect("missing credentials must be refused")
+                .code,
+            "denied"
+        );
+        drop(inner);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     use crate::{Config, DetEntry};
     use cyclops_proto::{
         LiveSessionKey, MessagesChangedArea, MessagesChangedData, MessagesSnapshotResult, OsBootId,
@@ -2414,7 +2523,11 @@ mod tests {
         exact.push(FrameContract::DELIMITER);
         let mut reader = BufReader::new(Cursor::new(exact));
         assert_eq!(
-            read_frame(&mut reader).await.unwrap().unwrap().len(),
+            read_frame(&mut reader, &mut Vec::new())
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
             FrameContract::MAX_JSON_BYTES
         );
 
@@ -2422,13 +2535,19 @@ mod tests {
         oversized.push(FrameContract::DELIMITER);
         let mut reader = BufReader::new(Cursor::new(oversized));
         assert_eq!(
-            read_frame(&mut reader).await.unwrap_err().kind(),
+            read_frame(&mut reader, &mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::InvalidData
         );
 
         let mut reader = BufReader::new(Cursor::new(b"{}"));
         assert_eq!(
-            read_frame(&mut reader).await.unwrap_err().kind(),
+            read_frame(&mut reader, &mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
     }
@@ -4088,6 +4207,7 @@ mod tests {
                 pane_id: pane.to_string(),
                 label: Some("first".into()),
                 root: first_root,
+                bridge: false,
             },
             ReportPane {
                 session_idx: Some(1),
@@ -4095,6 +4215,7 @@ mod tests {
                 pane_id: pane.to_string(),
                 label: Some("second".into()),
                 root: second_root,
+                bridge: false,
             },
         ];
 

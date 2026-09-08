@@ -84,8 +84,9 @@ pub(crate) fn is_current(local_short: &str, remote_sha: &str) -> bool {
 /// The commit `reff` names at `repo`, asked of the remote itself. One
 /// cheap round trip, no clone, no checkout.
 pub(crate) fn ls_remote(repo: &str, reff: &str) -> Result<String, String> {
+    let peeled = format!("{reff}^{{}}");
     let out = Command::new("git")
-        .args(["ls-remote", repo, reff])
+        .args(["ls-remote", repo, reff, &peeled])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
@@ -93,10 +94,22 @@ pub(crate) fn ls_remote(repo: &str, reff: &str) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    match text.split_whitespace().next() {
-        Some(sha) if !sha.is_empty() => Ok(sha.to_string()),
-        _ => Err(format!("{reff} names nothing there")),
-    }
+    let refs: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    let &(sha, name) = refs
+        .iter()
+        .find(|(_, name)| !name.ends_with("^{}"))
+        .ok_or_else(|| format!("{reff} names nothing there"))?;
+    // Compare a tag's commit, not its tag object. Peel only the selected ref:
+    // a same-named branch sorts first and `git clone --branch` prefers it.
+    let peeled_name = format!("{name}^{{}}");
+    Ok(refs
+        .iter()
+        .find_map(|(sha, name)| (*name == peeled_name).then_some(*sha))
+        .unwrap_or(sha)
+        .to_string())
 }
 
 /// Shallow clone of `repo` at `reff` into `dest`, quiet on success.
@@ -130,11 +143,6 @@ pub(crate) fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
 /// macOS has a per-process temporary directory under `/private/var`; it is a
 /// bad home for a multi-gigabyte cache that persists after an update. Keep the
 /// cache in the platform cache location instead, where an operator can inspect
-/// The visible, user-owned root for retained update build artifacts.
-///
-/// macOS has a per-process temporary directory under `/private/var`; it is a
-/// bad home for a multi-gigabyte cache that persists after an update. Keep the
-/// cache in the platform cache location instead, where an operator can inspect
 /// or remove it without hunting through system temporary storage.
 pub(crate) fn build_cache_parent(home: &Path) -> PathBuf {
     let user_home = std::env::var_os("HOME")
@@ -160,6 +168,12 @@ pub(crate) fn build_cache_parent(home: &Path) -> PathBuf {
 pub(crate) fn build_cache(home: &Path) -> PathBuf {
     let home_key = fnv64(home.as_os_str().as_bytes());
     build_cache_parent(home).join(format!("build-{home_key}"))
+}
+
+/// Update workspaces share Cyclops's cache parent with the managed build cache.
+/// Exact owner markers distinguish removable scratch from unrelated cache data.
+pub(crate) fn update_scratch_root() -> PathBuf {
+    build_cache_parent(&cyclops_proto::cyclops_home())
 }
 
 /// Open the dedicated cache parent before its build-cache child. The standard
@@ -212,6 +226,7 @@ pub(crate) fn lock_build_cache(root: &cyclops_state::StateRoot) -> Result<Exclus
 pub(crate) const SCRATCH_MARKER: &str = ".cyclops-update-owner";
 pub(crate) const SCRATCH_LEASE: &str = ".lease";
 pub(crate) const SCRATCH_PREFIX: &str = "cycu.";
+pub(crate) const SCRATCH_NAME_NONCE_BYTES: usize = 16;
 
 /// Random owner-only update workspace with an exclusive kernel lease.
 pub(crate) struct Scratch {
@@ -226,13 +241,33 @@ pub(crate) struct Scratch {
 
 impl Scratch {
     pub(crate) fn create() -> Result<Self, String> {
-        let temp = std::fs::canonicalize(std::env::temp_dir())
-            .map_err(|error| format!("resolve temporary directory: {error}"))?;
+        #[cfg(test)]
+        let temp = cyclops_proto::scratch::scratch_root();
+        #[cfg(not(test))]
+        let temp = {
+            let root = update_scratch_root();
+            let parent = root.parent().ok_or("update cache has no parent")?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create update-cache ancestors: {error}"))?;
+            cyclops_state::StateRoot::open_or_create(&root)
+                .map_err(|error| format!("open update cache: {error}"))?;
+            root
+        };
+        Self::create_in(&temp)
+    }
+
+    fn create_in(temp: &Path) -> Result<Self, String> {
+        let temp = std::fs::canonicalize(temp)
+            .map_err(|error| format!("resolve update directory: {error}"))?;
         for _ in 0..32 {
             let nonce = random_hex()?;
-            // Keep the replay socket below the Unix sun_path limit even in
-            // macOS's long per-user temporary directory.
-            let path = temp.join(format!("{SCRATCH_PREFIX}{nonce}"));
+            // The directory needs collision resistance, not the full ownership
+            // marker. Keep the latter at 128 bits and the socket path short.
+            let path = temp.join(format!(
+                "{SCRATCH_PREFIX}{}",
+                &nonce[..SCRATCH_NAME_NONCE_BYTES]
+            ));
+            validate_replay_socket_path(&path)?;
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
             match builder.create(&path) {
@@ -295,6 +330,29 @@ impl Scratch {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn validate_replay_socket_path(scratch: &Path) -> Result<(), String> {
+    let socket = scratch.join("r").join(cyclops_proto::SOCK_NAME);
+    // macOS sockaddr_un has 104 bytes, including the terminating NUL. Use
+    // that portable bound before cloning/building, not after stopping a daemon.
+    if socket.as_os_str().as_bytes().len() >= 104 {
+        return Err(format!(
+            "update replay socket path is too long (maximum 103 bytes): {}",
+            socket.display()
+        ));
+    }
+    Ok(())
+}
+
+fn source_installer(source: &Path, expected_commit: &str) -> Command {
+    let mut installer = Command::new("sh");
+    installer
+        .arg(source.join("scripts/install.sh"))
+        .arg("--source")
+        .env_remove("CYCLOPS_VERSION")
+        .env("CYCLOPS_EXPECTED_BUILD", expected_commit);
+    installer
 }
 
 impl Drop for Scratch {
@@ -526,8 +584,7 @@ pub fn run(
         LocalBuild::Unknown => println!("  {}", style.dim(copy::UPDATE_UNKNOWN)),
     }
 
-    // 3. Runtime path, not test scratch, same as the installer's own
-    //    mktemp under ${TMPDIR:-/tmp}.
+    // 3. A private workspace under the platform's visible Cyclops cache.
     let scratch = match Scratch::create() {
         Ok(scratch) => scratch,
         Err(error) => {
@@ -547,6 +604,19 @@ pub fn run(
         eprintln!("{}", copy::update_clone_failed(&repo, &reff, &cause));
         return 1;
     }
+    let expected_commit = match Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&src)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => {
+            eprintln!("could not prove the cloned update commit; nothing was installed");
+            return 1;
+        }
+    };
     // The clone's installer, streamed: it prints every file it touches,
     // and it is the one implementation of where binaries and home live.
     //
@@ -558,8 +628,7 @@ pub fn run(
     // one: the edges keep arriving, from a build the daemon no longer
     // matches. Where it lands is printed, because a prefix is the kind of
     // thing an operator only discovers is wrong much later.
-    let mut installer = Command::new("sh");
-    installer.arg(src.join("scripts").join("install.sh"));
+    let mut installer = source_installer(&src, &expected_commit);
     // Build into a directory that outlives the clone.
     //
     // The clone is a fresh temp dir every run, so cargo's target/ starts
@@ -626,8 +695,23 @@ pub fn run(
     // 4.
     println!();
     match installed_cyclops().and_then(|p| version_of(&p)) {
-        Some(new) => println!("{}", updated_badge(crate::VERSION, &new, style)),
-        None => println!("  {}", style.dim(copy::UPDATE_UNRESOLVED)),
+        Some(new)
+            if cyclops_client::RuntimeIdentity::parse(&new)
+                .and_then(|identity| identity.build)
+                .is_some_and(|build| is_current(&build, &expected_commit)) =>
+        {
+            println!("{}", updated_badge(crate::VERSION, &new, style));
+        }
+        Some(new) => {
+            eprintln!(
+                "update did not select the requested commit {expected_commit}; installed {new}"
+            );
+            return 1;
+        }
+        None => {
+            eprintln!("{}", copy::UPDATE_UNRESOLVED);
+            return 1;
+        }
     }
     println!();
 

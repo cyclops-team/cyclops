@@ -67,6 +67,7 @@ evidence = "UNMEASURED"
 [[rule]]
 id = "screen_working_interrupt_hint"
 state = "working"
+lifecycle_evidence = false
 priority = 1100
 region = "bottom_non_empty_lines(8)"
 contains = ["(Esc/Ctrl+C to interrupt)"]

@@ -136,7 +136,7 @@ def run_installer(
 
     started = time.monotonic_ns()
     process = subprocess.Popen(
-        ["sh", str(repo / "scripts/install.sh"), "--prefix", env["CYCLOPS_INSTALL_PERF_PREFIX"], "--no-path"],
+        ["sh", str(repo / "scripts/install.sh"), "--source", "--prefix", env["CYCLOPS_INSTALL_PERF_PREFIX"], "--no-path"],
         cwd=repo,
         env=env,
         stdout=subprocess.PIPE,
@@ -367,6 +367,19 @@ def selftest() -> int:
     """Run the no-daemon regression checks for the performance fixture."""
 
     fixture_name_response_requires_the_requested_manifest()
+    # Check the real subprocess boundary without building or starting a daemon.
+    # A default install can download an older release and bypass the build timer.
+    from unittest.mock import patch
+
+    def inspect_invocation(command: list[str], **kwargs: object) -> None:
+        assert "--source" in command, "the staged source workload must build this checkout"
+        raise WorkloadError("invocation inspected")
+
+    with patch("subprocess.Popen", side_effect=inspect_invocation):
+        try:
+            run_installer(Path("repo"), Path("scratch"), {"CYCLOPS_INSTALL_PERF_PREFIX": "prefix"})
+        except WorkloadError as error:
+            assert str(error) == "invocation inspected"
     print("install first handoff fixture self-test passed")
     return 0
 

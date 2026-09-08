@@ -166,17 +166,26 @@ async fn an_unavailable_runtime_watch_waits_for_an_explicit_availability_edge() 
         return;
     }
     let mut rig = Rig::new_multi("runtime-watch-unavailable", CAT_MANIFEST, &[], "").await;
-    rig.tmux.run_ok(&[
-        "new-session",
-        "-d",
-        "-s",
-        "extra",
-        "-x",
-        "160",
-        "-y",
-        "40",
-        "cat",
-    ]);
+    let create_session = |rig: &Rig, phase| {
+        let output = rig.tmux.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "extra",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            "cat",
+        ]);
+        assert!(
+            output.status.success(),
+            "{phase} runtime session creation on {} failed: {}",
+            rig.tmux.socket(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    create_session(&rig, "initial");
     let first_watch = rig
         .ctl
         .request("session.watch", json!({"session": "extra"}))
@@ -207,17 +216,7 @@ async fn an_unavailable_runtime_watch_waits_for_an_explicit_availability_edge() 
         "uncertainty keeps the runtime slot's last observed identity"
     );
 
-    rig.tmux.run_ok(&[
-        "new-session",
-        "-d",
-        "-s",
-        "extra",
-        "-x",
-        "160",
-        "-y",
-        "40",
-        "cat",
-    ]);
+    create_session(&rig, "replacement after server loss");
     let still_detached = rig.ctl.request("status", json!({})).await;
     assert_eq!(
         still_detached["result"]["sessions"][0]["attached"],

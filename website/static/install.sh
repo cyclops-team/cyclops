@@ -19,9 +19,9 @@
 # Without --source this tries a published release for the requested version
 # (CYCLOPS_VERSION, default the latest) and this host's platform first: a
 # download and a SHA256 check, no compiler. No release for this host, no
-# release at that version, or anything that fails along the way falls back
-# to the source build this installer has always done, with a message
-# saying so. Either way the result is the same matched, activated pair.
+# release asset at that version falls back to building that same tag. An
+# explicit CYCLOPS_REF selects source instead; --source builds the local
+# checkout when one is available. Selection never silently changes channels.
 #
 # What it will and will not do: it never uses sudo, never touches your
 # tmux config, and never edits a shell profile without printing the exact
@@ -68,6 +68,7 @@ PREFIX=""
 NO_PATH=0
 UNINSTALL=0
 SOURCE_ONLY=0
+FETCH_REQUESTED_REF=0
 
 # ---------------------------------------------------------------------------
 # output
@@ -117,6 +118,7 @@ usage() {
     say "  --help         show this help"
     say ""
     say "CYCLOPS_VERSION selects the release to download (default: latest)."
+    say "CYCLOPS_REF selects a source branch or tag instead of a release."
     exit 0
 }
 
@@ -135,6 +137,13 @@ while [ $# -gt 0 ]; do
         *)           die "unknown option: $1" "rerun the installer with --help to list its options" ;;
     esac
 done
+
+if [ "$UNINSTALL" -eq 0 ] && [ "$SOURCE_ONLY" -eq 0 ] && [ -n "${CYCLOPS_REF:-}" ]; then
+    [ -z "${CYCLOPS_VERSION:-}" ] || die "CYCLOPS_REF and CYCLOPS_VERSION select different install sources" \
+        "set one of them, or use --source to build your checkout explicitly"
+    SOURCE_ONLY=1
+    FETCH_REQUESTED_REF=1
+fi
 
 # ---------------------------------------------------------------------------
 # where things go
@@ -459,11 +468,6 @@ try_download_pair() {
     have curl || { note "curl is not installed; cannot download a release"; return 1; }
     have tar || { note "tar is not installed; cannot unpack a release"; return 1; }
 
-    requested="${CYCLOPS_VERSION:-latest}"
-    tag="$(resolve_release_tag "$requested")" || {
-        note "could not resolve the $requested Cyclops release"
-        return 1
-    }
     version="${tag#v}"
     asset="cyclops-$version-$target.tar.gz"
     url="$RELEASE_REPO/releases/download/$tag/$asset"
@@ -537,11 +541,21 @@ try_download_pair() {
 }
 
 METHOD=source
+if [ "$FETCH_REQUESTED_REF" -eq 1 ]; then
+    SRC=""
+fi
 if [ "$SOURCE_ONLY" -eq 0 ]; then
+    requested="${CYCLOPS_VERSION:-latest}"
+    tag="$(resolve_release_tag "$requested")" || die "could not resolve the $requested Cyclops release" \
+        "check the network, pin CYCLOPS_VERSION, or use --source for a source install"
+    # Both download and fallback must install the selected release, not main
+    # or an unrelated checkout from which this script happened to be invoked.
+    REF="$tag"
+    SRC=""
     if try_download_pair; then
         METHOD=download
     else
-        note "falling back to a source build"
+        note "falling back to a source build of $REF"
     fi
 fi
 
@@ -596,7 +610,13 @@ if [ "$METHOD" = "source" ]; then
     # named packages skip workspace members an install never runs. Both trims
     # exist because this compile happens on every installing machine.
     BUILD_TARGET="${CARGO_TARGET_DIR:-$INSTALLER_CACHE/target}"
-    ( cd "$SRC" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
+    # Cargo resolves relative targets from the source checkout. Use that same
+    # absolute location when selecting the finished binaries below.
+    case "$BUILD_TARGET" in
+        /*) ;;
+        *) BUILD_TARGET="$SRC/$BUILD_TARGET" ;;
+    esac
+    ( cd "$SRC" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
 
     TARGET="$BUILD_TARGET/dist"
     for name in cyclops cyclopsd; do
@@ -640,6 +660,24 @@ fi
 # ---------------------------------------------------------------------------
 # 4. install the binaries
 # ---------------------------------------------------------------------------
+
+# Check the requested identity before the candidate can stop the old daemon or
+# change the selected pair. Pair activation separately proves both binaries match.
+for name in cyclops cyclopsd; do
+    identity="$("$PAIR_SOURCE/$name" --version)" || die "cannot read the candidate $name identity"
+    if [ "$SOURCE_ONLY" -eq 0 ]; then
+        candidate_version="$(printf '%s\n' "$identity" | awk '{print $2}')"
+        [ "$candidate_version" = "${tag#v}" ] || die "candidate $name is $candidate_version, but $tag was requested"
+    fi
+    if [ -n "${CYCLOPS_EXPECTED_BUILD:-}" ]; then
+        candidate_build="$(printf '%s\n' "$identity" | sed -n 's/.*(\([a-f0-9][a-f0-9]*\))$/\1/p')"
+        [ "${#candidate_build}" -ge 7 ] || die "candidate $name has no clean commit identity"
+        case "$CYCLOPS_EXPECTED_BUILD" in
+            "$candidate_build"*) ;;
+            *) die "candidate $name build $candidate_build does not match requested $CYCLOPS_EXPECTED_BUILD" ;;
+        esac
+    fi
+done
 
 [ -n "$PREFIX" ] || PREFIX="$(pick_prefix)"
 step "installing to $PREFIX"

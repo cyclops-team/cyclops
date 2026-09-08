@@ -50,6 +50,7 @@ fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
         verified_by: None,
         verify_outcome: None,
         pre_write_cause: None,
+        held_by: None,
         pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
@@ -74,6 +75,7 @@ fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
         verified_by: None,
         verify_outcome: None,
         pre_write_cause: None,
+        held_by: None,
         pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
@@ -98,6 +100,7 @@ fn quota(n: u64, state: MessageQuotaState) -> MessageNotificationSummary {
         verified_by: None,
         verify_outcome: None,
         pre_write_cause: None,
+        held_by: None,
         pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
@@ -775,6 +778,45 @@ fn resolved_notification_does_not_render_a_historical_verification_hold() {
             "a resolved notification must not look actively held: {frame}"
         );
     }
+}
+
+#[test]
+fn a_live_draft_hold_is_visible_and_clears_without_changing_the_journal_sequence() {
+    let mut notification = wake(MessageNotificationState::Gating);
+    notification.attempt_id = Some(attempt(31));
+    notification.held_by = Some("held_for_existing_draft".into());
+    let mut snapshot = snapshot(
+        1,
+        vec![row(
+            "m-live-hold",
+            1,
+            MessageDirection::Outbound,
+            false,
+            vec![theirs("%1", "reviewer", notification)],
+        )],
+    );
+    let mut queue = HumanQueue::new();
+    queue.set_scope(Scope::All);
+    let mut refresh = RefreshGate::new();
+    refresh.connected();
+    let request = refresh.begin().unwrap();
+    assert!(refresh.finish_snapshot(request, &snapshot));
+    queue.replace(rows_from_snapshot(&snapshot));
+    let registry = AvatarRegistry::default();
+    let frame = render_chat(&queue, ChatRenderContext::new(&registry), 120, 15).join("\n");
+    assert!(frame.contains("held for existing draft"), "{frame}");
+    assert_eq!(
+        snapshot.rows[0].recipients[0].notification.state,
+        MessageNotificationState::Gating
+    );
+
+    snapshot.rows[0].recipients[0].notification.held_by = None;
+    refresh.mark_dirty();
+    let request = refresh.begin().unwrap();
+    assert!(refresh.finish_snapshot(request, &snapshot));
+    queue.replace(rows_from_snapshot(&snapshot));
+    let frame = render_chat(&queue, ChatRenderContext::new(&registry), 120, 15).join("\n");
+    assert!(!frame.contains("held for existing draft"), "{frame}");
 }
 
 /// The resting queue names the exact phase instead of reducing progress to waiting.

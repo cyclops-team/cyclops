@@ -3,6 +3,42 @@
 All notable changes to Cyclops v2. Format follows Keep a Changelog;
 versions are unreleased until admin cuts a tag.
 
+## [1.2.0] - Unreleased
+
+### Added
+- `cyclops mcp`: bounded local tools for send, reply, inbox, claim, and thread,
+  with a separate identity for each session-owned bridge process. Optional
+  Claude Code Channels support forwards body-free inbox notices through its
+  preview API. Native tool access does not imply arbitrary desktop chat control.
+- Native connection guidance and an opt-in Antigravity sidecar transport probe.
+  The probe is not a complete authenticated conversation connector.
+
+### Fixed
+- Send receipts and message views expose observed draft and modal holds without
+  waiting for a timeout. Status distinguishes sensor readiness observations
+  from actual notification holds. Five unmeasured manifest activity rules are
+  advisory rather than lifecycle evidence.
+- Socket claims no longer withdraw an owed pane notification. The notification
+  FIFO advances after a submitted input is consumed, without waiting for a full
+  agent turn or an unrelated mailbox claim. Historical journals retain their
+  original claim-withdrawal behavior on replay.
+- Subscription events no longer discard a partially read request, including a
+  UTF-8 character split across socket reads.
+- Source updates build the requested commit and verify it before activation.
+  Explicit installer refs no longer silently select a different release or
+  fall back to an unrelated local checkout.
+- Update scratch and health inspection use the Cyclops cache instead of scanning
+  the entire system temporary directory. An absent update directory does not
+  hide a retained build cache. Empty, detached session slots are reported as
+  waiting rather than broken live routes.
+- Untouched released skills and manifests refresh during setup. User edits,
+  links, and changed file identities remain protected. The skill is shorter and
+  no longer tells agents that an inbox claim cancels their pane notification.
+- The retired `flush` command refuses without connecting or erasing journals.
+  Status reset requires an authenticated operator and rejects journal truncation.
+- Installer performance evidence explicitly builds source. Release publication
+  requires passing release evidence for the exact tagged commit.
+
 ## [1.1.0] - 2026-09-05
 
 ### Removed
@@ -1385,4 +1421,3 @@ context, not the current release summary or a source of product semantics.
 - `cyclops flush`: added dedicated command to completely reset session state, prune dead panes, and flush the message ledger for a pristine restart.
 - Modal toggle on Space: keyboard-only navigation in Settings where Space toggles switches and checkboxes instantly.
 - Enlarged composer clear button: expanded the clear composer control into a bracketed button (`[⌫ clear]` / `[⌫]`) with an expanded hit target for easier mouse clicking.
-

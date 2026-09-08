@@ -1155,6 +1155,9 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
         for session in &status.sessions {
             let state = match (&session.identity, session_record_error.as_ref()) {
                 (_, Some(_)) => "invalid_record",
+                (None, None) if !session.attached && session.panes.is_empty() => {
+                    "waiting_for_session"
+                }
                 (None, None) => "unproven",
                 (Some(binding), None)
                     if recorded_sessions.iter().any(|recorded| recorded == binding) =>
@@ -1247,7 +1250,10 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
     let config_state = match (config_state, status.is_some()) {
         ("invalid", _) => "invalid",
         (_, false) => "unproven",
-        (_, true) if !stale.is_empty() || !duplicates.is_empty() => "stale",
+        (_, true) if !duplicates.is_empty() => "stale",
+        // A configured boot target can legitimately not exist yet. Keep its
+        // name visible, but absence alone does not mean broken configuration.
+        (_, true) if !stale.is_empty() => "waiting_for_session",
         _ => "current",
     };
     let config_error = config_error.or_else(|| {
@@ -1866,13 +1872,10 @@ fn inspect_operational_state(home: &Path) -> (ExternalStateReport, ExternalState
         }
     }
     let root_error = inventory.error;
-    let build_cache = summarize_external(
-        cache_path,
-        build_candidates,
-        inventory.root_safe,
-        inventory.truncated,
-        root_error.clone(),
-    );
+    // The selected cache is inspected independently even when its update-scratch
+    // parent cannot be listed. Its candidates carry their own safety failures;
+    // a scratch inventory error must not invalidate a proven cache.
+    let build_cache = summarize_external(cache_path, build_candidates, true, false, None);
     let update_scratch = summarize_external(
         inventory.temp_root,
         update_candidates,
@@ -2365,7 +2368,7 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
         lines.push(format!("    session mapping record invalid · {error}"));
     }
     lines.push(format!(
-        "    config {} · {} configured · {} stale · {} dynamic",
+        "    config {} · {} configured · {} not attached · {} dynamic",
         report.operational.config.state,
         report.operational.config.configured.len(),
         report.operational.config.stale.len(),
@@ -2872,6 +2875,54 @@ mod tests {
         assert_eq!(report.config.stale, vec!["gone"]);
         assert_eq!(report.config.duplicates, vec!["main"]);
         assert_eq!(report.watchers.state, "current");
+    }
+
+    #[test]
+    fn empty_unattached_slots_wait_but_live_or_retained_routes_require_identity() {
+        let scratch = private_scratch();
+        let home = scratch.path().join("state");
+        let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        root.replace_file(Path::new("config.toml"), b"sessions = [\"main\"]\n")
+            .unwrap();
+        let mut daemon = daemon_stopped();
+        daemon.running = true;
+        daemon.status = Some(
+            serde_json::from_value(json!({
+                "daemon_version": "1.2.0", "proto": 1, "boot_id": "test",
+                "uptime_ms": 1, "tmux_version": "3.6a",
+                "sessions": [{"name": "main", "attached": false, "panes": []}],
+            }))
+            .unwrap(),
+        );
+        let waiting = inspect_operational(&home, &daemon);
+        assert_eq!(waiting.sessions[0].state, "waiting_for_session");
+        assert_eq!(waiting.config.state, "waiting_for_session");
+        assert_eq!(
+            waiting.config.stale,
+            ["main"],
+            "retain the unavailable-name diagnostic"
+        );
+
+        daemon.status.as_mut().unwrap().sessions[0].attached = true;
+        assert_eq!(
+            inspect_operational(&home, &daemon).sessions[0].state,
+            "unproven"
+        );
+
+        let slot = &mut daemon.status.as_mut().unwrap().sessions[0];
+        slot.attached = false;
+        slot.panes.push(
+            serde_json::from_value(json!({
+                "pane_id": "%1", "window_id": "@1", "window_name": "test",
+                "title": "", "current_command": "agent", "dead": false,
+                "in_mode": false, "width": 80, "height": 24, "state": "idle",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            inspect_operational(&home, &daemon).sessions[0].state,
+            "unproven"
+        );
     }
 
     #[test]

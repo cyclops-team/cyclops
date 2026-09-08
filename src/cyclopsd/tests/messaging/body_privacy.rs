@@ -620,7 +620,7 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo() {
+async fn authenticated_claim_preserves_a_blocked_attempt_until_route_recovery_delivers_it() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -703,8 +703,8 @@ async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo()
     assert!(notification_attempts(&rig, &second_id).is_empty());
 
     // The command runs as a descendant of the exact watched cycagent pane.
-    // The fixture paints Codex Working before opening the socket, so releasing
-    // the FIFO cannot let the second attempt write while this claim runs.
+    // The fixture paints Codex Working before opening the socket. Working
+    // does not veto a notification; the exact recipient still owns its claim.
     let claimed = pane_request(
         &mut rig,
         &client_dir,
@@ -721,11 +721,9 @@ async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo()
         .into_iter()
         .any(|line| { line["id"] == first_id && line["data"]["type"] == "message_claimed" }));
 
-    // The claim withdrew the blocked attempt: the recipient holds the body,
-    // so the wake has nothing left to announce and the FIFO moves on. Read
-    // the projection over the admin socket: the second doorbell may now
-    // land in the loop pane and must not race a command typed there.
-    let lines_after_claim = workspace_lines(&rig).len();
+    // The claim keeps its notification obligation. The fresh route observation
+    // may already have reopened it; inspect through the admin socket so no
+    // test command can collide with either recipient notification.
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     assert!(snapshot["error"].is_null(), "snapshot failed: {snapshot}");
     let rows = snapshot["result"]["rows"].as_array().unwrap();
@@ -735,23 +733,22 @@ async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo()
         .expect("claimed first message remains visible");
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
     let first_notification = &first_row["recipients"][0]["notification"];
-    assert_eq!(first_notification["state"], "not_started", "{first_row}");
-    assert_eq!(first_notification["settlement"], "withdrawn_by_claim");
-    assert_eq!(
+    assert!(first_notification["settlement"].is_null(), "{first_row}");
+    assert_ne!(
         first_notification["pre_write_cause"],
         "claimed_before_write"
     );
 
+    wait_for_notification_submitted(&mut rig, &first_id).await;
     let second_attempt = wait_for_notification_attempt(&mut rig, &second_id).await;
-    wait_for_notification_state(&mut rig, &second_id, "writing").await;
+    wait_for_notification_submitted(&mut rig, &second_id).await;
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
     assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
     assert_ne!(first_attempt, second_attempt);
-    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
-    assert!(notification_state_count(&rig, &second_id, "writing") > 0);
+    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 1);
+    assert_eq!(notification_state_count(&rig, &second_id, "writing"), 1);
 
-    // The operator withdrawing the already-withdrawn attempt is answered
-    // with the record and appends nothing.
+    // Explicit withdrawal still refuses after terminal bytes were written.
     let lines_before_withdraw = workspace_lines(&rig).len();
     let withdrawn = rig
         .ctl
@@ -763,16 +760,24 @@ async fn authenticated_claim_withdraws_a_blocked_attempt_and_releases_the_fifo()
             }),
         )
         .await;
-    assert!(withdrawn["error"].is_null(), "{withdrawn}");
+    assert!(!withdrawn["error"].is_null(), "{withdrawn}");
     let first_lines = |lines: &[Value]| lines.iter().filter(|l| l["id"] == first_id).count();
     assert_eq!(
         first_lines(&workspace_lines(&rig)),
         first_lines(&workspace_lines(&rig)[..lines_before_withdraw]),
-        "the operator withdrawal appended a fact for the withdrawn attempt"
+        "refused post-write withdrawal appended a fact"
     );
-    assert!(lines_after_claim <= lines_before_withdraw);
     let history = pane_history(&rig, &recipient);
-    assert!(!history.contains(&compact_doorbell(&first_attempt)));
+    let first_pos = history
+        .find(&compact_doorbell(&first_attempt))
+        .expect("first doorbell");
+    let second_pos = history
+        .find(&compact_doorbell(&second_attempt))
+        .expect("second doorbell");
+    assert!(
+        first_pos < second_pos,
+        "notifications were not FIFO: {history}"
+    );
 
     rig.shutdown().await;
 }

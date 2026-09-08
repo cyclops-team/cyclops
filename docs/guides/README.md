@@ -18,6 +18,7 @@ handoff. The remaining guides answer one operational question each.
 | Guide | Use it when... |
 |---|---|
 | [Send, wake, claim, and reply](send.md) | You need the durable messaging contract and recovery behavior. |
+| [Connect a native coding app](native-apps.md) | You need MCP tools, opt-in Claude channel notices, or the limits of native push integration. |
 | [History](history.md) | You want to page through and inspect the durable record. |
 | [Wait](wait.md) | You need to understand what observed pane state does and does not prove. |
 

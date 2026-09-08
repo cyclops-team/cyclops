@@ -943,6 +943,12 @@ impl Rig {
     /// Shut the daemon down and boot a fresh one on the same home and tmux
     /// server, with fresh clients. The ledger persists across the two runs.
     pub async fn reboot(self) -> Rig {
+        self.reboot_with_stopped_home(|_| {}).await
+    }
+
+    /// Edit replay fixtures only after the old daemon and its socket clients
+    /// have stopped, so a live registry writer cannot replace the test input.
+    pub async fn reboot_with_stopped_home(self, edit: impl FnOnce(&Path)) -> Rig {
         let Rig {
             _descriptor_slot,
             tmux,
@@ -956,6 +962,7 @@ impl Rig {
         daemon.shutdown().await;
         ctl.expect_closed().await;
         ev.expect_closed().await;
+        edit(&home);
         let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
         let daemon = cyclopsd::boot(cfg).await.expect("daemon reboots");
         let sock = daemon.socket_path();

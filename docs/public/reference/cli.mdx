@@ -21,7 +21,7 @@ the same system to terminals and scripts.
 | `cyclops name <pane> <label>` | Give a pane a stable address; `--clear` releases it. |
 | `cyclops clear [<agent>] [--status]` | Quiet queued pane notifications for one agent, or cleanse status with `--status`. |
 | `cyclops reset` | Reset status by clearing old, terminated, and stale processes and sessions. |
-| `cyclops flush [--prune]` | Flush message ledgers, cleanse state, and reset sessions to start clean; `--prune` (default true) also drops dead panes and stale sessions. |
+| `cyclops clear <agent>` | Withdraw unsubmitted notifications for one agent without deleting message history. Use `cyclops remove --all` for an explicit complete-state removal preview. |
 | `cyclops read <agent>` | Read visible/recent pane output or the detection evidence. |
 | `cyclops send <agent> --subject ... [--summary ...] [--raw]` | Accept a durable message and print its wake receipt; `--raw` pastes the whole message with no composer check. |
 | `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact message. |

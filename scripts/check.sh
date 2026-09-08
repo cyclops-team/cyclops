@@ -75,6 +75,7 @@ if [ "$mode" = "quick" ]; then
 fi
 
 stage "messaging docs" ./tests/e2e/messaging-docs-parity.sh
+stage "native adapters" python3 scripts/native/test_native_adapters.py
 stage "fmt" cargo fmt --all --check
 stage "clippy" cargo clippy --workspace --all-targets -- -D warnings
 stage "installer parity" cmp -s scripts/install.sh website/static/install.sh

@@ -40,14 +40,14 @@ pub(crate) enum NotificationAdapterError {
     MessageMissing,
 }
 
-/// Nothing is written for a message the recipient already holds. A claim
-/// before the write boundary settles the attempt as withdrawn under the
-/// same store lock, so a worker that reaches its pre-write check after a
-/// claim finds the entry claimed and stops without touching the pane. A
-/// doorbell already past Enter is receipted by the claim instead; that path
-/// never asks this question.
-fn entry_allows_notification(state: &MailboxEntryState, _transport: NotificationTransport) -> bool {
+/// Socket retrieval must not consume the independently owed pane doorbell.
+/// Supersession and explicit withdrawal still stop the exact attempt.
+fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationTransport) -> bool {
     state.is_pending()
+        || (matches!(
+            transport,
+            NotificationTransport::Doorbell | NotificationTransport::Raw
+        ) && state.is_claimed())
 }
 
 impl NotificationContext {
@@ -188,6 +188,30 @@ impl NotificationContext {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
         Ok(())
+    }
+
+    /// Completion may advance FIFO only for this exact settled run. A route
+    /// recovery can replace a blocked run before its old worker returns.
+    pub(crate) fn has_settled_current_run(&self) -> Result<bool, NotificationAdapterError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        Ok(store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .is_some_and(|record| {
+                self.owns(record)
+                    && matches!(
+                        record.state,
+                        NotificationState::Notified
+                            | NotificationState::AttentionRequired
+                            | NotificationState::Withdrawn
+                            | NotificationState::WithdrawnAfterStaging
+                            | NotificationState::WithdrawnByOperator
+                            | NotificationState::Superseded
+                    )
+            }))
     }
 
     /// Atomically recheck ownership and record the irreversible write boundary.
@@ -385,13 +409,7 @@ impl NotificationContext {
         }
         let claimed = store
             .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .is_some_and(|entry| {
-                matches!(
-                    &entry.state,
-                    MailboxEntryState::Claimed { claimant, .. } if *claimant == self.recipient
-                )
-            });
+            .exact_recipient_claimed_after_write(&current);
         if current.state == NotificationState::Notified {
             return Ok(claimed);
         }

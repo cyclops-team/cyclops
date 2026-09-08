@@ -18,8 +18,8 @@
 //! honored by a later boot: `workspace::finish_deferred_wiring`), only inside
 //! an installed consumer's user-owned, non-writable-by-others directory,
 //! honoring `CYCLOPS_NO_VENDOR_HOOKS`, and creating only Cyclops's missing
-//! `skills/cyclops` leaf and shipped skill. Every existing skill, including a
-//! known old Cyclops seed, remains untouched.
+//! `skills/cyclops` leaf and shipped skill. Untouched released seeds refresh;
+//! operator edits remain untouched.
 
 use std::ffi::OsStr;
 use std::io::ErrorKind;
@@ -35,7 +35,7 @@ pub(crate) const SHIPPED: &str = include_str!("../../../skills/cyclops/SKILL.md"
 /// one included. Same classification contract as
 /// `crate::manifests::EVER_SHIPPED_FNV64`: a file on disk whose hash is in
 /// this list is a known old Cyclops seed; any other existing content is an
-/// operator edit. Both remain untouched. The test below fails until the
+/// operator edit. Only the unedited seed may refresh. The test fails until the
 /// current body is listed, and prints the hash to append.
 ///
 /// Released, not every body that ever compiled. An unreleased intermediate
@@ -70,6 +70,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "028b6c534c5f24a1",
     "6dedc4256dbfe205",
     "ab33e7f75239b918",
+    "a7ecd116aeda0389",
 ];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
@@ -90,10 +91,10 @@ pub(crate) fn unedited_seed(data: &[u8]) -> bool {
 /// What one [`seed_into`] run did, in the order a caller checks them.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The shipped body was created at [`SeededSkill::path`].
+    /// The shipped body was created or an unedited older seed refreshed.
     Written,
     /// A file was already there and was left alone: it may be current,
-    /// outdated, or operator-edited.
+    /// current or operator-edited.
     Kept,
     /// No consumer for this destination is installed. Nothing was created.
     NoAgent,
@@ -695,27 +696,33 @@ fn seed_decision_at(
 
 /// Read one target only through the operator-controlled parent descriptor that will later
 /// be transferred into managed publication authority. The resulting decision
-/// never authorizes changing an existing leaf.
+/// retains the exact inspected leaf required for a released-seed refresh.
 fn inspected_seed_decision(
     parent: &StateInspector,
     location: &crate::consumer::AssetLocation,
-) -> Result<crate::managed_assets::SeedDecision, ()> {
+) -> Result<
+    (
+        crate::managed_assets::SeedDecision,
+        Option<cyclops_state::FileInspection>,
+    ),
+    (),
+> {
     let leaf = skill_leaf(location)?;
     let decision = match parent.read_file(
         Path::new(leaf),
         cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX,
     ) {
         Ok(Some(file)) if !file.truncated && skill_file_is_owner_controlled(&file) => {
-            Ok(crate::managed_assets::seed_decision(
+            let decision = crate::managed_assets::seed_decision(
                 Some(&file.bytes),
                 SHIPPED.as_bytes(),
                 unedited_seed,
-            ))
+            );
+            Ok((decision, Some(file)))
         }
-        Ok(None) => Ok(crate::managed_assets::seed_decision(
+        Ok(None) => Ok((
+            crate::managed_assets::seed_decision(None, SHIPPED.as_bytes(), unedited_seed),
             None,
-            SHIPPED.as_bytes(),
-            unedited_seed,
         )),
         Ok(Some(_)) | Err(_) => Err(()),
     }?;
@@ -734,7 +741,7 @@ fn manual_review(path: &Path, cause: impl std::fmt::Display) -> Outcome {
 
 fn publish_problem(path: &Path, error: StateError) -> Outcome {
     match error {
-        StateError::CreationDurabilityUnknown { .. } | StateError::CreationMayBeVisible { .. } => Outcome::Problem(format!(
+        StateError::ReplacementDurabilityUnknown { .. } | StateError::CreationDurabilityUnknown { .. } | StateError::CreationMayBeVisible { .. } => Outcome::Problem(format!(
             "manual review required for {}: publication may be visible, but durability is unknown; inspect it before retrying",
             path.display()
         )),
@@ -774,7 +781,7 @@ mod test_sync {
     }
 }
 
-/// Create the shipped skill only when its declared destination is missing.
+/// Create a missing skill or refresh an unchanged released seed.
 ///
 /// The installation proof is repeated immediately before each mutation. The
 /// final parent is created only below an installed, operator-controlled
@@ -831,7 +838,7 @@ fn seed_into(
             };
         }
     }
-    let decision = match inspected_seed_decision(&parent, &location) {
+    let (decision, existing) = match inspected_seed_decision(&parent, &location) {
         Ok(inspection) => inspection,
         Err(()) => {
             return SeededSkill {
@@ -843,7 +850,6 @@ fn seed_into(
     };
     match decision.action() {
         crate::managed_assets::SeedAction::KeepCurrent
-        | crate::managed_assets::SeedAction::PreserveKnownOldSeed
         | crate::managed_assets::SeedAction::PreserveOperatorEdit => {
             return SeededSkill {
                 consumer,
@@ -858,7 +864,8 @@ fn seed_into(
                 outcome: manual_review(&path, decision.ownership_reason()),
             };
         }
-        crate::managed_assets::SeedAction::Create => {}
+        crate::managed_assets::SeedAction::Create
+        | crate::managed_assets::SeedAction::RefreshKnownOldSeed => {}
     }
     let leaf = match skill_leaf(&location) {
         Ok(leaf) => leaf,
@@ -904,7 +911,14 @@ fn seed_into(
             };
         }
     }
-    let outcome = match authority.create_file_once(Path::new(leaf), SHIPPED.as_bytes()) {
+    let publication = if let Some(existing) = existing {
+        authority
+            .replace_file_if_unchanged(Path::new(leaf), &existing, SHIPPED.as_bytes())
+            .map(|()| CreateFileOutcome::Created)
+    } else {
+        authority.create_file_once(Path::new(leaf), SHIPPED.as_bytes())
+    };
+    let outcome = match publication {
         Ok(CreateFileOutcome::Created) => Outcome::Written,
         Ok(CreateFileOutcome::AlreadyExists) => {
             manual_review(&path, "target appeared while the skill was being published")
@@ -1214,6 +1228,16 @@ mod tests {
         let second = seed_into("test agent", &installation_roots, skill.clone());
         assert_eq!(second.outcome, Outcome::Kept);
         assert_eq!(note(&second), None);
+
+        // A byte-for-byte released seed upgrades without asking the user to
+        // delete it. Arbitrary edits below must still survive the same path.
+        let old = include_bytes!("../tests/fixtures/skill-1.1.0.md");
+        assert!(unedited_seed(old));
+        assert_ne!(old.as_slice(), SHIPPED.as_bytes());
+        std::fs::write(&first.path, old).unwrap();
+        let refreshed = seed_into("test agent", &installation_roots, skill.clone());
+        assert_eq!(refreshed.outcome, Outcome::Written);
+        assert_eq!(std::fs::read(&first.path).unwrap(), SHIPPED.as_bytes());
 
         // An operator edit outranks the shipped copy on every later run.
         std::fs::write(&first.path, "# my own notes\n").expect("edit");

@@ -245,7 +245,8 @@ pub struct StatusResetParams {
     /// Remove adoptions for panes that no longer exist or are dead.
     #[serde(default = "default_true")]
     pub prune_stale_adoptions: bool,
-    /// Flush message ledgers and queues so history/messages view starts blank.
+    /// Retained for old clients. A true value is rejected before any mutation;
+    /// journal removal belongs to the explicit state-removal operation.
     #[serde(default)]
     pub flush_messages: bool,
 }
@@ -1221,6 +1222,11 @@ pub struct MessageNotificationSummary {
     /// Minimum width recorded with `pre_write_pane_width`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_required_pane_width: Option<u32>,
+    /// Current live pre-write hold for this exact attempt (for example
+    /// `held_for_existing_draft`). Diagnostic only: not journaled or replayed,
+    /// and not evidence of submission or a new durable notification state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
     /// The named write block behind a pre-write hold, when the observation
     /// recorded one (for example `hook_admission_unproven`). Content-free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2209,6 +2215,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                held_by: None,
                 pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
@@ -2304,6 +2311,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            held_by: None,
             pre_write_block: None,
             attention_cleared: Some(false),
             resolution: None,
@@ -2396,6 +2404,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                held_by: None,
                 pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
@@ -2436,6 +2445,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            held_by: None,
             pre_write_block: None,
             attention_cleared: Some(false),
             resolution: None,
@@ -2528,6 +2538,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                held_by: None,
                 pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,

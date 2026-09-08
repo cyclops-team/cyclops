@@ -849,6 +849,9 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
 
     fn invalidate_unread(&self, recipient: RecipientKey);
 
+    /// Current pre-write hold for this exact live attempt, never replayed truth.
+    fn notification_hold(&self, attempt: NotificationAttemptId) -> Option<String>;
+
     fn notification_route(
         &self,
         service: &MailboxService,
@@ -1146,7 +1149,22 @@ impl WorkspaceMessaging {
         caller: RecipientKey,
         recent_settled: u32,
     ) -> Result<MessagesSnapshotResult, MailboxServiceError> {
-        self.service.messages_snapshot(caller, recent_settled)
+        let mut snapshot = self.service.messages_snapshot(caller, recent_settled)?;
+        for row in &mut snapshot.rows {
+            for recipient in &mut row.recipients {
+                let notification = &mut recipient.notification;
+                if matches!(
+                    notification.state,
+                    cyclops_proto::MessageNotificationState::Queued
+                        | cyclops_proto::MessageNotificationState::Gating
+                ) {
+                    notification.held_by = notification
+                        .attempt_id
+                        .and_then(|attempt| self.effects.notification_hold(attempt));
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     pub(crate) fn messages_follow(
@@ -1221,6 +1239,26 @@ impl WorkspaceMessaging {
             if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
                 error!(%recipient, %error, "cannot schedule mailbox notification");
             }
+        }
+    }
+
+    /// A notification worker released its exact run. Advance the durable wake
+    /// FIFO without waiting for a later body claim, pane event, or new send.
+    pub(crate) fn notification_run_finished(
+        &self,
+        recipient: RecipientKey,
+        context: &NotificationContext,
+    ) {
+        match context.has_settled_current_run() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                error!(%recipient, %error, "cannot inspect finished notification");
+                return;
+            }
+        }
+        if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
+            error!(%recipient, %error, "cannot schedule the next mailbox notification");
         }
     }
 
@@ -1545,6 +1583,14 @@ impl WorkspaceMessaging {
             events,
             deadline,
             require_wake,
+            |attempt| {
+                // A known hold is immediately useful. The generic `unknown`
+                // token also covers a transient binding recheck; wait for its
+                // concrete pre-write decision instead of hiding that cause.
+                self.effects
+                    .notification_hold(attempt)
+                    .is_some_and(|cause| cause != "unknown")
+            },
         )
         .await?;
         Ok(MsgSendResult {
@@ -1555,15 +1601,23 @@ impl WorkspaceMessaging {
                 .into_iter()
                 .map(|disposition| {
                     let recipient = disposition.recipient;
+                    let held_by = match disposition.notification_state_raw {
+                        Some(NotificationState::Queued | NotificationState::Gating) => disposition
+                            .attempt_id
+                            .and_then(|attempt| self.effects.notification_hold(attempt)),
+                        _ => None,
+                    };
                     let pane = self
                         .effects
                         .notification_route(&self.service, disposition.recipient)?
                         .map(|route| route.pane_id);
-                    Ok(receipt_with_schedule_truth(
+                    let mut receipt = receipt_with_schedule_truth(
                         disposition,
                         pane,
                         schedule.unavailable.contains(&recipient),
-                    ))
+                    );
+                    receipt.held_by = held_by;
+                    Ok(receipt)
                 })
                 .collect::<Result<Vec<_>, MailboxServiceError>>()?,
             inserted: Some(accepted.inserted),
@@ -1688,7 +1742,9 @@ async fn wait_for_messages_change(
 ) -> bool {
     loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Ok(event)) if event.event == "messages.changed" => return true,
+            Ok(Ok(event)) if matches!(event.event.as_str(), "messages.changed" | "gate") => {
+                return true;
+            }
             Ok(Ok(_)) => continue,
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => return true,
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => return false,
@@ -1703,15 +1759,16 @@ async fn observe_first_durable_dispositions(
     events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
     deadline: Instant,
     require_wake: bool,
+    is_held: impl FnMut(NotificationAttemptId) -> bool,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
     observe_first_durable_dispositions_with(
         message_id,
         outcomes,
         events,
-        deadline,
-        require_wake,
+        (deadline, require_wake),
         || service.message_dispositions(message_id),
         Instant::now,
+        is_held,
     )
     .await
 }
@@ -1720,14 +1777,15 @@ async fn observe_first_durable_dispositions_with(
     message_id: &MessageId,
     outcomes: &HashMap<RecipientKey, RecipientScheduleOutcome>,
     mut events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
-    deadline: Instant,
-    require_wake: bool,
+    response_bound: (Instant, bool),
     mut read_projection: impl FnMut() -> Result<
         Vec<crate::mailbox::MessageDisposition>,
         MailboxServiceError,
     >,
     mut now: impl FnMut() -> Instant,
+    mut is_held: impl FnMut(NotificationAttemptId) -> bool,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
+    let (deadline, require_wake) = response_bound;
     let mut pending: HashMap<RecipientKey, ScheduledHead> = outcomes
         .iter()
         .filter_map(|(recipient, outcome)| match outcome {
@@ -1747,6 +1805,12 @@ async fn observe_first_durable_dispositions_with(
                 .find(|disposition| disposition.recipient == *recipient)
                 .is_none_or(|disposition| {
                     !has_first_durable_disposition(disposition, head, require_wake)
+                        && !(disposition.attempt_id == Some(head.attempt_id)
+                            && matches!(
+                                disposition.notification_state_raw,
+                                Some(NotificationState::Queued | NotificationState::Gating)
+                            )
+                            && is_held(head.attempt_id))
                 })
         });
         if pending.is_empty() {
@@ -2489,6 +2553,10 @@ mod tests {}
     }
 
     impl WorkspaceMessagingEffects for RecordingEffects {
+        fn notification_hold(&self, _attempt: NotificationAttemptId) -> Option<String> {
+            None
+        }
+
         fn subscribe_messages_changed(
             &self,
         ) -> tokio::sync::broadcast::Receiver<cyclops_proto::Event> {
@@ -2972,6 +3040,80 @@ mod tests {}
         );
     }
 
+    #[test]
+    fn a_repeat_of_a_prewrite_claim_does_not_fake_notification_consumption() {
+        for unverified in [false, true] {
+            let (_scratch, service, events, reviewer, _) =
+                mailbox_service("repeat-prewrite-claim", 8);
+            let effects = Arc::new(RecordingEffects::new(events));
+            let messaging = WorkspaceMessaging::new(
+                Arc::clone(&service),
+                Arc::new(StdMutex::new(())),
+                effects.clone(),
+            );
+            let (first, context, _) = queued_attempt(&service);
+            context.record_gating().unwrap();
+            assert_eq!(
+                messaging
+                    .claim(reviewer, first.message_id.clone())
+                    .unwrap()
+                    .disposition,
+                ClaimDisposition::Claimed
+            );
+            let second = send_to(&service, &["reviewer"], "Next notification");
+            record_doorbell_write(&context);
+            let submitted = if unverified {
+                context.record_submitted_unverified().unwrap()
+            } else {
+                context.record_submitted().unwrap()
+            };
+
+            // The body was retrieved before the pane write. Repeating that
+            // idempotent read is not a new claim fact or a consumption receipt.
+            assert_eq!(
+                messaging
+                    .claim(reviewer, first.message_id.clone())
+                    .unwrap()
+                    .disposition,
+                ClaimDisposition::AlreadyClaimed
+            );
+            assert!(
+                !effects.calls().iter().any(|effect| matches!(
+                    effect,
+                    RecordedEffect::SettleClaim(_) | RecordedEffect::CancelNotification(_)
+                )),
+                "a repeated early claim falsely settled the delivery: {:?}",
+                effects.calls()
+            );
+            assert_eq!(context.current_record().unwrap(), submitted);
+            assert!(!context.settle_submitted_claim().unwrap());
+            assert!(service
+                .prepare_oldest_notification(reviewer)
+                .unwrap()
+                .is_none());
+
+            // Actual terminal evidence still finishes this run and advances
+            // its follower. No new send or body claim is needed to unstick it.
+            context
+                .record_notified(Some(cyclops_proto::VerifiedBy::Screen))
+                .unwrap();
+            let before = effects.calls().len();
+            messaging.notification_run_finished(reviewer, &context);
+            assert_eq!(
+                &effects.calls()[before..],
+                &[RecordedEffect::Schedule(reviewer)]
+            );
+            assert_eq!(
+                service
+                    .prepare_oldest_notification(reviewer)
+                    .unwrap()
+                    .unwrap()
+                    .message_id,
+                second.message_id
+            );
+        }
+    }
+
     // Obsolete if requeue or pre-write withdrawal callers again coordinate
     // durable notification mutations with workers, cancellation, or unread
     // projection themselves.
@@ -3270,7 +3412,7 @@ mod tests {}
     }
 
     #[test]
-    fn workspace_messaging_prewrite_after_a_claim_is_obsolete_work() {
+    fn workspace_messaging_claim_preserves_prewrite_work_until_operator_withdrawal() {
         let (_scratch, service, events, reviewer, _) =
             mailbox_service("workspace-messaging-prewrite-claim", 8);
         let effects = Arc::new(RecordingEffects::new(events));
@@ -3286,8 +3428,8 @@ mod tests {}
             generation: 1,
         };
 
-        // The claim withdrew the gating doorbell, so the pre-write block the
-        // worker records afterwards is obsolete work, not a new fact.
+        // The claim retrieves the body. Only explicit withdrawal makes this
+        // independently owed notification obsolete.
         assert_eq!(
             messaging
                 .record_notification_prewrite_block(
@@ -3299,12 +3441,15 @@ mod tests {}
                     "%3",
                 )
                 .unwrap(),
-            MessagingPreWriteBlockOutcome::Obsolete
+            MessagingPreWriteBlockOutcome::Recorded(MessagingPreWriteBlock {
+                attempt_id: context.attempt_id(),
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+            })
         );
         assert_eq!(
             service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
-            Some(NotificationState::Withdrawn),
-            "a claim before the write withdraws the doorbell"
+            Some(NotificationState::BlockedPreWrite),
+            "a claim before the write preserves the doorbell"
         );
         messaging
             .withdraw_notification(service.admin().key, reviewer, context.attempt_id())
@@ -4008,6 +4153,7 @@ mod tests {}
             receiver,
             Instant::now() + Duration::from_secs(1),
             false,
+            |_| false,
         );
         let advance = async {
             tokio::task::yield_now().await;
@@ -4093,6 +4239,7 @@ mod tests {}
             receiver,
             Instant::now() + Duration::from_secs(1),
             false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -4221,6 +4368,7 @@ mod tests {}
             receiver,
             Instant::now() + Duration::from_millis(10),
             false,
+            |_| false,
         )
         .await
         .unwrap();
@@ -4229,6 +4377,60 @@ mod tests {}
             Some(NotificationState::Gating)
         );
         assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_hold_event_finishes_receipt_observation_without_waiting_for_a_timer() {
+        for require_wake in [false, true] {
+            let (_scratch, service, events, recipient, _) = mailbox_service("live-hold-receipt", 8);
+            let (accepted, context, head) = queued_attempt(&service);
+            context.record_gating().unwrap();
+            let attempt = head.attempt_id;
+            let outcomes = HashMap::from([(
+                recipient,
+                RecipientScheduleOutcome::WorkerOwned {
+                    head,
+                    observe_first_disposition: true,
+                },
+            )]);
+            let lines_before = service.journal_lines().unwrap().len();
+            let receiver = events.subscribe();
+            let held = std::cell::Cell::new(false);
+            let started = Instant::now();
+            let observe = observe_first_durable_dispositions(
+                &service,
+                &accepted.message_id,
+                &outcomes,
+                receiver,
+                started + Duration::from_secs(120),
+                require_wake,
+                |current| current == attempt && held.get(),
+            );
+            let gate = async {
+                tokio::task::yield_now().await;
+                held.set(true);
+                events
+                    .send(Event {
+                        event: "gate".into(),
+                        data: serde_json::json!({"action": "hold"}),
+                        seq: None,
+                    })
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(observe, gate);
+            let dispositions = result.unwrap();
+            assert_eq!(
+                Instant::now(),
+                started,
+                "a gate event, not a timeout, returns the receipt"
+            );
+            assert_eq!(dispositions[0].attempt_id, Some(attempt));
+            assert_eq!(
+                dispositions[0].notification_state_raw,
+                Some(NotificationState::Gating)
+            );
+            assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4250,8 +4452,7 @@ mod tests {}
             &accepted.message_id,
             &outcomes,
             receiver,
-            Instant::now() + Duration::from_secs(10),
-            false,
+            (Instant::now() + Duration::from_secs(10), false),
             || {
                 reads += 1;
                 if reads == 2 {
@@ -4266,6 +4467,7 @@ mod tests {}
                 service.message_dispositions(&accepted.message_id)
             },
             Instant::now,
+            |_| false,
         )
         .await
         .unwrap();
@@ -4302,8 +4504,7 @@ mod tests {}
             &accepted.message_id,
             &outcomes,
             receiver,
-            deadline,
-            false,
+            (deadline, false),
             || {
                 reads += 1;
                 if reads == 2 {
@@ -4318,6 +4519,7 @@ mod tests {}
                 service.message_dispositions(&accepted.message_id)
             },
             || deadline,
+            |_| false,
         )
         .await
         .unwrap();
@@ -4387,6 +4589,7 @@ mod tests {}
             receiver,
             deadline,
             false,
+            |_| false,
         )
         .await
         .unwrap();

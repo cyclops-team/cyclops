@@ -4,9 +4,8 @@
 
 - macOS or Linux
 - tmux 3.2 or newer (`tmux -V`)
-- Rust toolchain (`cargo`), recent stable (1.85+): Cyclops builds from
-  source, so this is a hard requirement, not a contributor extra
-- curl and Git (for the one-line source install)
+- curl, tar, and a SHA-256 tool (`shasum` or `sha256sum`) for release downloads
+- Git and a recent stable Rust toolchain (`cargo`, 1.85+) only for source builds
 
 No Rust on the machine? Install it with [rustup](https://rustup.rs):
 
@@ -29,27 +28,36 @@ curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 The hosted script is the same `scripts/install.sh` that this repository
-tests. It clones the current `main` branch into Cyclops's user-owned cache,
-builds both binaries, puts them where your shell looks, writes the config
-and detection manifests, proves the result runs, and removes the source clone.
+tests. By default it downloads the latest published release for your platform,
+verifies its checksums, and activates the matched CLI/daemon pair. If that
+release has no usable download, it builds the **same release tag** from source;
+it does not silently switch to `main` or an unrelated local checkout.
+It puts both binaries where your shell looks, writes config and detection
+manifests, and proves the pair runs before selecting it.
 It never uses sudo. Its reusable Cargo build cache is
 `~/Library/Caches/Cyclops/installer/` on macOS and
 `~/.cache/cyclops/installer/` on Linux, never `/private/var`.
 
-The build step dominates the install time: an optimized compile of the
+For source installations, the build step dominates the install time: an optimized compile of the
 two binaries and their dependencies, a few minutes on a fast machine and
 noticeably longer on older or low-power hardware. The installer builds
 the `dist` profile: release optimizations without the link-time
 optimization pass, which would add minutes for runtime margin this tool
 does not need. That cost returns on `cyclops update`, which rebuilds the
-same way. Prebuilt binaries are not published yet.
+same way. A release download does not need Rust or a local build.
+
+`CYCLOPS_VERSION=1.2.0` pins a release, including its source fallback.
+`CYCLOPS_REF=main` selects a source branch instead. Set only one of these;
+an explicit `--source` builds the supplied checkout when one is available.
+An unresolved latest-release lookup stops with a recovery command rather
+than guessing which version you meant.
 
 To inspect the installer before running it, clone the repository instead:
 
 ```bash
 git clone https://github.com/cyclops-team/cyclops.git
 cd cyclops
-./scripts/install.sh
+./scripts/install.sh --source
 ```
 
 Two binaries: `cyclops` (the CLI) and `cyclopsd` (the daemon).
@@ -198,20 +206,19 @@ shared destination alone does not trigger any of them. Claude Code requires
 `~/.claude`, Antigravity CLI `~/.gemini/antigravity-cli`, Kimi `~/.kimi-code`
 (or `$KIMI_CODE_HOME`), and Qwen `~/.qwen` (or `$QWEN_HOME`). Setup creates
 no home for an absent
-consumer and never seeds duplicate skill locations. Skill seeding never
-creates `.agents`, `skills`, or `cyclops` directories: it creates only a
-missing final `SKILL.md` below an existing private canonical parent. A missing
-or non-private parent is reported for manual review. It keeps current and
-edited copies unchanged. An existing skill that matches a known older Cyclops
-release is also preserved for manual review. The entire wiring step is skipped when
+consumer and never seeds duplicate skill locations. With wiring consent, setup
+creates only the declared Cyclops skill directories beneath installed,
+owner-controlled consumers. Normal 0755 directories are accepted; links,
+group/world-writable paths, or replaced parents require review. Current and
+operator-edited copies stay unchanged. A byte-for-byte older Cyclops seed
+refreshes after its identity and contents are rechecked. The step is skipped when
 `CYCLOPS_NO_VENDOR_HOOKS` is set.
 
 That consent outlives the run that gave it. `--wire-hooks` records it at
 `~/.cyclops/vendor-wiring-consented`, and every later `cyclops` or
 `cyclops start` finishes the wiring for an agent CLI that was not there
-yet. Once that CLI has created its private canonical skill parent, the first
-later start can add the final skill file and says what was placed. Otherwise
-the plan and setup report manual review; Cyclops does not create the parent.
+yet. A later start can create the declared skill leaf for that installed
+consumer and says what was placed. Unsafe paths still require manual review.
 A boot that finds nothing new writes nothing and says nothing.
 Delete the marker file to withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS`
 declines the step for one run without deleting anything.
@@ -240,13 +247,12 @@ $ cyclops setup plan
 The plan is a read-only, body-free report. `--json` gives the same rows for a
 script. Each row names the exact manifest or installed-consumer skill target,
 its observed state, and the managed-asset decision: create a missing final
-file below an accepted private parent, keep the current seed, preserve an
+file below an accepted owner-controlled parent, keep the current seed, refresh an
 outdated released seed, preserve an operator edit, or leave an unreadable,
 unproven, or unsafe target for manual review. A shared
 `~/.agents/skills/cyclops/SKILL.md` alone does not make Codex or Cursor look
-installed, and the report never creates a vendor directory. During setup,
-Cyclops never creates the shared `.agents` root or any consumer skill-tree
-directory; a missing or unsafe parent remains manual review.
+installed, and the report never creates a directory. Actual setup may create
+the declared skill path only when the corresponding consumer is installed.
 
 This is intentionally not a generic setup dry run. It does not plan or change
 config, hook wiring, themes, sounds, binaries, updates, cleanup, or uninstall.
@@ -285,9 +291,9 @@ find, so a new one lands on your next start and says so:
   wrote 1 detection manifest to /Users/you/.cyclops/manifests
 ```
 
-A file already present is never rewritten, so your measurements survive every
-run. A known old Cyclops seed is reported as outdated and stays in place for
-manual review. Themes follow their own update rule; the shipped sounds are
+A locally edited manifest is never rewritten, so your measurements survive
+updates. An unedited older Cyclops seed refreshes atomically; a changed or
+replaced file is left for review. Themes follow their own update rule; sounds are
 written once and then left alone.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
@@ -642,6 +648,10 @@ the authenticated running daemon, same-user daemon process inventory, durable
 workspace and session mappings, configured and detached sessions, duplicate
 watcher slots, setup files, state permissions, caches, logs, and rollback
 proof. JSON callers receive the same facts under `operational` and `rollback`.
+A configured session that has not been created or attached yet is reported as
+`waiting_for_session`, not a broken identity mapping. Missing identity for an
+attached session or a retained pane route is still a problem. Duplicate or
+invalid configuration remains a problem too.
 Health reports install-time replay evidence separately from current replay
 readiness. `attested_snapshot` means the exact selected binary pair booted a
 private state snapshot whose content-free identity is stored in the selection
@@ -669,6 +679,10 @@ appends one content-free `completed` or `interrupted` fact to
 checkpoint exactly once, and a torn final journal record is discarded before
 replay. Invalid complete records stop cleanup before deletion instead of hiding
 journal damage.
+Update cleanup inspects only Cyclops's cache directory and selects exact
+owner-marked update workspaces; it does not walk the operating system's
+temporary directory or remove unrelated cache entries. An absent cache root
+is normal.
 
 ```bash
 cyclops cleanup build-cache
@@ -694,20 +708,28 @@ cyclops 1.1.0 (1e16081)
 ✔ already the latest main · nothing to update
 ```
 
-Behind a newer commit, updating clones the repository and builds a candidate
-pair. The candidate CLI and daemon must report one build, then the candidate
+Behind a newer commit, updating clones the repository and explicitly builds
+that source candidate, regardless of any inherited `CYCLOPS_VERSION` release
+pin. Before activation, both candidates must report the cloned commit; the
+final update receipt also checks the newly selected build. The candidate
+CLI and daemon must report one build, then the candidate
 daemon must replay a private copy of the current journals before either
 installed selector changes. A running daemon is authenticated, quiesced, and
 stopped before that copy is taken, then restarted on the old pair if replay
 fails. Durable records and existing setup files in your home are preserved.
-Known unedited shipped themes and hook artifacts may advance with the installed
-release; manifests and skills remain in place and can report outdated state.
+Known unedited shipped themes, hook artifacts, manifests, and skills may advance
+with the installed release. Operator-edited files remain in place.
 
 The source clone and candidate pair are temporary and disappear when the
-update ends. The only retained build artifact is Cargo's incremental cache:
+update ends. Their owner-marked workspaces live directly in Cyclops's cache directory,
+not the system temporary directory. The only retained build artifact is Cargo's incremental cache:
 `~/Library/Caches/Cyclops/` on macOS and `~/.cache/cyclops/` on Linux. Cyclops
 prints its exact directory before building; it is user-owned and rebuildable.
 Set `CARGO_TARGET_DIR` if you deliberately want Cargo to use another location.
+The private replay socket still has the Unix pathname limit (103 bytes on
+macOS). Normal home and isolated installer paths fit; an unusually long home
+or cache root is rejected before building or changing the selected pair, with
+the full offending path reported.
 
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older

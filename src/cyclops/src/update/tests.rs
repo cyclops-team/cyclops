@@ -1,6 +1,65 @@
 use super::pair_store::*;
 use super::*;
 
+#[test]
+fn source_update_cannot_download_a_release_instead_of_the_cloned_commit() {
+    let commit = "a84d44b8f5476c10ecf849d46370d2cb0238dab9";
+    let command = source_installer(Path::new("checkout"), commit);
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, ["checkout/scripts/install.sh", "--source"]);
+    let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+    assert_eq!(environment[std::ffi::OsStr::new("CYCLOPS_VERSION")], None);
+    assert_eq!(
+        environment[std::ffi::OsStr::new("CYCLOPS_EXPECTED_BUILD")],
+        Some(std::ffi::OsStr::new(commit))
+    );
+}
+
+#[test]
+fn copy_fallback_installer_home_fits_the_update_replay_socket() {
+    let cache = build_cache_parent(&cyclops_proto::cyclops_home());
+    let root = update_scratch_root();
+    let relative = root.strip_prefix(&cache).unwrap();
+    let actual_installer_cache =
+        Path::new("/private/tmp/cyclops-parity.OI48kX/copy-fallback/Library/Caches/Cyclops");
+    let scratch = actual_installer_cache.join(relative).join(format!(
+        "{SCRATCH_PREFIX}{}",
+        "a".repeat(SCRATCH_NAME_NONCE_BYTES)
+    ));
+    assert!(
+        validate_replay_socket_path(&scratch).is_ok(),
+        "{}",
+        scratch.display()
+    );
+}
+
+#[test]
+fn replay_socket_length_is_checked_before_creating_an_update_workspace() {
+    let normal = Path::new("/Users/operator/Library/Caches/Cyclops").join(format!(
+        "{SCRATCH_PREFIX}{}",
+        "a".repeat(SCRATCH_NAME_NONCE_BYTES)
+    ));
+    assert!(validate_replay_socket_path(&normal).is_ok());
+    let parity = Path::new("/private/tmp/cyc-parity-999999/inst/Library/Caches/Cyclops").join(
+        format!("{SCRATCH_PREFIX}{}", "a".repeat(SCRATCH_NAME_NONCE_BYTES)),
+    );
+    assert!(validate_replay_socket_path(&parity).is_ok());
+    assert_eq!(
+        update_scratch_root(),
+        build_cache_parent(&cyclops_proto::cyclops_home())
+    );
+    let long = PathBuf::from(format!("/Users/{}/Library/Caches/Cyclops", "a".repeat(64))).join(
+        format!("{SCRATCH_PREFIX}{}", "a".repeat(SCRATCH_NAME_NONCE_BYTES)),
+    );
+    assert!(validate_replay_socket_path(&long)
+        .unwrap_err()
+        .contains("too long"));
+    let exactly_fits = PathBuf::from(format!("/{}", "a".repeat(95)));
+    assert!(validate_replay_socket_path(&exactly_fits).is_ok());
+    let too_long = PathBuf::from(format!("/{}", "a".repeat(96)));
+    assert!(validate_replay_socket_path(&too_long).is_err());
+}
+
 fn directory(path: &Path) {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700).recursive(true);
@@ -235,10 +294,43 @@ fn replay_failure_pair(path: &Path, build: &str, hello: &str, cli: &[u8]) {
     write_new(&path.join("cyclops"), cli, 0o755).unwrap();
     let hello = serde_json::to_string(hello).unwrap();
     let script = format!(
-            "#!/usr/bin/env python3\nimport os, socket, sys, time\nif len(sys.argv) > 1 and sys.argv[1] == '--version':\n    print('cyclopsd 0.1.0 ({build})')\n    sys.exit(0)\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\ntime.sleep(60)\n",
-            cyclops_proto::SOCK_NAME,
-            hello
-        );
+        r#"#!/usr/bin/env python3
+import os, socket, sys
+if len(sys.argv) > 1 and sys.argv[1] == '--version':
+    print('cyclopsd 0.1.0 ({build})')
+    sys.exit(0)
+home = os.environ['CYCLOPS_HOME']
+path = os.path.join(home, '{socket_name}')
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX)
+s.bind(path)
+with open(os.path.join(home, 'probe.pid'), 'w') as f:
+    f.write(str(os.getpid()))
+s.listen(1)
+# Normal replay supplies null stdin. The fixture regression holds a pipe open
+# to queue an abandoned connection before the first accept, without a sleep.
+sys.stdout.buffer.write(b'R')
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+# A startup connection can time out before its worker returns the socket.
+# Serve the next probe after that peer leaves, just as a real daemon does.
+while True:
+    c, _ = s.accept()
+    with c:
+        try:
+            c.sendall(({hello} + '\n').encode())
+            while c.recv(4096):
+                pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    sys.stdout.buffer.write(b'D')
+    sys.stdout.buffer.flush()
+"#,
+        socket_name = cyclops_proto::SOCK_NAME,
+    );
     write_new(&path.join("cyclopsd"), script.as_bytes(), 0o755).unwrap();
 }
 
@@ -264,6 +356,82 @@ fn valid_probe_hello(build: &str) -> String {
         boot_id: "probe-boot".to_string(),
     })
     .unwrap()
+}
+
+#[test]
+fn replay_fixture_serves_a_greeting_after_an_abandoned_startup_connection() {
+    let scratch = Scratch::create().unwrap();
+    let pair = scratch.path().join("pair");
+    let home = scratch.path().join("r");
+    directory(&home);
+    replay_failure_pair(
+        &pair,
+        "build",
+        &valid_probe_hello("build"),
+        b"#!/bin/sh\nexit 1\n",
+    );
+    let stderr_path = scratch.path().join("fixture-stderr.log");
+    let mut child = ReplayChild::new(
+        Command::new(pair.join("cyclopsd"))
+            .env("CYCLOPS_HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let expect_event = |child: &mut ReplayChild, expected: u8| {
+        let output = child.child_mut().stdout.as_mut().unwrap();
+        let mut readiness = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut readiness, 1, 2_000) },
+            1,
+            "fixture event {expected:?} did not arrive; stderr {}",
+            std::fs::read_to_string(&stderr_path).unwrap(),
+        );
+        let mut event = [0_u8; 1];
+        output.read_exact(&mut event).unwrap();
+        assert_eq!(event, [expected]);
+    };
+    expect_event(&mut child, b'R');
+
+    let socket = home.join(cyclops_proto::SOCK_NAME);
+    // The stdin gate withholds hello until this official client times out and
+    // closes its first connection. No raw transport bypass or scheduling guess.
+    match crate::client::Client::connect_path(
+        &socket,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(20),
+    ) {
+        Err(crate::client::ClientError::HelloTimeout(_)) => {}
+        Err(error) => panic!("the gated greeting should time out: {error}"),
+        Ok(_) => panic!("the fixture sent a greeting before its gate was released"),
+    }
+    drop(child.child_mut().stdin.take());
+    // Releasing the gate does not prove accept has removed the abandoned peer
+    // from the one-slot backlog. Wait for its retirement before reconnecting.
+    expect_event(&mut child, b'D');
+    let client = crate::client::Client::connect_path(
+        &socket,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "fixture did not serve the second greeting: {error}; status {:?}; stderr {}",
+            child.child_mut().try_wait().unwrap(),
+            std::fs::read_to_string(&stderr_path).unwrap(),
+        )
+    });
+    assert_eq!(client.hello().build.as_deref(), Some("build"));
+    assert_eq!(client.hello().boot_id, "probe-boot");
+    drop(client);
+    drop(child);
+    assert_replay_probe_reaped(&scratch);
 }
 
 #[test]
@@ -590,6 +758,14 @@ fn update_scratch_is_random_owner_only_marked_and_leased() {
     let first = Scratch::create().unwrap();
     let second = Scratch::create().unwrap();
     assert_ne!(first.path(), second.path());
+    assert_eq!(first.marker.len(), 32);
+    assert_eq!(
+        first.path().file_name().unwrap().to_str().unwrap(),
+        format!(
+            "{SCRATCH_PREFIX}{}",
+            &first.marker[..SCRATCH_NAME_NONCE_BYTES]
+        )
+    );
     let metadata = std::fs::symlink_metadata(first.path()).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     assert_eq!(
@@ -1650,6 +1826,50 @@ fn currency_is_a_prefix_match_on_the_short_sha() {
     // A .dirty ref never reaches this compare, but if one did the
     // suffix keeps it from matching.
     assert!(!is_current("e610afc.dirty", remote));
+}
+
+#[test]
+fn remote_identity_peels_annotated_tags_without_overriding_a_same_named_branch() {
+    let scratch = Scratch::create().unwrap();
+    let repo = scratch.path().join("repo");
+    directory(&repo);
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=Installer fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "--quiet"]);
+    git(&["commit", "--allow-empty", "--quiet", "-m", "first"]);
+    git(&["tag", "--annotate", "v-fixture", "-m", "release"]);
+    git(&["tag", "lightweight-fixture"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    let repo_url = repo.to_str().unwrap();
+    assert_eq!(ls_remote(repo_url, "v-fixture").unwrap(), first);
+    assert_eq!(ls_remote(repo_url, "lightweight-fixture").unwrap(), first);
+    assert_eq!(ls_remote(repo_url, "HEAD").unwrap(), first);
+
+    git(&["commit", "--allow-empty", "--quiet", "-m", "second"]);
+    git(&["branch", "v-fixture"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    // `git clone --branch` prefers the branch when a tag has the same name.
+    assert_eq!(ls_remote(repo_url, "v-fixture").unwrap(), second);
+    assert_eq!(ls_remote(repo_url, "refs/tags/v-fixture").unwrap(), first);
 }
 
 #[test]

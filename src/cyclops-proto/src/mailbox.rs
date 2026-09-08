@@ -470,6 +470,10 @@ pub enum MailboxFact {
         recipient: RecipientKey,
         /// Authenticated claimant identity (must equal recipient).
         claimant: RecipientKey,
+        /// Keep a pane recipient's independent notification owed after retrieval.
+        /// Absent on historical claims, which retain their original settlement.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preserve_notification: bool,
     },
     /// Replay only: no longer written since 1.1.0. An older daemon retired
     /// a mailbox entry after its direct payload delivery.

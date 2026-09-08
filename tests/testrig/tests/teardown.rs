@@ -120,8 +120,14 @@ fn simulated_server_loss_reuses_the_owned_address_and_still_tears_down() {
         return;
     }
     let (server, socket, path) = started("teardown-simulated-loss");
+    let original_pid = server.run(&["display-message", "-p", "#{pid}"]);
+    assert!(original_pid.status.success());
 
     server.simulate_server_loss();
+    assert!(
+        !path.exists(),
+        "simulated loss must remove the old socket before a replacement can connect"
+    );
     assert!(
         !server_is_up(&socket),
         "the simulated loss left the old server live"
@@ -132,6 +138,12 @@ fn simulated_server_loss_reuses_the_owned_address_and_still_tears_down() {
         .socket_path()
         .expect("replacement reports the owned socket path");
     assert_eq!(replacement_path, path);
+    let replacement_pid = server.run(&["display-message", "-p", "#{pid}"]);
+    assert!(replacement_pid.status.success());
+    assert_ne!(
+        replacement_pid.stdout, original_pid.stdout,
+        "the replacement must be a new server"
+    );
     drop(server);
 
     assert!(!server_is_up(&socket), "replacement survived teardown");

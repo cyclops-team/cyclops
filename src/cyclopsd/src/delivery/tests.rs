@@ -2037,12 +2037,25 @@ async fn superseded_notification_aborts_inside_on_write_without_pasting() {
     );
 }
 
-/// A claim while the doorbell is still gating withdraws it: the recipient
-/// already holds the body, so the wake has nothing left to announce, and a
-/// worker that reaches its pre-write check afterwards stops without
-/// touching the pane.
+/// Retrieving the body does not cancel the independently owed pane wake.
 #[test]
-fn a_socket_claim_withdraws_the_gating_doorbell_before_the_write() {
+fn a_socket_claim_does_not_cancel_an_explicit_raw_pane_write() {
+    let (_scratch, store, context, _handle, recipient) =
+        notification_fixture_full("claimed-raw-send", None, true);
+    context.record_gating().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .claim(recipient, context.message_id().clone())
+        .unwrap();
+    let writing = context.record_writing_raw().unwrap();
+    assert_eq!(writing.state, NotificationState::Writing);
+    assert_eq!(writing.transport, NotificationTransport::Raw);
+    assert_eq!(context.record_notified(None).unwrap().verified_by, None);
+}
+
+#[test]
+fn a_socket_claim_preserves_the_gating_doorbell_before_the_write() {
     let (_scratch, store, context, _handle, recipient) = notification_fixture("claimed");
     context.record_gating().unwrap();
     let outcome = store
@@ -2056,17 +2069,37 @@ fn a_socket_claim_withdraws_the_gating_doorbell_before_the_write() {
     else {
         panic!("first claim must append a claim fact");
     };
-    assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
-    assert!(matches!(
-        context.ensure_current_gating(),
-        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
-    ));
+    assert_eq!(withdrawn_attempt, None);
+    context.ensure_current_gating().unwrap();
     let record = notification_state(&store, recipient, context.message_id());
-    assert_eq!(record.state, cyclops_proto::NotificationState::Withdrawn);
-    assert_eq!(
-        record.pre_write_cause,
-        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
-    );
+    assert_eq!(record.state, cyclops_proto::NotificationState::Gating);
+    assert_eq!(record.pre_write_cause, None);
+}
+
+#[test]
+fn a_consumed_doorbell_releases_its_hold_while_the_agent_keeps_working() {
+    for verifier in [VerifiedBy::Hook, VerifiedBy::Screen] {
+        let (scratch, _store, _context, handle, _recipient) =
+            notification_fixture("consumed-during-turn");
+        let inner = unwritten_test_inner(&scratch.0);
+        let binding = unwritten_test_binding();
+        seed_unwritten_test_composer(&inner, &binding);
+        latch_hold(&inner, &handle, &binding).unwrap();
+        {
+            let mut detections = inner.detections.lock().unwrap();
+            let entry = detections.get_mut(&PaneKey::new(0, "%1")).unwrap();
+            entry.detection.state = AgentState::Working;
+            entry.detection.composer_semantic = Some(ComposerSemantic::GhostSuggestion);
+        }
+        settle_hold_on_receipt(&inner, &handle, Some(verifier), Some(1), None);
+        assert!(!fusion::composer_is_held(&inner, 0, "%1"), "{verifier:?}");
+        assert_eq!(
+            inner.detections.lock().unwrap()[&PaneKey::new(0, "%1")]
+                .detection
+                .state,
+            AgentState::Working
+        );
+    }
 }
 
 #[tokio::test]
@@ -2401,11 +2434,10 @@ fn readiness_block_persistence_records_route_baseline_and_reopens_once() {
     assert_eq!(service.journal_lines().unwrap().len(), lines_before_repeat);
 }
 
-/// A claim while the doorbell is gating settles it as withdrawn, so a
-/// pre-write block the worker records afterwards finds nothing to block:
-/// the attempt stays withdrawn by the claim and the worker is not faulted.
+/// Pulling the body does not cancel an unwritten wake or prevent its exact
+/// worker from recording a later route hold.
 #[test]
-fn a_socket_claim_settles_the_attempt_before_a_prewrite_block_can_land() {
+fn a_socket_claim_preserves_the_attempt_when_a_prewrite_block_lands() {
     let (_scratch, store, context, handle, recipient) =
         notification_fixture("claim-wins-prewrite-block");
     context.record_gating().unwrap();
@@ -2437,18 +2469,13 @@ fn a_socket_claim_settles_the_attempt_before_a_prewrite_block_can_land() {
             required_pane_width: None,
         }),
     );
-    assert!(matches!(
-        record,
-        Err(NotificationAdapterError::TerminalConflict(
-            NotificationState::Withdrawn
-        ))
-    ));
+    assert_eq!(record.unwrap().state, NotificationState::BlockedPreWrite);
     assert!(!worker.is_faulted());
     let record = notification_state(&store, recipient, context.message_id());
-    assert_eq!(record.state, NotificationState::Withdrawn);
+    assert_eq!(record.state, NotificationState::BlockedPreWrite);
     assert_eq!(
         record.pre_write_cause,
-        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
+        Some(NotificationPreWriteCause::WriteReadinessChanged)
     );
 }
 
@@ -2461,6 +2488,24 @@ fn notified_state_without_the_exact_claim_does_not_settle_a_claim_race() {
     assert!(
         !context.settle_submitted_claim().unwrap(),
         "Notified proves receipt, not an exact mailbox claim"
+    );
+}
+
+#[test]
+fn a_socket_claim_before_the_write_is_not_a_pane_consumption_receipt() {
+    let (_scratch, store, context, _handle, recipient) =
+        notification_fixture("claim-before-write-is-not-receipt");
+    store
+        .lock()
+        .unwrap()
+        .claim(recipient, context.message_id().clone())
+        .unwrap();
+    prepare_notification_receipt(&context);
+
+    assert!(!context.settle_submitted_claim().unwrap());
+    assert_eq!(
+        notification_state(&store, recipient, context.message_id()).state,
+        NotificationState::Submitted,
     );
 }
 
@@ -2523,11 +2568,9 @@ fn submitted_doorbell_claim_names_the_attempt_that_consumed_it() {
     assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
 }
 
-/// A claim while the doorbell is still queued withdraws it before the gate
-/// ever runs: the worker that picks the attempt up finds it no longer
-/// current and never writes.
+/// Claim-before-scheduling still leaves the same doorbell owed.
 #[test]
-fn a_claimed_queued_doorbell_never_enters_the_gate() {
+fn a_claimed_queued_doorbell_enters_the_gate_once() {
     let (_scratch, store, context, _handle, recipient) =
         notification_fixture("withdrawn-before-gate");
     let outcome = store
@@ -2541,18 +2584,12 @@ fn a_claimed_queued_doorbell_never_enters_the_gate() {
     else {
         panic!("first claim must append a claim fact");
     };
-    assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
+    assert_eq!(withdrawn_attempt, None);
 
-    assert!(matches!(
-        context.record_gating(),
-        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
-    ));
+    context.record_gating().unwrap();
     let record = notification_state(&store, recipient, context.message_id());
-    assert_eq!(record.state, cyclops_proto::NotificationState::Withdrawn);
-    assert_eq!(
-        record.pre_write_cause,
-        Some(NotificationPreWriteCause::ClaimedBeforeWrite)
-    );
+    assert_eq!(record.state, cyclops_proto::NotificationState::Gating);
+    assert_eq!(record.pre_write_cause, None);
 }
 
 #[test]

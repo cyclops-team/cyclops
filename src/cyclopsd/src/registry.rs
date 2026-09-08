@@ -80,8 +80,8 @@ pub(crate) struct Adoption {
 
 /// One headless registration: an agent process with no pane.
 ///
-/// The root is the vendor process the registration was proven from, and
-/// it is the whole identity: a caller resolves to this label by descending
+/// The root is the vendor process, or a session-owned bridge proven below
+/// that vendor. A caller resolves to this label by descending
 /// from that exact process generation, and the label is released when the
 /// process exits. The boot token is kept because a process birth is only
 /// comparable within one OS boot; a row from another boot names nothing.
@@ -96,6 +96,10 @@ pub(crate) struct HeadlessAdoption {
     /// is ever gated on it because nothing is ever written to a terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest: Option<String>,
+    /// Present only for a session-owned bridge: its root is the bridge
+    /// process, and this exact vendor generation must remain its ancestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vendor_root: Option<ProcessInstanceId>,
 }
 
 /// Who answers to a label right now.
@@ -135,6 +139,10 @@ struct File {
     /// every boot anyway.
     #[serde(default)]
     headless: Vec<HeadlessAdoption>,
+    /// Kept separate so pre-bridge daemons ignore these roots instead of
+    /// treating a non-vendor MCP process as an administrative shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bridges: Vec<HeadlessAdoption>,
 }
 
 /// The live registry. Exact adoptions are keyed by their durable mailbox
@@ -203,7 +211,15 @@ impl Registry {
         for w in file.windows {
             reg.windows.insert(w.window_id.clone(), w);
         }
-        for adoption in file.headless {
+        let headless = file
+            .headless
+            .into_iter()
+            .filter(|adoption| adoption.vendor_root.is_none());
+        let bridges = file
+            .bridges
+            .into_iter()
+            .filter(|adoption| adoption.vendor_root.is_some());
+        for adoption in headless.chain(bridges) {
             if adoption.recipient.is_headless() {
                 reg.headless.insert(adoption.recipient, adoption);
             }
@@ -805,12 +821,22 @@ impl Registry {
                 .chain(legacy_panes.iter().cloned())
                 .collect(),
             windows: windows.values().cloned().collect(),
-            headless: headless.values().cloned().collect(),
+            headless: headless
+                .values()
+                .filter(|adoption| adoption.vendor_root.is_none())
+                .cloned()
+                .collect(),
+            bridges: headless
+                .values()
+                .filter(|adoption| adoption.vendor_root.is_some())
+                .cloned()
+                .collect(),
         };
         file.panes
             .sort_by(|a, b| (&a.session, &a.pane_id).cmp(&(&b.session, &b.pane_id)));
         file.windows.sort_by(|a, b| a.window_id.cmp(&b.window_id));
         file.headless.sort_by_key(|a| a.recipient);
+        file.bridges.sort_by_key(|a| a.recipient);
         let path = self.state_root.path().join(FILE);
         let mut text = serde_json::to_string_pretty(&file).map_err(|source| StateError::Io {
             path: path.clone(),
@@ -951,6 +977,7 @@ mod tests {
             root: ProcessInstanceId::new(pid, pid as u64 + 10_000).unwrap(),
             os_boot_id: OsBootId::new("boot-test").unwrap(),
             manifest: Some("claude".into()),
+            vendor_root: None,
         }
     }
 
@@ -997,6 +1024,35 @@ mod tests {
         // The pane adoption is untouched throughout.
         assert_eq!(again.label_of("%1").as_deref(), Some("reviewer"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_roots_roundtrip_without_becoming_legacy_headless_roots() {
+        let dir = home("bridge-format");
+        let (mut registry, warnings) = load(&dir);
+        assert!(warnings.is_empty());
+        let vendor = headless("vendor", 100, 1);
+        let mut bridge = headless("bridge", 101, 2);
+        bridge.vendor_root = Some(vendor.root);
+        registry.adopt_headless(vendor.clone()).unwrap();
+        registry.adopt_headless(bridge.clone()).unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct OldRegistry {
+            headless: Vec<HeadlessAdoption>,
+        }
+        let bytes = std::fs::read(dir.join(FILE)).unwrap();
+        let old: OldRegistry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.headless.len(), 1);
+        assert_eq!(old.headless[0].root, vendor.root);
+        let (current, warnings) = load(&dir);
+        assert!(warnings.is_empty());
+        assert_eq!(current.headless_adoptions().len(), 2);
+        assert_eq!(
+            current.headless_for_root(bridge.root).unwrap().vendor_root,
+            Some(vendor.root)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1302,6 +1358,7 @@ mod tests {
             panes: vec![legacy],
             windows: vec![window("@0", None)],
             headless: Vec::new(),
+            bridges: Vec::new(),
         };
         std::fs::write(
             dir.join(FILE),
