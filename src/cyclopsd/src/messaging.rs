@@ -3040,6 +3040,80 @@ mod tests {}
         );
     }
 
+    #[test]
+    fn a_repeat_of_a_prewrite_claim_does_not_fake_notification_consumption() {
+        for unverified in [false, true] {
+            let (_scratch, service, events, reviewer, _) =
+                mailbox_service("repeat-prewrite-claim", 8);
+            let effects = Arc::new(RecordingEffects::new(events));
+            let messaging = WorkspaceMessaging::new(
+                Arc::clone(&service),
+                Arc::new(StdMutex::new(())),
+                effects.clone(),
+            );
+            let (first, context, _) = queued_attempt(&service);
+            context.record_gating().unwrap();
+            assert_eq!(
+                messaging
+                    .claim(reviewer, first.message_id.clone())
+                    .unwrap()
+                    .disposition,
+                ClaimDisposition::Claimed
+            );
+            let second = send_to(&service, &["reviewer"], "Next notification");
+            record_doorbell_write(&context);
+            let submitted = if unverified {
+                context.record_submitted_unverified().unwrap()
+            } else {
+                context.record_submitted().unwrap()
+            };
+
+            // The body was retrieved before the pane write. Repeating that
+            // idempotent read is not a new claim fact or a consumption receipt.
+            assert_eq!(
+                messaging
+                    .claim(reviewer, first.message_id.clone())
+                    .unwrap()
+                    .disposition,
+                ClaimDisposition::AlreadyClaimed
+            );
+            assert!(
+                !effects.calls().iter().any(|effect| matches!(
+                    effect,
+                    RecordedEffect::SettleClaim(_) | RecordedEffect::CancelNotification(_)
+                )),
+                "a repeated early claim falsely settled the delivery: {:?}",
+                effects.calls()
+            );
+            assert_eq!(context.current_record().unwrap(), submitted);
+            assert!(!context.settle_submitted_claim().unwrap());
+            assert!(service
+                .prepare_oldest_notification(reviewer)
+                .unwrap()
+                .is_none());
+
+            // Actual terminal evidence still finishes this run and advances
+            // its follower. No new send or body claim is needed to unstick it.
+            context
+                .record_notified(Some(cyclops_proto::VerifiedBy::Screen))
+                .unwrap();
+            let before = effects.calls().len();
+            messaging.notification_run_finished(reviewer, &context);
+            assert_eq!(
+                &effects.calls()[before..],
+                &[RecordedEffect::Schedule(reviewer)]
+            );
+            assert_eq!(
+                service
+                    .prepare_oldest_notification(reviewer)
+                    .unwrap()
+                    .unwrap()
+                    .message_id,
+                second.message_id
+            );
+        }
+    }
+
     // Obsolete if requeue or pre-write withdrawal callers again coordinate
     // durable notification mutations with workers, cancellation, or unread
     // projection themselves.

@@ -355,8 +355,11 @@ impl MessageStore {
             .notification(entry.recipient, &message_id)
             .filter(|record| {
                 record.transport == NotificationTransport::Doorbell
-                    && (record.state == NotificationState::Submitted
-                        || record.state == NotificationState::SubmittedUnverified
+                    && ((entry.state.is_pending()
+                        && matches!(
+                            record.state,
+                            NotificationState::Submitted | NotificationState::SubmittedUnverified
+                        ))
                         || (record.state == NotificationState::Notified
                             && prior_claim_seq == Some(record.updated_seq)))
             })

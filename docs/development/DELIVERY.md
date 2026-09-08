@@ -155,8 +155,10 @@ Once a doorbell is notified, its unclaimed body does not block the next pane
 notification. Mailbox FIFO and notification FIFO have different completion
 events.
 
-A claim before the write is not a pane-consumption receipt. An exact recipient
-claim after the write can settle a submitted attempt as `notified`. New claim
+A claim before the write is not a pane-consumption receipt. Repeating that
+already-completed claim after submission is still retrieval, not fresh receipt
+evidence. A new exact recipient claim after the write can settle a submitted
+attempt as `notified`. New claim
 facts for pane recipients carry `preserve_notification: true`; headless
 recipients owe no pane notification. Historical claims without that field
 retain their original withdrawal on replay. Upgrading never resurrects an old
