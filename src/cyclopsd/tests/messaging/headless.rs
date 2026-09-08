@@ -924,15 +924,20 @@ async fn a_restart_reverifies_headless_registrations_by_process_generation() {
     assert!(sent["error"].is_null(), "{sent}");
 
     // Another boot: the row's process generation means nothing, so the
-    // registration is dropped even though the process is still running.
-    let registry = home.join("registry.json");
-    let mut file: Value =
-        serde_json::from_str(&std::fs::read_to_string(&registry).expect("registry readable"))
+    // registration is dropped even though the process is still running. The
+    // old daemon must release the registry before the fixture changes it.
+    let rig = rig
+        .reboot_with_stopped_home(|home| {
+            let registry = home.join("registry.json");
+            let mut file: Value = serde_json::from_str(
+                &std::fs::read_to_string(&registry).expect("registry readable"),
+            )
             .expect("registry parses");
-    assert_eq!(file["headless"].as_array().map(Vec::len), Some(1));
-    file["headless"][0]["os_boot_id"] = json!("another-boot");
-    std::fs::write(&registry, serde_json::to_string_pretty(&file).unwrap()).unwrap();
-    let rig = rig.reboot().await;
+            assert_eq!(file["headless"].as_array().map(Vec::len), Some(1));
+            file["headless"][0]["os_boot_id"] = json!("another-boot");
+            std::fs::write(&registry, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        })
+        .await;
     let refused = admin_send(
         &rig,
         json!({"to": ["worker"], "subject": "gone", "summary": "Gone.", "body": "b"}),
@@ -945,19 +950,23 @@ async fn a_restart_reverifies_headless_registrations_by_process_generation() {
         "no_such_target"
     );
 
-    // Same boot, dead process: re-register, then make the row name a
-    // process that has exited, and reboot.
+    // Same boot, different process generation: a PID alone cannot restore a
+    // registration when its recorded birth no longer matches the live process.
     let socket = rig.daemon.socket_path();
     let registered = agent.register(&home, &socket, "worker").await;
     assert!(registered["error"].is_null(), "{registered}");
-    let mut file: Value =
-        serde_json::from_str(&std::fs::read_to_string(&registry).expect("registry readable"))
+    let rig = rig
+        .reboot_with_stopped_home(|home| {
+            let registry = home.join("registry.json");
+            let mut file: Value = serde_json::from_str(
+                &std::fs::read_to_string(&registry).expect("registry readable"),
+            )
             .expect("registry parses");
-    let dead = Command::new("true").status().expect("run true");
-    assert!(dead.success());
-    file["headless"][0]["root"]["birth"] = json!(1);
-    std::fs::write(&registry, serde_json::to_string_pretty(&file).unwrap()).unwrap();
-    let rig = rig.reboot().await;
+            assert_eq!(file["headless"].as_array().map(Vec::len), Some(1));
+            file["headless"][0]["root"]["birth"] = json!(1);
+            std::fs::write(&registry, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        })
+        .await;
     let refused = admin_send(
         &rig,
         json!({"to": ["worker"], "subject": "dead", "summary": "Dead.", "body": "b"}),

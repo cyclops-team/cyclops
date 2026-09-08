@@ -26,7 +26,10 @@
 # whole ladder from a directory with nothing in it, on its own home and
 # its own daemon.
 
-set -euo pipefail
+set -Eeuo pipefail
+# Identify failures inside nested rig functions before EXIT cleanup removes
+# their scratch files. The last captured output may belong to an earlier step.
+trap 'printf "\n!! parity command failed at %s:%s: %s\n" "${BASH_SOURCE[0]:-$0}" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # The scratch root, the tmux teardown rule and the daemon stop are
